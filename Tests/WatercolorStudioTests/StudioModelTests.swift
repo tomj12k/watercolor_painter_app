@@ -79,6 +79,59 @@ import WatercolorCore
         #expect(try renderer.studioChecksum() == checksumBefore)
     }
 
+    @Test func aggregatePointCapacityIsCheckedBeforeSynchronousRendering() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioPointCapacityProject(pointCount: 1_999_999)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+        var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
+        stroke.points.append(StrokePoint(x: 129, y: 128, pressure: 1, tiltX: 0, tiltY: 0, time: 1))
+        let checksumBefore = try renderer.studioChecksum()
+
+        model.completeStroke(stroke)
+
+        #expect(model.project.commands.count == project.commands.count)
+        #expect(model.rendererProject.commands.count == project.commands.count)
+        #expect(documentUpdates.isEmpty)
+        #expect(model.error?.message.contains("point capacity") == true)
+        #expect(try renderer.studioChecksum() == checksumBefore)
+    }
+
+    @Test func previewCommitRechecksAggregatePointCapacityAfterAwaitingUpdates() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioPointCapacityProject(pointCount: 1_999_999)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+        let preview = StrokeCommand.studioTestStroke(layerID: project.layers[0].id, x: 64, y: 64)
+        var finalStroke = preview
+        finalStroke.points.append(StrokePoint(x: 96, y: 64, pressure: 1, tiltX: 0, tiltY: 0, time: 1))
+        let checksumBefore = try renderer.studioChecksum()
+
+        model.beginStrokePreview(preview)
+        await model.waitForStrokePreviewIdle()
+        #expect(model.isStrokePreviewActive)
+        #expect(try renderer.debugPixel(x: 64, y: 64).alpha > 0.05)
+
+        await model.commitStrokePreview(finalStroke)
+
+        #expect(!model.isStrokePreviewActive)
+        #expect(model.project.commands.count == project.commands.count)
+        #expect(model.rendererProject.commands.count == project.commands.count)
+        #expect(documentUpdates.isEmpty)
+        #expect(model.error?.message.contains("point capacity") == true)
+        #expect(try renderer.studioChecksum() == checksumBefore)
+    }
+
     @Test func liveStrokePreviewRendersDuringDragAndCommitsExactlyOneCommand() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
@@ -1307,6 +1360,34 @@ private extension PaintingProject {
                 )
             ]
         )
+    }
+
+    static func studioPointCapacityProject(pointCount: Int) -> Self {
+        var project = studioTestProject()
+        let fullStrokeCount = pointCount / Self.maximumStrokePointCount
+        let remainderPointCount = pointCount % Self.maximumStrokePointCount
+        let points = Array(
+            repeating: StrokePoint(x: 1, y: 1, pressure: 1, tiltX: 0, tiltY: 0, time: 0),
+            count: Self.maximumStrokePointCount
+        )
+        let historicalLayerID = UUID()
+        project.commands = (0..<fullStrokeCount).map { _ in
+            .stroke(StrokeCommand(
+                layerID: historicalLayerID,
+                tool: .brush,
+                brush: .default,
+                points: points
+            ))
+        }
+        if remainderPointCount > 0 {
+            project.commands.append(.stroke(StrokeCommand(
+                layerID: historicalLayerID,
+                tool: .brush,
+                brush: .default,
+                points: Array(repeating: points[0], count: remainderPointCount)
+            )))
+        }
+        return project
     }
 }
 

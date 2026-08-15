@@ -27,7 +27,11 @@ public enum PaintingDocumentCodec {
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        return try encoder.encode(project)
+        let data = try encoder.encode(project)
+        guard data.count <= maximumDocumentBytes else {
+            throw DocumentCodecError.validationFailed(.documentByteLimitExceeded(data.count))
+        }
+        return data
     }
 
     public static func decode(_ data: Data) throws -> PaintingProject {

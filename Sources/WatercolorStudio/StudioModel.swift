@@ -201,10 +201,7 @@ public final class StudioModel: ObservableObject {
     }
 
     func beginStrokePreview(_ stroke: StrokeCommand) {
-        guard canAppendCommand else {
-            reportCommandCapacityFailure()
-            return
-        }
+        guard canAppendStroke(stroke) else { return }
         guard activeStrokePreviewID == nil,
               project.layers.contains(where: { $0.id == stroke.layerID })
         else { return }
@@ -231,6 +228,11 @@ public final class StudioModel: ObservableObject {
         startStrokePreviewDrainIfNeeded()
         await waitForStrokePreviewIdle(id: stroke.id)
         guard activeStrokePreviewID == stroke.id else { return }
+        guard canAppendStroke(stroke) else {
+            cancelStrokePreviewAfterAdmissionFailure(id: stroke.id)
+            if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
+            return
+        }
         do {
             try await renderer.finishStrokePreview(stroke)
             try renderer.recordRenderedStroke(stroke)
@@ -325,10 +327,7 @@ public final class StudioModel: ObservableObject {
     }
 
     func completeStroke(_ stroke: StrokeCommand) {
-        guard canAppendCommand else {
-            reportCommandCapacityFailure()
-            return
-        }
+        guard canAppendStroke(stroke) else { return }
         guard project.layers.contains(where: { $0.id == stroke.layerID }) else {
             error = StudioFailure(
                 message: StudioCoordinationError.strokeLayerUnavailable(stroke.layerID).localizedDescription
@@ -354,6 +353,47 @@ public final class StudioModel: ObservableObject {
         error = StudioFailure(
             message: "The project has reached its command capacity of \(PaintingProject.maximumCommandCount)."
         )
+    }
+
+    private func canAppendStroke(_ stroke: StrokeCommand) -> Bool {
+        guard canAppendCommand else {
+            reportCommandCapacityFailure()
+            return false
+        }
+        guard prospectiveStrokePointCapacityError(for: stroke) == nil else {
+            error = StudioFailure(
+                message: "The project has reached its point capacity of \(PaintingProject.maximumTotalStrokePointCount)."
+            )
+            return false
+        }
+        return true
+    }
+
+    private func prospectiveStrokePointCapacityError(
+        for stroke: StrokeCommand
+    ) -> ProjectValidationError? {
+        var totalPointCount = 0
+        for command in project.commands {
+            guard case let .stroke(existingStroke) = command else { continue }
+            let (updatedTotal, didOverflow) = totalPointCount.addingReportingOverflow(existingStroke.points.count)
+            guard !didOverflow else {
+                return .totalStrokePointLimitExceeded(Int.max)
+            }
+            totalPointCount = updatedTotal
+        }
+
+        let (updatedTotal, didOverflow) = totalPointCount.addingReportingOverflow(stroke.points.count)
+        guard !didOverflow, updatedTotal <= PaintingProject.maximumTotalStrokePointCount else {
+            return .totalStrokePointLimitExceeded(didOverflow ? Int.max : updatedTotal)
+        }
+        return nil
+    }
+
+    private func cancelStrokePreviewAfterAdmissionFailure(id previewID: UUID) {
+        guard activeStrokePreviewID == previewID else { return }
+        activeStrokePreviewID = nil
+        pendingStrokePreview = nil
+        try? renderer.cancelStrokePreview()
     }
 
     public func addLayer() {

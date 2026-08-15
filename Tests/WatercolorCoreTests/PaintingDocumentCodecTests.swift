@@ -2,7 +2,42 @@ import Foundation
 import Testing
 @testable import WatercolorCore
 
-@Suite struct PaintingDocumentCodecTests {
+@Suite(.serialized) struct PaintingDocumentCodecTests {
+    @Test func codecRejectsEncodedDocumentsAboveTheByteLimit() {
+        let project = PaintingProject.pointLimitFixture(
+            pointCount: 2_000_000,
+            point: StrokePoint(
+                x: 123.456_789_012_345_67,
+                y: 234.567_890_123_456_78,
+                pressure: 0.123_456_789_012_345_67,
+                tiltX: -0.123_456_789_012_345_67,
+                tiltY: 0.123_456_789_012_345_67,
+                time: 123_456_789_012_345.67
+            )
+        )
+
+        do {
+            _ = try PaintingDocumentCodec.encode(project)
+            Issue.record("Expected encoding above the byte limit to fail")
+        } catch let DocumentCodecError.validationFailed(.documentByteLimitExceeded(byteCount)) {
+            #expect(byteCount > PaintingDocumentCodec.maximumDocumentBytes)
+        } catch {
+            Issue.record("Expected documentByteLimitExceeded, got \(error)")
+        }
+    }
+
+    @Test func codecRoundTripsAProjectAtTheAggregatePointLimit() throws {
+        let project = PaintingProject.pointLimitFixture(
+            pointCount: 2_000_000,
+            point: StrokePoint(x: 1, y: 1, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
+        )
+
+        let data = try PaintingDocumentCodec.encode(project)
+
+        #expect(data.count <= PaintingDocumentCodec.maximumDocumentBytes)
+        #expect(try PaintingDocumentCodec.decode(data) == project)
+    }
+
     @Test func codecRejectsDataAboveTheDocumentByteLimitBeforeDecoding() {
         let data = Data(repeating: 0, count: PaintingDocumentCodec.maximumDocumentBytes + 1)
 
@@ -334,5 +369,32 @@ private extension StrokeCommand {
             brush: brush,
             points: points
         )
+    }
+}
+
+private extension PaintingProject {
+    static func pointLimitFixture(pointCount: Int, point: StrokePoint) -> Self {
+        var project = Self.newDefault()
+        let fullStrokeCount = pointCount / Self.maximumStrokePointCount
+        let remainderPointCount = pointCount % Self.maximumStrokePointCount
+        let fullStrokePoints = Array(repeating: point, count: Self.maximumStrokePointCount)
+        let historicalLayerID = UUID()
+        project.commands = (0..<fullStrokeCount).map { _ in
+            .stroke(StrokeCommand(
+                layerID: historicalLayerID,
+                tool: .brush,
+                brush: .default,
+                points: fullStrokePoints
+            ))
+        }
+        if remainderPointCount > 0 {
+            project.commands.append(.stroke(StrokeCommand(
+                layerID: historicalLayerID,
+                tool: .brush,
+                brush: .default,
+                points: Array(repeating: point, count: remainderPointCount)
+            )))
+        }
+        return project
     }
 }
