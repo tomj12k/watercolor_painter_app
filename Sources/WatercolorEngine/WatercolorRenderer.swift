@@ -111,6 +111,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private var wetnessTextures: [MTLTexture]
     private var compositeTexture: MTLTexture
     private var transactionCompositeTexture: MTLTexture
+    private let previewPigmentSnapshot: MTLTexture
+    private let previewWetnessSnapshot: MTLTexture
     private var frontTextureIndex = 0
     private var layerCapacity: Int
     private var layerSlices: [UUID: Int] = [:]
@@ -118,6 +120,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private var lastCommandBuffer: MTLCommandBuffer?
     private let commandBufferErrorProvider: CommandBufferErrorProvider
     private var strokePreview: StrokePreviewTransaction?
+    private let previewTextureAllocationCount: Int
     private var activeSimulationRegions: [Int: [ActiveSimulationRegion]]
     private var displayZoom: CGFloat = 1
     private var displayPan: CGSize = .zero
@@ -282,6 +285,14 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         wetnessTextures = textures.wetness
         compositeTexture = textures.composite
         transactionCompositeTexture = textures.transactionComposite
+        let previewSnapshot = try Self.makeStrokePreviewSnapshot(
+            device: requestedDevice,
+            width: project.canvas.width,
+            height: project.canvas.height
+        )
+        previewPigmentSnapshot = previewSnapshot.pigment
+        previewWetnessSnapshot = previewSnapshot.wetness
+        previewTextureAllocationCount = 2
         layerCapacity = initialReplayPlan.layerCapacity
         self.project = project
         viewportSize = CGSize(width: project.canvas.width, height: project.canvas.height)
@@ -344,25 +355,14 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         } catch let error as ProjectValidationError {
             throw RendererError.invalidProject(error)
         }
-        guard project.layers.contains(where: { $0.id == stroke.layerID }) else {
+        guard project.layers.contains(where: { $0.id == stroke.layerID }),
+              let layerSlice = layerSlices[stroke.layerID]
+        else {
             throw RendererError.unknownLayer(stroke.layerID)
         }
-        try resourcePolicy.admit(
-            width: compositeTexture.width,
-            height: compositeTexture.height,
-            layerCapacity: layerCapacity,
-            structuralCandidateCapacity: layerCapacity
-        )
-        let snapshot = try Self.makeStrokePreviewSnapshot(
-            device: device,
-            width: compositeTexture.width,
-            height: compositeTexture.height,
-            layerCapacity: layerCapacity
-        )
         let transaction = StrokePreviewTransaction(
             stroke: stroke,
-            pigmentSnapshot: snapshot.pigment,
-            wetnessSnapshot: snapshot.wetness,
+            layerSlice: layerSlice,
             committedSimulationRegions: activeSimulationRegions
         )
         strokePreview = transaction
@@ -570,6 +570,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                 slice: slice,
                 pointIndexOffset: pointIndexOffset,
                 initialPreviousPoint: pointIndexOffset > 0 ? stroke.points[pointIndexOffset - 1] : nil,
+                restrictingSimulationTo: Set([transaction.layerSlice]),
                 workBudget: &workBudget,
                 with: encoder
             )
@@ -612,12 +613,16 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         }
         encodeTextureCopy(
             from: pigmentTextures[frontTextureIndex],
-            to: transaction.pigmentSnapshot,
+            sourceSlice: transaction.layerSlice,
+            to: previewPigmentSnapshot,
+            destinationSlice: 0,
             with: encoder
         )
         encodeTextureCopy(
             from: wetnessTextures[frontTextureIndex],
-            to: transaction.wetnessSnapshot,
+            sourceSlice: transaction.layerSlice,
+            to: previewWetnessSnapshot,
+            destinationSlice: 0,
             with: encoder
         )
         encoder.endEncoding()
@@ -631,33 +636,45 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.allocation("a stroke preview restore encoder")
         }
         for texture in pigmentTextures {
-            encodeTextureCopy(from: transaction.pigmentSnapshot, to: texture, with: encoder)
+            encodeTextureCopy(
+                from: previewPigmentSnapshot,
+                sourceSlice: 0,
+                to: texture,
+                destinationSlice: transaction.layerSlice,
+                with: encoder
+            )
         }
         for texture in wetnessTextures {
-            encodeTextureCopy(from: transaction.wetnessSnapshot, to: texture, with: encoder)
+            encodeTextureCopy(
+                from: previewWetnessSnapshot,
+                sourceSlice: 0,
+                to: texture,
+                destinationSlice: transaction.layerSlice,
+                with: encoder
+            )
         }
         encoder.endEncoding()
     }
 
     private func encodeTextureCopy(
         from source: MTLTexture,
+        sourceSlice: Int,
         to destination: MTLTexture,
+        destinationSlice: Int,
         with encoder: MTLBlitCommandEncoder
     ) {
         let size = MTLSize(width: source.width, height: source.height, depth: 1)
-        for slice in 0..<min(source.arrayLength, destination.arrayLength) {
-            encoder.copy(
-                from: source,
-                sourceSlice: slice,
-                sourceLevel: 0,
-                sourceOrigin: .init(x: 0, y: 0, z: 0),
-                sourceSize: size,
-                to: destination,
-                destinationSlice: slice,
-                destinationLevel: 0,
-                destinationOrigin: .init(x: 0, y: 0, z: 0)
-            )
-        }
+        encoder.copy(
+            from: source,
+            sourceSlice: sourceSlice,
+            sourceLevel: 0,
+            sourceOrigin: .init(x: 0, y: 0, z: 0),
+            sourceSize: size,
+            to: destination,
+            destinationSlice: destinationSlice,
+            destinationLevel: 0,
+            destinationOrigin: .init(x: 0, y: 0, z: 0)
+        )
     }
 
     public func replay(project newProject: PaintingProject) throws {
@@ -1193,6 +1210,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         slice: Int,
         pointIndexOffset: Int = 0,
         initialPreviousPoint: StrokePoint? = nil,
+        restrictingSimulationTo restrictedSimulationSlices: Set<Int>? = nil,
         workBudget: inout RenderWorkBudget,
         with encoder: MTLComputeCommandEncoder
     ) throws {
@@ -1220,6 +1238,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             registerActiveSimulationRegion(stampRegion, slice: slice)
             let dispatches = try encodeActiveSimulation(
                 steps: stepCount,
+                restrictingTo: restrictedSimulationSlices,
                 workBudget: &workBudget,
                 with: encoder
             )
@@ -1905,19 +1924,15 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private static func makeStrokePreviewSnapshot(
         device: MTLDevice,
         width: Int,
-        height: Int,
-        layerCapacity: Int
+        height: Int
     ) throws -> (pigment: MTLTexture, wetness: MTLTexture) {
         func makeTexture(pixelFormat: MTLPixelFormat, label: String) throws -> MTLTexture {
-            let descriptor = MTLTextureDescriptor()
-            descriptor.textureType = .type2DArray
-            descriptor.pixelFormat = pixelFormat
-            descriptor.width = width
-            descriptor.height = height
-            descriptor.depth = 1
-            descriptor.mipmapLevelCount = 1
-            descriptor.arrayLength = layerCapacity
-            descriptor.sampleCount = 1
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: pixelFormat,
+                width: width,
+                height: height,
+                mipmapped: false
+            )
             descriptor.storageMode = .private
             descriptor.usage = [.shaderRead, .shaderWrite]
             guard let texture = device.makeTexture(descriptor: descriptor) else {
@@ -2169,8 +2184,7 @@ private final class CommandBufferErrorProvider: @unchecked Sendable {
 private final class StrokePreviewTransaction: @unchecked Sendable {
     let strokeID: UUID
     let layerID: UUID
-    let pigmentSnapshot: MTLTexture
-    let wetnessSnapshot: MTLTexture
+    let layerSlice: Int
     let committedSimulationRegions: [Int: [ActiveSimulationRegion]]
     var renderedPointCount = 0
 
@@ -2181,14 +2195,12 @@ private final class StrokePreviewTransaction: @unchecked Sendable {
 
     init(
         stroke: StrokeCommand,
-        pigmentSnapshot: MTLTexture,
-        wetnessSnapshot: MTLTexture,
+        layerSlice: Int,
         committedSimulationRegions: [Int: [ActiveSimulationRegion]]
     ) {
         strokeID = stroke.id
         layerID = stroke.layerID
-        self.pigmentSnapshot = pigmentSnapshot
-        self.wetnessSnapshot = wetnessSnapshot
+        self.layerSlice = layerSlice
         self.committedSimulationRegions = committedSimulationRegions
     }
 
@@ -2267,6 +2279,9 @@ struct RendererDebugResources: Equatable {
     let wetnessTextures: [ObjectIdentifier]
     let pipelines: [ObjectIdentifier]
     let compositeTextures: Set<ObjectIdentifier>
+    let previewTextures: [ObjectIdentifier]
+    let previewTextureAllocationCount: Int
+    let previewArrayLength: Int
     let pigmentArrayLength: Int
     let wetnessArrayLength: Int
     let pigmentPixelFormat: MTLPixelFormat
@@ -2317,7 +2332,8 @@ extension WatercolorRenderer {
     }
 
     var debugResources: RendererDebugResources {
-        RendererDebugResources(
+        let previewTextures = [previewPigmentSnapshot, previewWetnessSnapshot]
+        return RendererDebugResources(
             pigmentTextures: pigmentTextures.map { ObjectIdentifier($0 as AnyObject) },
             wetnessTextures: wetnessTextures.map { ObjectIdentifier($0 as AnyObject) },
             pipelines: [
@@ -2336,6 +2352,9 @@ extension WatercolorRenderer {
                 ObjectIdentifier(compositeTexture as AnyObject),
                 ObjectIdentifier(transactionCompositeTexture as AnyObject)
             ],
+            previewTextures: previewTextures.map { ObjectIdentifier($0 as AnyObject) },
+            previewTextureAllocationCount: previewTextureAllocationCount,
+            previewArrayLength: previewTextures.first?.arrayLength ?? 0,
             pigmentArrayLength: pigmentTextures[0].arrayLength,
             wetnessArrayLength: wetnessTextures[0].arrayLength,
             pigmentPixelFormat: pigmentTextures[0].pixelFormat,

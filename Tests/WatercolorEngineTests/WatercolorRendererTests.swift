@@ -77,6 +77,51 @@ import WatercolorCore
         #expect(before.compositePixelFormat == .bgra8Unorm)
     }
 
+    @Test func pointerDownUsesInitializedPreviewSnapshotTextures() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let before = renderer.debugResources
+
+        try renderer.beginStrokePreview(.testDot(layerID: project.layers[0].id))
+        let afterPointerDown = renderer.debugResources
+
+        #expect(afterPointerDown.previewTextures == before.previewTextures)
+        #expect(afterPointerDown.previewTextureAllocationCount == before.previewTextureAllocationCount)
+        #expect(afterPointerDown.previewTextureAllocationCount == 2)
+        #expect(afterPointerDown.previewArrayLength == 1)
+        try renderer.cancelStrokePreview()
+    }
+
+    @Test func repeatedStrokesReuseSingleLayerPreviewTextures() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let layers = [PaintLayer(name: "First"), PaintLayer(name: "Second")]
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 64, height: 64),
+            paper: .coldPress,
+            layers: layers
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let before = renderer.debugResources
+
+        for index in 0..<20 {
+            let layer = layers[index % layers.count]
+            let stroke = StrokeCommand.testDot(
+                layerID: layer.id,
+                x: Double(20 + index),
+                y: 32
+            )
+            try renderer.beginStrokePreview(stroke)
+            #expect(renderer.debugResources.previewTextures == before.previewTextures)
+            try await renderer.updateStrokePreview(stroke)
+            try await renderer.finishStrokePreview(stroke)
+        }
+
+        #expect(renderer.debugResources.previewTextures == before.previewTextures)
+        #expect(renderer.debugResources.previewTextureAllocationCount == 2)
+        #expect(renderer.debugResources.previewArrayLength == 1)
+    }
+
     @Test func rendererCapacityTracksEightAndTwelveLiveLayers() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         func project(layerCount: Int) -> PaintingProject {
@@ -255,7 +300,7 @@ import WatercolorCore
         let renderer = try WatercolorRenderer(
             project: project,
             device: device,
-            debugResourcePolicy: RendererResourcePolicy(maximumWorkingSetBytes: 9_900_000)
+            debugResourcePolicy: RendererResourcePolicy(maximumWorkingSetBytes: 9_500_000)
         )
         try renderer.beginStrokePreview(.testDot(layerID: first.id))
         var candidateProject = project
@@ -263,8 +308,8 @@ import WatercolorCore
 
         #expect(
             throws: RendererError.resourceBudgetExceeded(
-                required: 10_224_008,
-                available: 9_900_000
+                required: 9_568_648,
+                available: 9_500_000
             )
         ) {
             _ = try renderer.makeCandidate(project: candidateProject)

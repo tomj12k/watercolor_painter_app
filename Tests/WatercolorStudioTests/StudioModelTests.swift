@@ -197,6 +197,32 @@ import WatercolorCore
         #expect(try renderer.studioChecksum() == replayed.studioChecksum())
     }
 
+    @Test func previewsOnNewlySelectedLayersReuseRendererSnapshots() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.studioTestProject()
+        project.layers.append(PaintLayer(name: "Second"))
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        let snapshots = renderer.debugResources.previewTextures
+
+        for (index, layer) in project.layers.enumerated() {
+            model.selectedLayerID = layer.id
+            let stroke = StrokeCommand.studioTestStroke(
+                layerID: layer.id,
+                x: Double(64 + index * 64),
+                y: 128
+            )
+            model.beginStrokePreview(stroke)
+            await model.commitStrokePreview(stroke)
+            #expect(renderer.debugResources.previewTextures == snapshots)
+        }
+
+        let replayed = try WatercolorRenderer(project: model.project, device: device)
+        #expect(renderer.debugResources.previewTextureAllocationCount == 2)
+        #expect(renderer.debugResources.previewArrayLength == 1)
+        #expect(try renderer.studioChecksum() == replayed.studioChecksum())
+    }
+
     @Test func rapidMouseStyleUpdatesCoalesceGPUPreviewWork() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         var project = PaintingProject.studioTestProject()
