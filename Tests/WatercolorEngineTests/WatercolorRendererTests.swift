@@ -96,6 +96,17 @@ import WatercolorCore
         #expect(twelve.debugResources.wetnessArrayLength == 12)
     }
 
+    @Test func maximumCanvasTwelveLayerTextureEstimateExceedsCheckpointBudget() {
+        let estimatedBytes = WatercolorRenderer.estimatedTextureBytes(
+            width: 4096,
+            height: 4096,
+            layerCapacity: 12
+        )
+
+        #expect(estimatedBytes == 4_160_749_568)
+        #expect(estimatedBytes > 256 * 1024 * 1024)
+    }
+
     @Test func benchmark1600By1200AtEightAndTwelveLayers() throws {
         guard ProcessInfo.processInfo.environment["WATERCOLOR_RUN_BENCHMARK"] == "1",
               let device = MTLCreateSystemDefaultDevice()

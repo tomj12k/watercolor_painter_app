@@ -70,6 +70,7 @@ public final class StudioModel: ObservableObject {
     public static let brushSizeRange = 1.0...300.0
     private static let dryStepCount = 24
     private static let maximumRendererCheckpointCount = 2
+    private static let defaultRendererCheckpointByteBudget = 256 * 1024 * 1024
 
     @Published public private(set) var project: PaintingProject
     @Published public var selectedLayerID: UUID {
@@ -102,6 +103,10 @@ public final class StudioModel: ObservableObject {
 
     var rendererCheckpointCountForTesting: Int {
         rendererCheckpoints.count
+    }
+
+    var rendererCheckpointBytesForTesting: Int {
+        rendererCheckpoints.reduce(0) { $0 + $1.estimatedBytes }
     }
     #endif
 
@@ -140,6 +145,7 @@ public final class StudioModel: ObservableObject {
     private weak var attachedCanvas: MTKView?
     private var activeStrokePreviewID: UUID?
     private var rendererCheckpoints: [RendererCheckpoint]
+    private let rendererCheckpointByteBudget: Int
 
     public var isStrokePreviewActive: Bool {
         activeStrokePreviewID != nil
@@ -157,7 +163,8 @@ public final class StudioModel: ObservableObject {
         project: PaintingProject,
         renderer: WatercolorRenderer,
         onDocumentUpdate: ((PaintingProject) -> Void)? = nil,
-        pngExportWorker: StudioPNGExportWorker = .live
+        pngExportWorker: StudioPNGExportWorker = .live,
+        rendererCheckpointByteBudget: Int = StudioModel.defaultRendererCheckpointByteBudget
     ) {
         editor = ProjectEditor(project: project)
         self.project = project
@@ -177,6 +184,7 @@ public final class StudioModel: ObservableObject {
         currentPNGExportFailureID = nil
         activeStrokePreviewID = nil
         rendererCheckpoints = []
+        self.rendererCheckpointByteBudget = max(rendererCheckpointByteBudget, 0)
         canvasDelegate = CanvasRendererDelegate(renderer: renderer)
         self.onDocumentUpdate = onDocumentUpdate
         refreshCapabilities()
@@ -551,6 +559,7 @@ public final class StudioModel: ObservableObject {
 
         do {
             try replacement.validate()
+            rendererCheckpoints.removeAll()
             let candidateRenderer = try renderer.makeCandidate(project: replacement)
             let nextSelection = replacement.layers.contains(where: { $0.id == selectedLayerID })
                 ? selectedLayerID
@@ -558,7 +567,6 @@ public final class StudioModel: ObservableObject {
             editor = ProjectEditor(project: replacement)
             project = replacement
             selectedLayerID = nextSelection
-            rendererCheckpoints.removeAll()
             replaceRenderer(with: candidateRenderer)
             refreshCapabilities()
             error = nil
@@ -604,6 +612,7 @@ public final class StudioModel: ObservableObject {
             if let checkpointRenderer = takeRendererCheckpoint(for: updatedProject) {
                 replaceRenderer(with: checkpointRenderer, checkpointCurrent: true)
             } else {
+                rendererCheckpoints.removeAll()
                 let candidateRenderer = try renderer.makeCandidate(project: updatedProject)
                 replaceRenderer(with: candidateRenderer)
             }
@@ -629,8 +638,12 @@ public final class StudioModel: ObservableObject {
             try edit(&updatedEditor)
             let updatedProject = updatedEditor.project
             guard updatedProject != previousProject else { return true }
+            let preparedCheckpoint = prepareCurrentRendererCheckpointForCandidateAllocation()
             let candidateRenderer = try renderer.makeCandidate(project: updatedProject)
-            replaceRenderer(with: candidateRenderer, checkpointCurrent: true)
+            if let preparedCheckpoint {
+                appendRendererCheckpoint(preparedCheckpoint)
+            }
+            replaceRenderer(with: candidateRenderer)
             publishSuccessfulEdit(
                 editor: updatedEditor,
                 project: updatedProject,
@@ -703,14 +716,51 @@ public final class StudioModel: ObservableObject {
     }
 
     private func storeRendererCheckpoint(project: PaintingProject, renderer: WatercolorRenderer) {
+        let checkpoint = RendererCheckpoint(
+            project: project,
+            renderer: renderer,
+            estimatedBytes: renderer.estimatedResourceBytes
+        )
+        guard checkpoint.estimatedBytes <= rendererCheckpointByteBudget else {
+            rendererCheckpoints.removeAll()
+            return
+        }
         rendererCheckpoints.removeAll { checkpoint in
             checkpoint.project == project || checkpoint.renderer === renderer
         }
-        rendererCheckpoints.append(RendererCheckpoint(project: project, renderer: renderer))
-        if rendererCheckpoints.count > Self.maximumRendererCheckpointCount {
-            rendererCheckpoints.removeFirst(
-                rendererCheckpoints.count - Self.maximumRendererCheckpointCount
-            )
+        evictRendererCheckpoints(toFit: checkpoint.estimatedBytes)
+        appendRendererCheckpoint(checkpoint)
+    }
+
+    private func prepareCurrentRendererCheckpointForCandidateAllocation() -> RendererCheckpoint? {
+        let checkpoint = RendererCheckpoint(
+            project: project,
+            renderer: renderer,
+            estimatedBytes: renderer.estimatedResourceBytes
+        )
+        rendererCheckpoints.removeAll { existing in
+            existing.project == project || existing.renderer === renderer
+        }
+        guard checkpoint.estimatedBytes <= rendererCheckpointByteBudget else {
+            rendererCheckpoints.removeAll()
+            return nil
+        }
+        evictRendererCheckpoints(toFit: checkpoint.estimatedBytes)
+        return checkpoint
+    }
+
+    private func evictRendererCheckpoints(toFit additionalBytes: Int) {
+        while !rendererCheckpoints.isEmpty,
+              rendererCheckpoints.reduce(additionalBytes, { $0 + $1.estimatedBytes })
+                > rendererCheckpointByteBudget {
+            rendererCheckpoints.removeFirst()
+        }
+    }
+
+    private func appendRendererCheckpoint(_ checkpoint: RendererCheckpoint) {
+        rendererCheckpoints.append(checkpoint)
+        while rendererCheckpoints.count > Self.maximumRendererCheckpointCount {
+            rendererCheckpoints.removeFirst()
         }
     }
 
@@ -748,6 +798,7 @@ public final class StudioModel: ObservableObject {
 private struct RendererCheckpoint {
     let project: PaintingProject
     let renderer: WatercolorRenderer
+    let estimatedBytes: Int
 }
 
 @MainActor

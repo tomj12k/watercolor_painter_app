@@ -53,6 +53,22 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     /// The canvas-sized, top-left-oriented texture consumed by the MTKView display pass.
     public var renderedTexture: MTLTexture { compositeTexture }
 
+    public var estimatedResourceBytes: Int {
+        Self.estimatedTextureBytes(
+            width: compositeTexture.width,
+            height: compositeTexture.height,
+            layerCapacity: layerCapacity
+        ) + layerMetadataBuffer.length + wetnessTileMaximumBuffer.length + wetnessMaximumBuffer.length
+    }
+
+    static func estimatedTextureBytes(width: Int, height: Int, layerCapacity: Int) -> Int {
+        guard width > 0, height > 0, layerCapacity > 0 else { return 0 }
+        let pixelCount = width * height
+        let pingPongLayerBytesPerPixel = 2 * 8 + 2 * 2
+        let compositeBytesPerPixel = 2 * 4
+        return pixelCount * (layerCapacity * pingPongLayerBytesPerPixel + compositeBytesPerPixel)
+    }
+
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipelineResources: RendererPipelineResources

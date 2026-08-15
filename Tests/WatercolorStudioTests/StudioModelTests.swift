@@ -1048,6 +1048,64 @@ import WatercolorCore
         #expect(model.rendererCheckpointCountForTesting <= 2)
     }
 
+    @Test func checkpointBudgetEvictsOldSnapshotsBeforeAllocatingCandidate() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        var checkpointCountsDuringCandidateReplay: [Int] = []
+        weak var observedModel: StudioModel?
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugCommandBufferError: { commandBuffer in
+                if commandBuffer.label == "Watercolor replay", let observedModel {
+                    checkpointCountsDuringCandidateReplay.append(
+                        observedModel.rendererCheckpointCountForTesting
+                    )
+                }
+                return commandBuffer.error
+            }
+        )
+        let oneCheckpointBudget = renderer.estimatedResourceBytes + 1_024
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            rendererCheckpointByteBudget: oneCheckpointBudget
+        )
+        observedModel = model
+
+        model.selectPaper(.rough)
+        let roughRendererIdentity = model.rendererIdentity
+        model.selectPaper(.hotPress)
+
+        #expect(model.rendererCheckpointCountForTesting == 1)
+        #expect(model.rendererCheckpointBytesForTesting <= oneCheckpointBudget)
+        #expect(checkpointCountsDuringCandidateReplay == [0, 0])
+        model.undo()
+        #expect(model.project.paper == .rough)
+        #expect(model.rendererIdentity == roughRendererIdentity)
+    }
+
+    @Test func oversizedRendererIsNeverRetainedAndUndoFallsBackToEquivalentReplay() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let originalChecksum = try renderer.studioChecksum()
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            rendererCheckpointByteBudget: renderer.estimatedResourceBytes - 1
+        )
+
+        model.addLayer()
+        #expect(model.rendererCheckpointCountForTesting == 0)
+        #expect(model.rendererCheckpointBytesForTesting == 0)
+        model.undo()
+
+        #expect(model.project == project)
+        #expect(model.rendererIdentity != ObjectIdentifier(renderer))
+        #expect(try model.rendererForTesting.studioChecksum() == originalChecksum)
+    }
+
     @Test func directLayerReorderingMovesTheDraggedLayerAndKeepsItSelected() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let layers = [PaintLayer(name: "Bottom"), PaintLayer(name: "Middle"), PaintLayer(name: "Top")]
