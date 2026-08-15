@@ -165,6 +165,33 @@ import WatercolorCore
         }
     }
 
+    @Test func rendererRejectsUnsafeStrokeNumbersInsteadOfConvertingThemToIntegers() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let stroke = StrokeCommand.testDot(layerID: project.layers[0].id, x: 1e300, y: 32)
+
+        #expect(throws: RendererError.invalidProject(.invalidStrokePoint(stroke.id, 0))) {
+            try renderer.render(stroke: stroke)
+        }
+    }
+
+    @Test func rendererRejectsUnboundedDryReplayBeforeDispatchingWork() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var unsafe = project
+        let command = DryLayerCommand(
+            layerID: project.layers[0].id,
+            steps: PaintingProject.maximumDryStepCount + 1
+        )
+        unsafe.commands = [.dryLayer(command)]
+
+        #expect(throws: RendererError.invalidProject(.invalidDryStepCount(command.id, command.steps))) {
+            try renderer.replay(project: unsafe)
+        }
+    }
+
     @Test func failedCompletedStrokeDoesNotPoisonRecoveryOrTheNextStroke() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
@@ -860,7 +887,7 @@ private extension PaintingProject {
 
 private extension StrokeCommand {
     static func testDot(
-        id: UUID = UUID(uuidString: "14BB0640-16DC-4432-BD67-AE0CB0991F52")!,
+        id: UUID = UUID(),
         layerID: UUID,
         tool: PaintTool = .brush,
         pressure: Double = 1,
@@ -890,7 +917,7 @@ private extension StrokeCommand {
     }
 
     static func testLine(
-        id: UUID = UUID(uuidString: "E0E49930-E802-4BB8-B10E-BAEB740B9BC1")!,
+        id: UUID = UUID(),
         layerID: UUID,
         color: PaintColor,
         y: Double,

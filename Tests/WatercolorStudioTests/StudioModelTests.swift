@@ -910,7 +910,7 @@ private extension PaintingProject {
 
 private extension StrokeCommand {
     static func studioTestStroke(
-        id: UUID = UUID(uuidString: "364E8548-E972-4B33-AC9B-CB7977A89AF3")!,
+        id: UUID = UUID(),
         layerID: UUID,
         x: Double = 128,
         y: Double = 128

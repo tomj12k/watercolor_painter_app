@@ -253,6 +253,20 @@ public enum ProjectValidationError: Error, Equatable, Sendable {
     case missingLayers
     case layerLimitExceeded(Int)
     case duplicateLayerIdentifier(UUID)
+    case invalidLayerIdentifier(UUID)
+    case invalidLayerName(UUID)
+    case invalidLayerOpacity(UUID, Double)
+    case commandLimitExceeded(Int)
+    case duplicateCommandIdentifier(UUID)
+    case invalidCommandIdentifier(UUID)
+    case invalidCommandRelationship(UUID)
+    case invalidColorComponent(UUID)
+    case invalidBrushSize(UUID, Double)
+    case invalidBrushParameter(UUID)
+    case invalidStrokePointCount(UUID, Int)
+    case invalidStrokePoint(UUID, Int)
+    case nonMonotonicStrokeTime(UUID, Int)
+    case invalidDryStepCount(UUID, Int)
 }
 
 public struct PaintingProject: Codable, Equatable, Sendable {
@@ -260,6 +274,10 @@ public struct PaintingProject: Codable, Equatable, Sendable {
     public static let minimumCanvasDimension = 256
     public static let maximumCanvasDimension = 4096
     public static let maximumLayerCount = 12
+    public static let maximumCommandCount = 100_000
+    public static let maximumStrokePointCount = 65_536
+    public static let maximumDryStepCount = 4_096
+    public static let brushSizeRange = 1.0...300.0
 
     public var schemaVersion: Int
     public var canvas: CanvasSize
@@ -290,13 +308,31 @@ public struct PaintingProject: Codable, Equatable, Sendable {
     }
 
     public func validate() throws {
+        try validate(requireMinimumCanvasDimension: true)
+    }
+
+    /// Renderer entry points also accept smaller canvases for thumbnails and tests, while
+    /// preserving every upper bound and nested-data safety invariant used by documents.
+    public func validateForRendering() throws {
+        try validate(requireMinimumCanvasDimension: false)
+    }
+
+    public func validateForRendering(_ stroke: StrokeCommand) throws {
+        guard stroke.layerID != Self.zeroIdentifier else {
+            throw ProjectValidationError.invalidCommandRelationship(stroke.id)
+        }
+        try validate(stroke)
+    }
+
+    private func validate(requireMinimumCanvasDimension: Bool) throws {
         guard schemaVersion == Self.currentSchemaVersion else {
             throw ProjectValidationError.unsupportedSchema(schemaVersion)
         }
 
+        let minimumDimension = requireMinimumCanvasDimension ? Self.minimumCanvasDimension : 1
         guard
-            (Self.minimumCanvasDimension...Self.maximumCanvasDimension).contains(canvas.width),
-            (Self.minimumCanvasDimension...Self.maximumCanvasDimension).contains(canvas.height)
+            (minimumDimension...Self.maximumCanvasDimension).contains(canvas.width),
+            (minimumDimension...Self.maximumCanvasDimension).contains(canvas.height)
         else {
             throw ProjectValidationError.invalidCanvasSize(canvas)
         }
@@ -310,8 +346,118 @@ public struct PaintingProject: Codable, Equatable, Sendable {
         }
 
         var identifiers = Set<UUID>()
-        for layer in layers where !identifiers.insert(layer.id).inserted {
-            throw ProjectValidationError.duplicateLayerIdentifier(layer.id)
+        for layer in layers {
+            guard layer.id != Self.zeroIdentifier else {
+                throw ProjectValidationError.invalidLayerIdentifier(layer.id)
+            }
+            guard identifiers.insert(layer.id).inserted else {
+                throw ProjectValidationError.duplicateLayerIdentifier(layer.id)
+            }
+            guard !layer.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  layer.name.count <= 256
+            else {
+                throw ProjectValidationError.invalidLayerName(layer.id)
+            }
+            guard Self.unitRangeContains(layer.opacity) else {
+                throw ProjectValidationError.invalidLayerOpacity(layer.id, layer.opacity)
+            }
+        }
+
+        guard commands.count <= Self.maximumCommandCount else {
+            throw ProjectValidationError.commandLimitExceeded(commands.count)
+        }
+
+        var commandIdentifiers = Set<UUID>()
+        var duplicateDestinations = Set<UUID>()
+        for command in commands {
+            guard command.id != Self.zeroIdentifier else {
+                throw ProjectValidationError.invalidCommandIdentifier(command.id)
+            }
+            guard commandIdentifiers.insert(command.id).inserted else {
+                throw ProjectValidationError.duplicateCommandIdentifier(command.id)
+            }
+
+            switch command {
+            case let .stroke(stroke):
+                guard stroke.layerID != Self.zeroIdentifier else {
+                    throw ProjectValidationError.invalidCommandRelationship(stroke.id)
+                }
+                try validate(stroke)
+            case let .clearLayer(clear):
+                guard clear.layerID != Self.zeroIdentifier else {
+                    throw ProjectValidationError.invalidCommandRelationship(clear.id)
+                }
+            case let .duplicateLayer(duplicate):
+                guard duplicate.sourceLayerID != Self.zeroIdentifier,
+                      duplicate.destinationLayerID != Self.zeroIdentifier,
+                      duplicate.sourceLayerID != duplicate.destinationLayerID,
+                      duplicateDestinations.insert(duplicate.destinationLayerID).inserted
+                else {
+                    throw ProjectValidationError.invalidCommandRelationship(duplicate.id)
+                }
+            case let .mergeDown(merge):
+                guard merge.sourceLayerID != Self.zeroIdentifier,
+                      merge.destinationLayerID != Self.zeroIdentifier,
+                      merge.sourceLayerID != merge.destinationLayerID
+                else {
+                    throw ProjectValidationError.invalidCommandRelationship(merge.id)
+                }
+            case let .dryLayer(dry):
+                guard dry.layerID != Self.zeroIdentifier else {
+                    throw ProjectValidationError.invalidCommandRelationship(dry.id)
+                }
+                guard (0...Self.maximumDryStepCount).contains(dry.steps) else {
+                    throw ProjectValidationError.invalidDryStepCount(dry.id, dry.steps)
+                }
+            }
         }
     }
+
+    private func validate(_ stroke: StrokeCommand) throws {
+        let brush = stroke.brush
+        guard Self.brushSizeRange.contains(brush.size), brush.size.isFinite else {
+            throw ProjectValidationError.invalidBrushSize(stroke.id, brush.size)
+        }
+        guard [brush.opacity, brush.flow, brush.water, brush.granulation, brush.edgeBloom]
+            .allSatisfy(Self.unitRangeContains)
+        else {
+            throw ProjectValidationError.invalidBrushParameter(stroke.id)
+        }
+        guard [brush.color.red, brush.color.green, brush.color.blue, brush.color.alpha]
+            .allSatisfy(Self.unitRangeContains)
+        else {
+            throw ProjectValidationError.invalidColorComponent(stroke.id)
+        }
+        guard (1...Self.maximumStrokePointCount).contains(stroke.points.count) else {
+            throw ProjectValidationError.invalidStrokePointCount(stroke.id, stroke.points.count)
+        }
+
+        var previousTime = -Double.infinity
+        for (index, point) in stroke.points.enumerated() {
+            guard point.x.isFinite,
+                  point.y.isFinite,
+                  point.pressure.isFinite,
+                  point.tiltX.isFinite,
+                  point.tiltY.isFinite,
+                  point.time.isFinite,
+                  (0...Double(canvas.width)).contains(point.x),
+                  (0...Double(canvas.height)).contains(point.y),
+                  Self.unitRangeContains(point.pressure),
+                  (-1...1).contains(point.tiltX),
+                  (-1...1).contains(point.tiltY)
+            else {
+                throw ProjectValidationError.invalidStrokePoint(stroke.id, index)
+            }
+            guard point.time >= previousTime else {
+                throw ProjectValidationError.nonMonotonicStrokeTime(stroke.id, index)
+            }
+            previousTime = point.time
+        }
+    }
+
+    private static func unitRangeContains(_ value: Double) -> Bool {
+        value.isFinite && (0...1).contains(value)
+    }
+
+    private static let zeroIdentifier = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
 }

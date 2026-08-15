@@ -491,6 +491,7 @@ private extension PaintingProject {
 
 private extension StrokeCommand {
     static func durableFixture(
+        id: UUID = UUID(),
         layerID: UUID,
         x: Double = 128,
         y: Double = 128
@@ -500,7 +501,7 @@ private extension StrokeCommand {
         brush.opacity = 0.8
         brush.flow = 0.8
         return Self(
-            id: UUID(uuidString: "13D32B90-B1B6-4446-B057-B26D44BC64D2")!,
+            id: id,
             layerID: layerID,
             tool: .brush,
             brush: brush,

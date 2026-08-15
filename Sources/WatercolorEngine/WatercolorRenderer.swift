@@ -8,6 +8,7 @@ public enum RendererError: Error, Equatable, Sendable {
     case metalUnavailable
     case shaderCompilation(String)
     case allocation(String)
+    case invalidProject(ProjectValidationError)
     case unknownLayer(UUID)
     case invalidMetadataChange
     case readback(String)
@@ -22,6 +23,8 @@ extension RendererError: LocalizedError {
             "The watercolor shaders could not be compiled: \(message)"
         case let .allocation(resource):
             "The watercolor renderer could not allocate \(resource)."
+        case let .invalidProject(error):
+            "The watercolor project is unsafe to render: \(String(describing: error))."
         case let .unknownLayer(identifier):
             "The watercolor renderer does not contain layer \(identifier.uuidString)."
         case .invalidMetadataChange:
@@ -109,6 +112,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         pipelineResources sharedPipelineResources: RendererPipelineResources?,
         commandBufferError: @escaping (MTLCommandBuffer) -> Error?
     ) throws {
+        try Self.validateForRendering(project)
         guard let requestedDevice else {
             throw RendererError.metalUnavailable
         }
@@ -199,6 +203,11 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     }
 
     private func render(stroke: StrokeCommand, waitUntilCompleted: Bool) throws {
+        do {
+            try project.validateForRendering(stroke)
+        } catch let error as ProjectValidationError {
+            throw RendererError.invalidProject(error)
+        }
         guard project.layers.contains(where: { $0.id == stroke.layerID }),
               let slice = layerSlices[stroke.layerID]
         else {
@@ -225,6 +234,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     }
 
     public func replay(project newProject: PaintingProject) throws {
+        try Self.validateForRendering(newProject)
         #if DEBUG
         replayCount += 1
         #endif
@@ -496,6 +506,14 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             }
         }
         return relevant
+    }
+
+    private static func validateForRendering(_ project: PaintingProject) throws {
+        do {
+            try project.validateForRendering()
+        } catch let error as ProjectValidationError {
+            throw RendererError.invalidProject(error)
+        }
     }
 
     private static func makeReplayPlan(for project: PaintingProject) throws -> ReplayPlan {

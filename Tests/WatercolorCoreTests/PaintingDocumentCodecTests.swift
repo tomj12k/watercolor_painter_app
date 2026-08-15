@@ -127,4 +127,124 @@ import Testing
             _ = try PaintingDocumentCodec.encode(project)
         }
     }
+
+    @Test func codecRejectsUnsafeNestedBrushAndLayerNumbers() throws {
+        var project = PaintingProject.newDefault()
+        project.layers[0].opacity = 1.01
+        #expect(throws: DocumentCodecError.validationFailed(.invalidLayerOpacity(project.layers[0].id, 1.01))) {
+            _ = try PaintingDocumentCodec.encode(project)
+        }
+
+        project = .newDefault()
+        var brush = BrushSettings.default
+        brush.size = 301
+        project.commands = [.stroke(.fixture(layerID: project.layers[0].id, brush: brush))]
+        #expect(throws: DocumentCodecError.validationFailed(.invalidBrushSize(project.commands[0].id, 301))) {
+            _ = try PaintingDocumentCodec.encode(project)
+        }
+
+        project = .newDefault()
+        brush = .default
+        brush.color.red = -0.01
+        project.commands = [.stroke(.fixture(layerID: project.layers[0].id, brush: brush))]
+        #expect(throws: DocumentCodecError.validationFailed(.invalidColorComponent(project.commands[0].id))) {
+            _ = try PaintingDocumentCodec.encode(project)
+        }
+    }
+
+    @Test func codecRejectsUnsafeStrokePointsBeforeRendererConversion() throws {
+        let layer = PaintLayer(
+            id: UUID(uuidString: "11111111-1111-1111-1111-111111111111")!,
+            name: "Layer 1"
+        )
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [layer],
+            commands: [.stroke(.fixture(
+                layerID: layer.id,
+                points: [StrokePoint(x: 1e300, y: 20, pressure: 0.8, tiltX: 0, tiltY: 0, time: 1)]
+            ))]
+        )
+        let unsafeJSON = try JSONEncoder().encode(project)
+
+        #expect(throws: DocumentCodecError.validationFailed(.invalidStrokePoint(
+            UUID(uuidString: "22222222-2222-2222-2222-222222222222")!,
+            0
+        ))) {
+            _ = try PaintingDocumentCodec.decode(unsafeJSON)
+        }
+    }
+
+    @Test func codecRejectsEmptyOversizedAndNonMonotonicStrokes() throws {
+        var project = PaintingProject.newDefault()
+        project.commands = [.stroke(.fixture(layerID: project.layers[0].id, points: []))]
+        #expect(throws: DocumentCodecError.validationFailed(.invalidStrokePointCount(project.commands[0].id, 0))) {
+            _ = try PaintingDocumentCodec.encode(project)
+        }
+
+        project.commands = [.stroke(.fixture(
+            layerID: project.layers[0].id,
+            points: Array(repeating: StrokePoint(x: 1, y: 1, pressure: 1, tiltX: 0, tiltY: 0, time: 0), count: PaintingProject.maximumStrokePointCount + 1)
+        ))]
+        #expect(throws: DocumentCodecError.validationFailed(.invalidStrokePointCount(
+            project.commands[0].id,
+            PaintingProject.maximumStrokePointCount + 1
+        ))) {
+            _ = try PaintingDocumentCodec.encode(project)
+        }
+
+        project.commands = [.stroke(.fixture(
+            layerID: project.layers[0].id,
+            points: [
+                StrokePoint(x: 1, y: 1, pressure: 1, tiltX: 0, tiltY: 0, time: 2),
+                StrokePoint(x: 2, y: 2, pressure: 1, tiltX: 0, tiltY: 0, time: 1)
+            ]
+        ))]
+        #expect(throws: DocumentCodecError.validationFailed(.nonMonotonicStrokeTime(project.commands[0].id, 1))) {
+            _ = try PaintingDocumentCodec.encode(project)
+        }
+    }
+
+    @Test func codecRejectsUnboundedDryingAndBrokenIdentifiers() throws {
+        var project = PaintingProject.newDefault()
+        let layerID = project.layers[0].id
+        project.commands = [.dryLayer(DryLayerCommand(layerID: layerID, steps: PaintingProject.maximumDryStepCount + 1))]
+        #expect(throws: DocumentCodecError.validationFailed(.invalidDryStepCount(
+            project.commands[0].id,
+            PaintingProject.maximumDryStepCount + 1
+        ))) {
+            _ = try PaintingDocumentCodec.encode(project)
+        }
+
+        let duplicateID = UUID(uuidString: "33333333-3333-3333-3333-333333333333")!
+        project.commands = [
+            .clearLayer(LayerCommand(id: duplicateID, layerID: layerID)),
+            .dryLayer(DryLayerCommand(id: duplicateID, layerID: layerID, steps: 1))
+        ]
+        #expect(throws: DocumentCodecError.validationFailed(.duplicateCommandIdentifier(duplicateID))) {
+            _ = try PaintingDocumentCodec.encode(project)
+        }
+
+        project.commands = [.mergeDown(MergeDownCommand(sourceLayerID: layerID, destinationLayerID: layerID))]
+        #expect(throws: DocumentCodecError.validationFailed(.invalidCommandRelationship(project.commands[0].id))) {
+            _ = try PaintingDocumentCodec.encode(project)
+        }
+    }
+}
+
+private extension StrokeCommand {
+    static func fixture(
+        layerID: UUID,
+        brush: BrushSettings = .default,
+        points: [StrokePoint] = [StrokePoint(x: 10, y: 20, pressure: 0.8, tiltX: 0.1, tiltY: -0.2, time: 1)]
+    ) -> Self {
+        Self(
+            id: UUID(uuidString: "22222222-2222-2222-2222-222222222222")!,
+            layerID: layerID,
+            tool: .brush,
+            brush: brush,
+            points: points
+        )
+    }
 }
