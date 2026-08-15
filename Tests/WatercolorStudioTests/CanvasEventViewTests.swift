@@ -64,7 +64,7 @@ import WatercolorCore
     }
 }
 
-@Suite @MainActor struct CanvasStrokeIntegrationTests {
+@Suite @MainActor struct CanvasEventViewTests {
     @Test func builderStrokeCompletesToItsSnapshottedLayerAfterSelectionChanges() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let firstLayer = PaintLayer(name: "First")
@@ -181,6 +181,86 @@ import WatercolorCore
 
         #expect(!view.hasTransientInputStateForTesting)
         #expect(!model.isStrokePreviewActive)
+    }
+
+    @Test func rejectedPreviewAdmissionDoesNotBuildStroke() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [PaintLayer(name: "Layer")]
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let finish = CanvasPreviewSuspension()
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, stroke, generation in
+                    try await renderer.updateStrokePreview(stroke, generation: generation)
+                },
+                finish: { renderer, stroke, generation in
+                    try await renderer.finishStrokePreview(stroke, generation: generation)
+                    await finish.suspend()
+                }
+            )
+        )
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+        let first = StrokeCommand(
+            layerID: project.layers[0].id,
+            tool: .brush,
+            brush: .default,
+            points: [StrokePoint(x: 64, y: 64, pressure: 1, tiltX: 0, tiltY: 0, time: 0)]
+        )
+
+        #expect(model.beginStrokePreview(first) == .accepted)
+        let commit = Task { @MainActor in
+            await model.commitStrokePreview(first)
+        }
+        await finish.waitUntilSuspended()
+        view.synchronize(with: model)
+
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown,
+            timestamp: 1,
+            eventNumber: 1
+        )))
+
+        #expect(!view.hasTransientInputStateForTesting)
+        #expect(view.toolTip == "Finishing stroke.")
+
+        await finish.resume()
+        await commit.value
+        #expect(model.project.commands == [.stroke(first)])
+    }
+}
+
+private actor CanvasPreviewSuspension {
+    private var isSuspended = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var completion: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        isSuspended = true
+        startWaiters.forEach { $0.resume() }
+        startWaiters.removeAll()
+        await withCheckedContinuation { continuation in
+            completion = continuation
+        }
+    }
+
+    func waitUntilSuspended() async {
+        guard !isSuspended else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func resume() {
+        completion?.resume()
+        completion = nil
     }
 }
 

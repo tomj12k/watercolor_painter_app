@@ -29,6 +29,43 @@ public struct StudioFailure: Identifiable, Equatable, Sendable {
     }
 }
 
+public enum StrokePreviewAdmission: Equatable, Sendable {
+    case accepted
+    case busy
+    case unavailable
+}
+
+public enum StudioRendererRecoveryError: Error, Equatable, Sendable {
+    case previewRestorationFailed(String)
+}
+
+extension StudioRendererRecoveryError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case let .previewRestorationFailed(message):
+            "The watercolor renderer could not restore the painting: \(message)"
+        }
+    }
+}
+
+@MainActor
+struct StrokePreviewRendererOperation {
+    typealias Update = @MainActor (WatercolorRenderer, StrokeCommand, UInt64) async throws -> Void
+    typealias Finish = @MainActor (WatercolorRenderer, StrokeCommand, UInt64) async throws -> Void
+
+    let update: Update
+    let finish: Finish
+
+    static let live = Self(
+        update: { renderer, stroke, generation in
+            try await renderer.updateStrokePreview(stroke, generation: generation)
+        },
+        finish: { renderer, stroke, generation in
+            try await renderer.finishStrokePreview(stroke, generation: generation)
+        }
+    )
+}
+
 // CGImage is immutable after creation, so this readback snapshot can safely cross to the export worker.
 struct StudioPNGImageSnapshot: @unchecked Sendable {
     let image: CGImage
@@ -81,6 +118,7 @@ public final class StudioModel: ObservableObject {
     @Published public var zoom: CGFloat
     @Published public var pan: CGSize
     @Published public private(set) var error: StudioFailure?
+    @Published public private(set) var rendererRecoveryError: StudioRendererRecoveryError?
     @Published public private(set) var capabilities: StudioCapabilities
     @Published public private(set) var canvasWetness: Double
     @Published public private(set) var layerOpacityPreviews: [UUID: Double]
@@ -140,18 +178,25 @@ public final class StudioModel: ObservableObject {
     private let canvasDelegate: CanvasRendererDelegate
     private var editor: ProjectEditor
     private let pngExportWorker: StudioPNGExportWorker
+    private let strokePreviewOperation: StrokePreviewRendererOperation
     private var latestPNGExportID: UUID?
     private var currentPNGExportFailureID: UUID?
     private weak var attachedCanvas: MTKView?
-    private var activeStrokePreviewID: UUID?
+    private var strokePreviewState: StudioStrokePreviewState
+    private var strokePreviewGeneration: UInt64
     private var pendingStrokePreview: StrokeCommand?
     private var strokePreviewDrainTask: Task<Void, Never>?
-    private var strokePreviewDrainID: UUID?
+    private var strokePreviewDrainToken: StudioStrokePreviewToken?
     private var rendererCheckpoints: [RendererCheckpoint]
     private let rendererCheckpointByteBudget: Int
 
     public var isStrokePreviewActive: Bool {
-        activeStrokePreviewID != nil
+        strokePreviewState.token != nil
+    }
+
+    var isStrokePreviewFinalizing: Bool {
+        if case .finalizing = strokePreviewState { return true }
+        return false
     }
 
     private var canAppendCommand: Bool {
@@ -171,7 +216,8 @@ public final class StudioModel: ObservableObject {
         renderer: WatercolorRenderer,
         onDocumentUpdate: ((PaintingProject) -> Void)? = nil,
         pngExportWorker: StudioPNGExportWorker = .live,
-        rendererCheckpointByteBudget: Int = StudioModel.defaultRendererCheckpointByteBudget
+        rendererCheckpointByteBudget: Int = StudioModel.defaultRendererCheckpointByteBudget,
+        strokePreviewOperation: StrokePreviewRendererOperation = .live
     ) {
         editor = ProjectEditor(project: project)
         self.project = project
@@ -181,18 +227,21 @@ public final class StudioModel: ObservableObject {
         zoom = 1
         pan = .zero
         error = nil
+        rendererRecoveryError = nil
         capabilities = StudioCapabilities(canPaint: true, canUndo: false, canRedo: false)
         canvasWetness = renderer.canvasWetness
         layerOpacityPreviews = [:]
         recentColors = []
         self.renderer = renderer
         self.pngExportWorker = pngExportWorker
+        self.strokePreviewOperation = strokePreviewOperation
         latestPNGExportID = nil
         currentPNGExportFailureID = nil
-        activeStrokePreviewID = nil
+        strokePreviewState = .idle
+        strokePreviewGeneration = 0
         pendingStrokePreview = nil
         strokePreviewDrainTask = nil
-        strokePreviewDrainID = nil
+        strokePreviewDrainToken = nil
         rendererCheckpoints = []
         self.rendererCheckpointByteBudget = max(rendererCheckpointByteBudget, 0)
         canvasDelegate = CanvasRendererDelegate(renderer: renderer)
@@ -200,130 +249,161 @@ public final class StudioModel: ObservableObject {
         refreshCapabilities()
     }
 
-    func beginStrokePreview(_ stroke: StrokeCommand) {
-        guard canAppendStroke(stroke) else { return }
-        guard activeStrokePreviewID == nil,
+    @discardableResult
+    func beginStrokePreview(_ stroke: StrokeCommand) -> StrokePreviewAdmission {
+        guard strokePreviewState.token == nil else { return .busy }
+        guard rendererRecoveryError == nil,
+              canAppendStroke(stroke),
               project.layers.contains(where: { $0.id == stroke.layerID })
-        else { return }
+        else { return .unavailable }
+        let token = nextStrokePreviewToken(for: stroke.id)
         do {
-            try renderer.beginStrokePreview(stroke)
-            activeStrokePreviewID = stroke.id
+            try renderer.beginStrokePreview(stroke, generation: token.generation)
+            strokePreviewState = .active(token)
             pendingStrokePreview = stroke
             startStrokePreviewDrainIfNeeded()
             error = nil
+            return .accepted
         } catch {
             self.error = StudioFailure(message: error.localizedDescription)
+            return .unavailable
         }
     }
 
     func updateStrokePreview(_ stroke: StrokeCommand) {
-        guard activeStrokePreviewID == stroke.id else { return }
+        guard case let .active(token) = strokePreviewState,
+              token.strokeID == stroke.id
+        else { return }
         pendingStrokePreview = stroke
         startStrokePreviewDrainIfNeeded()
     }
 
     func commitStrokePreview(_ stroke: StrokeCommand) async {
-        guard activeStrokePreviewID == stroke.id else { return }
+        guard case let .active(token) = strokePreviewState,
+              token.strokeID == stroke.id
+        else { return }
+        strokePreviewState = .finalizing(token)
+        refreshCapabilities()
         pendingStrokePreview = stroke
         startStrokePreviewDrainIfNeeded()
-        await waitForStrokePreviewIdle(id: stroke.id)
-        guard activeStrokePreviewID == stroke.id else { return }
+        await waitForStrokePreviewIdle(token: token)
+        guard isFinalizingStrokePreview(token) else { return }
         guard canAppendStroke(stroke) else {
-            cancelStrokePreviewAfterAdmissionFailure(id: stroke.id)
+            cancelStrokePreviewAfterAdmissionFailure(token: token)
             if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
             return
         }
         do {
-            try await renderer.finishStrokePreview(stroke)
+            try await strokePreviewOperation.finish(renderer, stroke, token.generation)
+            guard isFinalizingStrokePreview(token) else { return }
             try renderer.recordRenderedStroke(stroke)
             canvasWetness = renderer.canvasWetness
             editor.append(.stroke(stroke))
-            activeStrokePreviewID = nil
+            strokePreviewState = .idle
             pendingStrokePreview = nil
             publishEditorProject()
             error = nil
         } catch {
+            guard isFinalizingStrokePreview(token) else { return }
             let failure = StudioFailure(message: error.localizedDescription)
-            activeStrokePreviewID = nil
-            pendingStrokePreview = nil
-            try? renderer.replay(project: project)
-            self.error = failure
+            invalidateStrokePreview(token)
+            if case RendererError.strokePreviewRestoration = error {
+                enterRendererRecovery(error)
+            } else {
+                do {
+                    try renderer.replay(project: project)
+                    self.error = failure
+                } catch {
+                    enterRendererRecovery(error)
+                }
+            }
         }
+        refreshCapabilities()
         if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
     }
 
     func cancelStrokePreview() {
-        guard activeStrokePreviewID != nil else { return }
-        activeStrokePreviewID = nil
-        pendingStrokePreview = nil
-        strokePreviewDrainTask?.cancel()
-        strokePreviewDrainTask = nil
-        strokePreviewDrainID = nil
+        guard let token = strokePreviewState.token else { return }
+        let wasFinalizing = isFinalizingStrokePreview(token)
+        invalidateStrokePreview(token)
         do {
-            try renderer.cancelStrokePreview()
+            try renderer.cancelStrokePreview(generation: token.generation)
+            if wasFinalizing {
+                try renderer.replay(project: project)
+            }
             error = nil
         } catch {
-            self.error = StudioFailure(message: error.localizedDescription)
+            enterRendererRecovery(error)
         }
+        refreshCapabilities()
         if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
     }
 
     func waitForStrokePreviewIdle() async {
-        guard let activeStrokePreviewID else { return }
-        await waitForStrokePreviewIdle(id: activeStrokePreviewID)
+        guard let token = strokePreviewState.token else { return }
+        await waitForStrokePreviewIdle(token: token)
     }
 
     private func startStrokePreviewDrainIfNeeded() {
         guard strokePreviewDrainTask == nil,
-              let previewID = activeStrokePreviewID,
-              pendingStrokePreview?.id == previewID
+              let token = strokePreviewState.token,
+              pendingStrokePreview?.id == token.strokeID
         else { return }
 
-        strokePreviewDrainID = previewID
+        strokePreviewDrainToken = token
         strokePreviewDrainTask = Task { @MainActor [weak self] in
-            await self?.drainStrokePreviewUpdates(id: previewID)
+            await self?.drainStrokePreviewUpdates(token: token)
         }
     }
 
-    private func drainStrokePreviewUpdates(id previewID: UUID) async {
+    private func drainStrokePreviewUpdates(token: StudioStrokePreviewToken) async {
         while !Task.isCancelled,
-              activeStrokePreviewID == previewID,
+              isCurrentStrokePreview(token),
               let stroke = pendingStrokePreview,
-              stroke.id == previewID {
+              stroke.id == token.strokeID {
             pendingStrokePreview = nil
             do {
-                try await renderer.updateStrokePreview(stroke)
-                guard activeStrokePreviewID == previewID else { break }
+                try await strokePreviewOperation.update(renderer, stroke, token.generation)
+                guard isCurrentStrokePreview(token) else { break }
                 error = nil
                 if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
             } catch {
-                failStrokePreview(error, id: previewID)
+                guard isCurrentStrokePreview(token) else { break }
+                failStrokePreview(error, token: token)
                 break
             }
         }
 
-        guard strokePreviewDrainID == previewID else { return }
+        guard strokePreviewDrainToken == token else { return }
         strokePreviewDrainTask = nil
-        strokePreviewDrainID = nil
+        strokePreviewDrainToken = nil
         startStrokePreviewDrainIfNeeded()
     }
 
-    private func waitForStrokePreviewIdle(id previewID: UUID) async {
-        while activeStrokePreviewID == previewID {
+    private func waitForStrokePreviewIdle(token: StudioStrokePreviewToken) async {
+        while isCurrentStrokePreview(token) {
             startStrokePreviewDrainIfNeeded()
-            guard strokePreviewDrainID == previewID,
+            guard strokePreviewDrainToken == token,
                   let task = strokePreviewDrainTask
             else { return }
             await task.value
+            guard isCurrentStrokePreview(token) else { return }
         }
     }
 
-    private func failStrokePreview(_ previewError: Error, id previewID: UUID) {
-        guard activeStrokePreviewID == previewID else { return }
-        activeStrokePreviewID = nil
-        pendingStrokePreview = nil
-        try? renderer.cancelStrokePreview()
-        error = StudioFailure(message: previewError.localizedDescription)
+    private func failStrokePreview(
+        _ previewError: Error,
+        token: StudioStrokePreviewToken
+    ) {
+        guard isCurrentStrokePreview(token) else { return }
+        invalidateStrokePreview(token)
+        do {
+            try renderer.cancelStrokePreview(generation: token.generation)
+            error = StudioFailure(message: previewError.localizedDescription)
+        } catch {
+            enterRendererRecovery(error)
+        }
+        refreshCapabilities()
     }
 
     func completeStroke(_ stroke: StrokeCommand) {
@@ -344,8 +424,13 @@ public final class StudioModel: ObservableObject {
             error = nil
         } catch {
             let failure = StudioFailure(message: error.localizedDescription)
-            try? renderer.replay(project: project)
-            self.error = failure
+            do {
+                try renderer.replay(project: project)
+                self.error = failure
+            } catch {
+                enterRendererRecovery(error)
+                refreshCapabilities()
+            }
         }
     }
 
@@ -356,6 +441,7 @@ public final class StudioModel: ObservableObject {
     }
 
     private func canAppendStroke(_ stroke: StrokeCommand) -> Bool {
+        guard rendererRecoveryError == nil else { return false }
         guard canAppendCommand else {
             reportCommandCapacityFailure()
             return false
@@ -389,11 +475,55 @@ public final class StudioModel: ObservableObject {
         return nil
     }
 
-    private func cancelStrokePreviewAfterAdmissionFailure(id previewID: UUID) {
-        guard activeStrokePreviewID == previewID else { return }
-        activeStrokePreviewID = nil
+    private func cancelStrokePreviewAfterAdmissionFailure(
+        token: StudioStrokePreviewToken
+    ) {
+        guard isFinalizingStrokePreview(token) else { return }
+        let admissionFailure = error
+        invalidateStrokePreview(token)
+        do {
+            try renderer.cancelStrokePreview(generation: token.generation)
+            error = admissionFailure
+        } catch {
+            enterRendererRecovery(error)
+        }
+        refreshCapabilities()
+    }
+
+    private func nextStrokePreviewToken(for strokeID: UUID) -> StudioStrokePreviewToken {
+        strokePreviewGeneration += 1
+        return StudioStrokePreviewToken(
+            strokeID: strokeID,
+            generation: strokePreviewGeneration
+        )
+    }
+
+    private func invalidateStrokePreview(_ token: StudioStrokePreviewToken) {
+        guard isCurrentStrokePreview(token) else { return }
+        strokePreviewGeneration += 1
+        strokePreviewState = .idle
         pendingStrokePreview = nil
-        try? renderer.cancelStrokePreview()
+        strokePreviewDrainTask?.cancel()
+        strokePreviewDrainTask = nil
+        strokePreviewDrainToken = nil
+    }
+
+    private func isCurrentStrokePreview(_ token: StudioStrokePreviewToken) -> Bool {
+        strokePreviewState.token == token
+    }
+
+    private func isFinalizingStrokePreview(_ token: StudioStrokePreviewToken) -> Bool {
+        guard case let .finalizing(current) = strokePreviewState else { return false }
+        return current == token
+    }
+
+    private func enterRendererRecovery(_ recoveryCause: Error) {
+        let recoveryError = StudioRendererRecoveryError.previewRestorationFailed(
+            recoveryCause.localizedDescription
+        )
+        rendererRecoveryError = recoveryError
+        rendererCheckpoints.removeAll()
+        error = StudioFailure(message: recoveryError.localizedDescription)
     }
 
     public func addLayer() {
@@ -734,7 +864,8 @@ public final class StudioModel: ObservableObject {
             : updatedProject.layers[0].id
 
         do {
-            if let checkpointRenderer = takeRendererCheckpoint(for: updatedProject) {
+            if rendererRecoveryError == nil,
+               let checkpointRenderer = takeRendererCheckpoint(for: updatedProject) {
                 replaceRenderer(with: checkpointRenderer, checkpointCurrent: true)
             } else {
                 rendererCheckpoints.removeAll()
@@ -763,7 +894,9 @@ public final class StudioModel: ObservableObject {
             try edit(&updatedEditor)
             let updatedProject = updatedEditor.project
             guard updatedProject != previousProject else { return true }
-            let preparedCheckpoint = prepareCurrentRendererCheckpointForCandidateAllocation()
+            let preparedCheckpoint = rendererRecoveryError == nil
+                ? prepareCurrentRendererCheckpointForCandidateAllocation()
+                : nil
             let candidateRenderer = try renderer.makeCandidate(project: updatedProject)
             if let preparedCheckpoint {
                 appendRendererCheckpoint(preparedCheckpoint)
@@ -794,7 +927,13 @@ public final class StudioModel: ObservableObject {
             try edit(&updatedEditor)
             let updatedProject = updatedEditor.project
             guard updatedProject != previousProject else { return true }
-            try renderer.applyMetadata(project: updatedProject)
+            if rendererRecoveryError == nil {
+                try renderer.applyMetadata(project: updatedProject)
+            } else {
+                rendererCheckpoints.removeAll()
+                let candidateRenderer = try renderer.makeCandidate(project: updatedProject)
+                replaceRenderer(with: candidateRenderer)
+            }
             publishSuccessfulEdit(
                 editor: updatedEditor,
                 project: updatedProject,
@@ -832,6 +971,7 @@ public final class StudioModel: ObservableObject {
             storeRendererCheckpoint(project: project, renderer: self.renderer)
         }
         self.renderer = renderer
+        rendererRecoveryError = nil
         canvasWetness = renderer.canvasWetness
         layerOpacityPreviews.removeAll()
         canvasDelegate.replaceRenderer(with: renderer)
@@ -841,6 +981,7 @@ public final class StudioModel: ObservableObject {
     }
 
     private func storeRendererCheckpoint(project: PaintingProject, renderer: WatercolorRenderer) {
+        guard rendererRecoveryError == nil else { return }
         let checkpoint = RendererCheckpoint(
             project: project,
             renderer: renderer,
@@ -911,12 +1052,32 @@ public final class StudioModel: ObservableObject {
 
     private func refreshCapabilities() {
         capabilities = StudioCapabilities(
-            canPaint: project.layers.contains(where: { $0.id == selectedLayerID }),
+            canPaint: rendererRecoveryError == nil
+                && !isStrokePreviewFinalizing
+                && project.layers.contains(where: { $0.id == selectedLayerID }),
             canUndo: editor.canUndo,
             canRedo: editor.canRedo
         )
     }
 
+}
+
+private struct StudioStrokePreviewToken: Equatable {
+    let strokeID: UUID
+    let generation: UInt64
+}
+
+private enum StudioStrokePreviewState {
+    case idle
+    case active(StudioStrokePreviewToken)
+    case finalizing(StudioStrokePreviewToken)
+
+    var token: StudioStrokePreviewToken? {
+        switch self {
+        case .idle: nil
+        case let .active(token), let .finalizing(token): token
+        }
+    }
 }
 
 @MainActor

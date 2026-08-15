@@ -443,6 +443,302 @@ import WatercolorCore
         #expect(try renderer.studioChecksum() == before)
     }
 
+    @Test func previewCancelCannotCommitAfterSuspendedFinish() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let finish = ControlledPreviewSuspension()
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) },
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, stroke, generation in
+                    try await renderer.updateStrokePreview(stroke, generation: generation)
+                },
+                finish: { renderer, stroke, generation in
+                    try await renderer.finishStrokePreview(stroke, generation: generation)
+                    _ = try await finish.suspendOnce()
+                }
+            )
+        )
+        let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
+        let checksumBefore = try renderer.studioChecksum()
+
+        #expect(model.beginStrokePreview(stroke) == .accepted)
+        let commit = Task { @MainActor in
+            await model.commitStrokePreview(stroke)
+        }
+        await finish.waitUntilSuspended()
+
+        #expect(!model.capabilities.canPaint)
+        model.cancelStrokePreview()
+        #expect(model.project == project)
+        #expect(documentUpdates.isEmpty)
+        #expect(try renderer.studioChecksum() == checksumBefore)
+
+        await finish.resume()
+        await commit.value
+
+        #expect(model.project == project)
+        #expect(model.rendererProject == project)
+        #expect(documentUpdates.isEmpty)
+        #expect(try renderer.studioChecksum() == checksumBefore)
+    }
+
+    @Test func staleUpdateFailureCannotCancelAReusedStrokeIDGeneration() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let update = ControlledPreviewSuspension()
+        let secondUpdateCompleted = ControlledPreviewSignal()
+        let operation = StrokePreviewRendererOperation(
+            update: { renderer, stroke, generation in
+                let wasSuspended = try await update.suspendOnce()
+                try await renderer.updateStrokePreview(stroke, generation: generation)
+                if !wasSuspended {
+                    await secondUpdateCompleted.signal()
+                }
+            },
+            finish: { renderer, stroke, generation in
+                try await renderer.finishStrokePreview(stroke, generation: generation)
+            }
+        )
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            strokePreviewOperation: operation
+        )
+        let reusedID = UUID(uuidString: "13400374-15FD-45EE-958D-3B9BB767281A")!
+        let first = StrokeCommand.studioTestStroke(
+            id: reusedID,
+            layerID: project.layers[0].id,
+            x: 64,
+            y: 64
+        )
+        let second = StrokeCommand.studioTestStroke(
+            id: reusedID,
+            layerID: project.layers[0].id,
+            x: 192,
+            y: 192
+        )
+
+        #expect(model.beginStrokePreview(first) == .accepted)
+        let firstCommit = Task { @MainActor in
+            await model.commitStrokePreview(first)
+        }
+        await update.waitUntilSuspended()
+        model.cancelStrokePreview()
+        #expect(model.beginStrokePreview(second) == .accepted)
+        await secondUpdateCompleted.wait()
+
+        await update.resume()
+        await firstCommit.value
+
+        #expect(model.isStrokePreviewActive)
+        #expect(model.error == nil)
+        model.cancelStrokePreview()
+    }
+
+    @Test func failedPreviewRestorationDisablesPaintingUntilRendererRebuild() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let injectedError = NSError(
+            domain: "StudioModelTests",
+            code: 43,
+            userInfo: [NSLocalizedDescriptionKey: "preview restoration failed"]
+        )
+        var shouldFailReplay = false
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugCommandBufferError: { commandBuffer in
+                if shouldFailReplay, commandBuffer.label == "Watercolor replay" {
+                    return injectedError
+                }
+                return commandBuffer.error
+            }
+        )
+        let finish = ControlledPreviewSuspension()
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) },
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, stroke, generation in
+                    try await renderer.updateStrokePreview(stroke, generation: generation)
+                },
+                finish: { renderer, stroke, generation in
+                    try await renderer.finishStrokePreview(stroke, generation: generation)
+                    _ = try await finish.suspendOnce()
+                }
+            )
+        )
+        let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
+
+        #expect(model.beginStrokePreview(stroke) == .accepted)
+        let commit = Task { @MainActor in
+            await model.commitStrokePreview(stroke)
+        }
+        await finish.waitUntilSuspended()
+        shouldFailReplay = true
+
+        model.cancelStrokePreview()
+
+        #expect(model.project == project)
+        #expect(documentUpdates.isEmpty)
+        #expect(!model.capabilities.canPaint)
+        #expect(model.rendererRecoveryError != nil)
+        #expect(
+            model.beginStrokePreview(.studioTestStroke(layerID: project.layers[0].id))
+                == .unavailable
+        )
+
+        shouldFailReplay = false
+        await finish.resume()
+        await commit.value
+        model.addLayer()
+
+        #expect(model.rendererRecoveryError == nil)
+        #expect(model.capabilities.canPaint)
+        #expect(model.rendererCheckpointCountForTesting == 0)
+    }
+
+    @Test func failedPreviewCancellationRestoreDisablesPainting() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let injectedError = NSError(
+            domain: "StudioModelTests",
+            code: 44,
+            userInfo: [NSLocalizedDescriptionKey: "preview cancellation restore failed"]
+        )
+        var shouldFailCancellation = false
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugCommandBufferError: { commandBuffer in
+                if shouldFailCancellation,
+                   commandBuffer.label == "Cancel watercolor stroke preview" {
+                    return injectedError
+                }
+                return commandBuffer.error
+            }
+        )
+        let model = StudioModel(project: project, renderer: renderer)
+        var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
+        stroke.points = (0..<8).map { index in
+            StrokePoint(
+                x: Double(64 + index * 8),
+                y: 64,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 60
+            )
+        }
+
+        #expect(model.beginStrokePreview(stroke) == .accepted)
+        await model.waitForStrokePreviewIdle()
+        shouldFailCancellation = true
+
+        model.cancelStrokePreview()
+
+        #expect(model.project == project)
+        #expect(model.rendererRecoveryError != nil)
+        #expect(!model.capabilities.canPaint)
+    }
+
+    @Test func failedPreviewFinishRestorationDisablesPainting() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let injectedError = NSError(
+            domain: "StudioModelTests",
+            code: 45,
+            userInfo: [NSLocalizedDescriptionKey: "preview finish restoration failed"]
+        )
+        var shouldFailFinish = false
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugCommandBufferError: { commandBuffer in
+                if shouldFailFinish,
+                   commandBuffer.label == "Commit watercolor stroke preview"
+                    || commandBuffer.label == "Cancel watercolor stroke preview" {
+                    return injectedError
+                }
+                return commandBuffer.error
+            }
+        )
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+        var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
+        stroke.points = (0..<8).map { index in
+            StrokePoint(
+                x: Double(64 + index * 8),
+                y: 64,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 60
+            )
+        }
+
+        #expect(model.beginStrokePreview(stroke) == .accepted)
+        await model.waitForStrokePreviewIdle()
+        shouldFailFinish = true
+
+        await model.commitStrokePreview(stroke)
+
+        #expect(model.project == project)
+        #expect(documentUpdates.isEmpty)
+        #expect(model.rendererRecoveryError != nil)
+        #expect(!model.capabilities.canPaint)
+    }
+
+    @Test func finishFailureAfterCancellationCannotReplaceRecoveredState() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let finish = ControlledPreviewSuspension()
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, stroke, generation in
+                    try await renderer.updateStrokePreview(stroke, generation: generation)
+                },
+                finish: { renderer, stroke, generation in
+                    try await renderer.finishStrokePreview(stroke, generation: generation)
+                    _ = try await finish.suspendOnce()
+                }
+            )
+        )
+        let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
+        let checksumBefore = try renderer.studioChecksum()
+
+        #expect(model.beginStrokePreview(stroke) == .accepted)
+        let commit = Task { @MainActor in
+            await model.commitStrokePreview(stroke)
+        }
+        await finish.waitUntilSuspended()
+        model.cancelStrokePreview()
+
+        await finish.fail(message: "finish completed after cancellation")
+        await commit.value
+
+        #expect(model.project == project)
+        #expect(model.error == nil)
+        #expect(model.rendererRecoveryError == nil)
+        #expect(model.capabilities.canPaint)
+        #expect(try renderer.studioChecksum() == checksumBefore)
+    }
+
     @Test func firstPreviewWorkAdmissionFailurePreservesPaintThroughModelCancellation() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         var project = PaintingProject.studioTestProject()
@@ -625,6 +921,37 @@ import WatercolorCore
         #expect(model.error == nil)
         #expect(try renderer.debugPixel(x: 64, y: 64).alpha == 0)
         #expect(try renderer.debugPixel(x: 192, y: 192).alpha > 0.1)
+    }
+
+    @Test func completedStrokeRollbackFailureDisablesPainting() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let injectedError = NSError(
+            domain: "StudioModelTests",
+            code: 8,
+            userInfo: [NSLocalizedDescriptionKey: "stroke rollback failed"]
+        )
+        var shouldFail = false
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugCommandBufferError: { commandBuffer in
+                if shouldFail,
+                   commandBuffer.label == "Watercolor stroke"
+                    || commandBuffer.label == "Watercolor replay" {
+                    return injectedError
+                }
+                return commandBuffer.error
+            }
+        )
+        let model = StudioModel(project: project, renderer: renderer)
+        shouldFail = true
+
+        model.completeStroke(.studioTestStroke(layerID: project.layers[0].id))
+
+        #expect(model.project == project)
+        #expect(model.rendererRecoveryError != nil)
+        #expect(!model.capabilities.canPaint)
     }
 
     @Test func configuringACanvasAttachesOnlyTheDisplayDelegate() throws {
@@ -1505,6 +1832,84 @@ private final class CommandBufferLabelCounter: @unchecked Sendable {
         defer { lock.unlock() }
         return storage
     }
+}
+
+private actor ControlledPreviewSuspension {
+    private enum Outcome {
+        case resume
+        case failure(String)
+    }
+
+    private var hasSuspended = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var completion: CheckedContinuation<Outcome, Never>?
+    private var pendingOutcome: Outcome?
+
+    func suspendOnce() async throws -> Bool {
+        guard !hasSuspended else { return false }
+        hasSuspended = true
+        startWaiters.forEach { $0.resume() }
+        startWaiters.removeAll()
+        let outcome = if let pendingOutcome {
+            pendingOutcome
+        } else {
+            await withCheckedContinuation { continuation in
+                completion = continuation
+            }
+        }
+        if case let .failure(message) = outcome {
+            throw ControlledPreviewError(message: message)
+        }
+        return true
+    }
+
+    func waitUntilSuspended() async {
+        guard !hasSuspended else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func resume() {
+        resolve(with: .resume)
+    }
+
+    func fail(message: String) {
+        resolve(with: .failure(message))
+    }
+
+    private func resolve(with outcome: Outcome) {
+        if let completion {
+            self.completion = nil
+            completion.resume(returning: outcome)
+        } else {
+            pendingOutcome = outcome
+        }
+    }
+}
+
+private actor ControlledPreviewSignal {
+    private var isSignaled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        isSignaled = true
+        waiters.forEach { $0.resume() }
+        waiters.removeAll()
+    }
+
+    func wait() async {
+        guard !isSignaled else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+}
+
+private struct ControlledPreviewError: Error, LocalizedError {
+    let message: String
+
+    var errorDescription: String? { message }
 }
 
 @MainActor

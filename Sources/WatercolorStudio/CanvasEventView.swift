@@ -76,6 +76,7 @@ public final class CanvasEventView: MTKView {
     public init(model: StudioModel) {
         self.model = model
         super.init(frame: .zero, device: nil)
+        updateInputAvailability()
     }
 
     @available(*, unavailable)
@@ -113,6 +114,7 @@ public final class CanvasEventView: MTKView {
 
     func synchronize(with model: StudioModel) {
         guard self.model !== model else {
+            updateInputAvailability()
             requestCanvasDraw()
             return
         }
@@ -123,6 +125,12 @@ public final class CanvasEventView: MTKView {
         spaceKeyDown = false
         self.model = model
         model.configureCanvas(self)
+        updateInputAvailability()
+    }
+
+    public override func resetCursorRects() {
+        let cursor: NSCursor = model.capabilities.canPaint ? .crosshair : .operationNotAllowed
+        addCursorRect(bounds, cursor: cursor)
     }
 
     public override func keyDown(with event: NSEvent) {
@@ -232,7 +240,6 @@ public final class CanvasEventView: MTKView {
     }
 
     private func beginStroke(with event: NSEvent) {
-        guard model.capabilities.canPaint else { return }
         var builder = CanvasStrokeBuilder(
             canvasSize: CGSize(width: model.project.canvas.width, height: model.project.canvas.height)
         )
@@ -242,10 +249,14 @@ public final class CanvasEventView: MTKView {
             brush: model.brush,
             point: strokePoint(from: event)
         )
-        strokeBuilder = builder
-        if let stroke = builder.currentStroke {
-            model.beginStrokePreview(stroke)
+        guard let stroke = builder.currentStroke,
+              model.beginStrokePreview(stroke) == .accepted
+        else {
+            strokeBuilder = nil
+            updateInputAvailability()
+            return
         }
+        strokeBuilder = builder
     }
 
     private func appendStrokePoint(from event: NSEvent) {
@@ -294,6 +305,20 @@ public final class CanvasEventView: MTKView {
         strokeBuilder = nil
         panAnchor = nil
         spaceKeyDown = false
+    }
+
+    private func updateInputAvailability() {
+        let help: String?
+        if model.isStrokePreviewFinalizing {
+            help = "Finishing stroke."
+        } else if !model.capabilities.canPaint {
+            help = "Painting unavailable."
+        } else {
+            help = nil
+        }
+        toolTip = help
+        setAccessibilityHelp(help)
+        window?.invalidateCursorRects(for: self)
     }
 
     private func strokePoint(from event: NSEvent) -> StrokePoint {
