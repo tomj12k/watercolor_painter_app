@@ -62,6 +62,12 @@ public final class StudioModel: ObservableObject {
         ObjectIdentifier(renderer)
     }
 
+    #if DEBUG
+    var rendererForTesting: WatercolorRenderer {
+        renderer
+    }
+    #endif
+
     public var canAddLayer: Bool {
         project.layers.count < PaintingProject.maximumLayerCount
     }
@@ -291,7 +297,7 @@ public final class StudioModel: ObservableObject {
 
     public func selectPaper(_ paper: PaperTexture) {
         let selectedLayerID = selectedLayerID
-        performMetadataEdit(
+        performProjectEdit(
             { editor in editor.setPaper(paper) },
             selecting: { project in
                 project.layers.first(where: { $0.id == selectedLayerID })?.id

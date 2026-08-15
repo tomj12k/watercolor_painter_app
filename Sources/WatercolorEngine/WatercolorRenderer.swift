@@ -316,6 +316,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         let currentIdentifiers = Set(project.layers.map(\.id))
         let updatedIdentifiers = Set(updatedProject.layers.map(\.id))
         guard updatedProject.canvas == project.canvas,
+              updatedProject.paper == project.paper,
               updatedProject.commands == project.commands,
               currentIdentifiers == updatedIdentifiers,
               updatedProject.layers.count == project.layers.count

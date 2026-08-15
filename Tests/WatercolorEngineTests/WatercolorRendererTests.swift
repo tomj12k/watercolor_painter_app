@@ -367,7 +367,6 @@ import WatercolorCore
         var updated = project
         updated.layers.reverse()
         updated.layers[0].opacity = 0.25
-        updated.paper = .rough
 
         try renderer.applyMetadata(project: updated)
 
@@ -375,6 +374,31 @@ import WatercolorCore
         #expect(renderer.debugResources == resourcesBefore)
         #expect(renderer.debugReplayCount == replayCountBefore)
         #expect(try renderer.compositeChecksum() != checksumBefore)
+    }
+
+    @Test func metadataTransactionRejectsPaperChangesWithoutMutatingTheRenderer() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.testCanvas(64, paper: .coldPress)
+        project.commands = [.stroke(.testDot(layerID: project.layers[0].id))]
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let resourcesBefore = renderer.debugResources
+        let replayCountBefore = renderer.debugReplayCount
+        let checksumBefore = try renderer.compositeChecksum()
+        let pigmentBefore = try renderer.debugPixel(x: 32, y: 32, layerID: project.layers[0].id)
+        let wetnessBefore = try renderer.debugWetness(x: 32, y: 32, layerID: project.layers[0].id)
+        var updated = project
+        updated.paper = .rough
+
+        #expect(throws: RendererError.invalidMetadataChange) {
+            try renderer.applyMetadata(project: updated)
+        }
+
+        #expect(renderer.project == project)
+        #expect(renderer.debugResources == resourcesBefore)
+        #expect(renderer.debugReplayCount == replayCountBefore)
+        #expect(try renderer.compositeChecksum() == checksumBefore)
+        #expect(try renderer.debugPixel(x: 32, y: 32, layerID: project.layers[0].id) == pigmentBefore)
+        #expect(try renderer.debugWetness(x: 32, y: 32, layerID: project.layers[0].id) == wetnessBefore)
     }
 
     @Test func failedOpacityPreviewLeavesCommittedMetadataAndAllowsTheNextPreview() throws {

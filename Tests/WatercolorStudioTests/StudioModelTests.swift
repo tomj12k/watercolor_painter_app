@@ -402,7 +402,6 @@ import WatercolorCore
         model.renameLayer(id: project.layers[0].id, to: "Ground")
         model.setLayerVisibility(id: project.layers[0].id, isVisible: false)
         model.moveSelectedLayerUp()
-        model.selectPaper(.rough)
         model.previewLayerOpacity(id: top.id, opacity: 0.35)
         model.commitLayerOpacity(id: top.id)
 
@@ -410,7 +409,7 @@ import WatercolorCore
         #expect(renderer.debugResources == resourcesBefore)
         #expect(renderer.debugReplayCount == replayCountBefore)
         #expect(model.rendererProject == model.project)
-        #expect(documentUpdates.count == 5)
+        #expect(documentUpdates.count == 4)
         #expect(model.capabilities.canUndo)
         #expect(model.project.layers.first(where: { $0.id == top.id })?.opacity == 0.35)
     }
@@ -598,6 +597,43 @@ import WatercolorCore
         #expect(documentUpdates == [model.project])
     }
 
+    @Test func changingPaperReplaysPaintedRasterExactlyAsTheSavedProjectReopens() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.studioTestProject()
+        let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
+        project.commands = [.stroke(stroke)]
+        let originalRenderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: originalRenderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+
+        model.selectPaper(.rough)
+
+        let reopenedProject = try PaintingDocumentCodec.decode(
+            PaintingDocumentCodec.encode(model.project)
+        )
+        let reopenedRenderer = try WatercolorRenderer(project: reopenedProject, device: device)
+        let liveRenderer = model.rendererForTesting
+        #expect(model.project == reopenedProject)
+        #expect(liveRenderer.project == reopenedProject)
+        #expect(
+            try liveRenderer.debugPixel(x: 128, y: 128, layerID: project.layers[0].id)
+                == reopenedRenderer.debugPixel(x: 128, y: 128, layerID: project.layers[0].id)
+        )
+        #expect(
+            try liveRenderer.debugWetness(x: 128, y: 128, layerID: project.layers[0].id)
+                == reopenedRenderer.debugWetness(x: 128, y: 128, layerID: project.layers[0].id)
+        )
+        #expect(try liveRenderer.studioChecksum() == reopenedRenderer.studioChecksum())
+        #expect(model.canvasWetness == reopenedRenderer.canvasWetness)
+        #expect(model.rendererIdentity != ObjectIdentifier(originalRenderer))
+        #expect(liveRenderer.debugResources.pipelines == originalRenderer.debugResources.pipelines)
+        #expect(documentUpdates == [model.project])
+    }
+
     @Test func selectingTheCurrentPaperDoesNotPublishANoOpEdit() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
@@ -614,6 +650,59 @@ import WatercolorCore
         #expect(model.project == project)
         #expect(documentUpdates.isEmpty)
         #expect(!model.capabilities.canUndo)
+    }
+
+    @Test func failedPaperReplayPreservesTheLiveModelRendererAndDocument() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.studioTestProject()
+        project.commands = [
+            .stroke(.studioTestStroke(layerID: project.layers[0].id))
+        ]
+        let injectedError = NSError(
+            domain: "StudioModelTests",
+            code: 10,
+            userInfo: [NSLocalizedDescriptionKey: "deterministic paper replay failure"]
+        )
+        var shouldFail = false
+        var failedReplayCount = 0
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugCommandBufferError: { commandBuffer in
+                if shouldFail, commandBuffer.label == "Watercolor replay" {
+                    failedReplayCount += 1
+                    return injectedError
+                }
+                return commandBuffer.error
+            }
+        )
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+        let rendererIdentity = model.rendererIdentity
+        let checksum = try renderer.studioChecksum()
+        let pigment = try renderer.debugPixel(x: 128, y: 128, layerID: project.layers[0].id)
+        let wetness = try renderer.debugWetness(x: 128, y: 128, layerID: project.layers[0].id)
+        let canvasWetness = model.canvasWetness
+        shouldFail = true
+
+        model.selectPaper(.rough)
+
+        #expect(model.project == project)
+        #expect(model.rendererProject == project)
+        #expect(model.rendererIdentity == rendererIdentity)
+        #expect(model.selectedLayerID == project.layers[0].id)
+        #expect(documentUpdates.isEmpty)
+        #expect(!model.capabilities.canUndo)
+        #expect(try renderer.studioChecksum() == checksum)
+        #expect(try renderer.debugPixel(x: 128, y: 128, layerID: project.layers[0].id) == pigment)
+        #expect(try renderer.debugWetness(x: 128, y: 128, layerID: project.layers[0].id) == wetness)
+        #expect(model.canvasWetness == canvasWetness)
+        #expect(model.error?.message.contains("deterministic paper replay failure") == true)
+        #expect(failedReplayCount == 1)
     }
 
     @Test func brushSizeAdjustmentsStayWithinThePaintableRange() throws {
