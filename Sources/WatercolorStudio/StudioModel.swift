@@ -1,7 +1,9 @@
 import Combine
 import CoreGraphics
 import Foundation
+import ImageIO
 import MetalKit
+import UniformTypeIdentifiers
 import WatercolorCore
 import WatercolorEngine
 
@@ -27,16 +29,10 @@ public struct StudioFailure: Identifiable, Equatable, Sendable {
     }
 }
 
-public enum StudioActionRequest: Equatable, Sendable {
-    case undo
-    case redo
-    case dryLayer(UUID)
-    case exportPNG
-}
-
 @MainActor
 public final class StudioModel: ObservableObject {
     public static let brushSizeRange = 1.0...300.0
+    private static let dryStepCount = 24
 
     @Published public private(set) var project: PaintingProject
     @Published public var selectedLayerID: UUID {
@@ -48,7 +44,6 @@ public final class StudioModel: ObservableObject {
     @Published public var pan: CGSize
     @Published public private(set) var error: StudioFailure?
     @Published public private(set) var capabilities: StudioCapabilities
-    @Published public private(set) var requestedAction: StudioActionRequest?
     @Published public private(set) var canvasWetness: Double
     @Published public private(set) var layerOpacityPreviews: [UUID: Double]
 
@@ -121,7 +116,6 @@ public final class StudioModel: ObservableObject {
         pan = .zero
         error = nil
         capabilities = StudioCapabilities(canPaint: true, canUndo: false, canRedo: false)
-        requestedAction = nil
         canvasWetness = renderer.canvasWetness
         layerOpacityPreviews = [:]
         self.renderer = renderer
@@ -140,6 +134,7 @@ public final class StudioModel: ObservableObject {
 
         do {
             try renderer.renderAndWait(stroke: stroke)
+            try renderer.recordRenderedStroke(stroke)
             canvasWetness = renderer.canvasWetness
             editor.append(.stroke(stroke))
             publishEditorProject()
@@ -339,21 +334,47 @@ public final class StudioModel: ObservableObject {
         pan = .zero
     }
 
-    public func requestUndo() {
-        requestedAction = .undo
+    public func undo() {
+        guard editor.canUndo else { return }
+        performHistoryMove { editor in
+            _ = editor.undo()
+        }
     }
 
-    public func requestRedo() {
-        requestedAction = .redo
+    public func redo() {
+        guard editor.canRedo else { return }
+        performHistoryMove { editor in
+            _ = editor.redo()
+        }
     }
 
-    public func requestDrySelectedLayer() {
+    public func drySelectedLayer() {
         guard selectedLayerIndex != nil else { return }
-        requestedAction = .dryLayer(selectedLayerID)
+        let layerID = selectedLayerID
+        performProjectEdit(
+            { editor in
+                editor.append(.dryLayer(DryLayerCommand(
+                    layerID: layerID,
+                    steps: Self.dryStepCount
+                )))
+            },
+            selecting: { _ in layerID }
+        )
     }
 
-    public func requestPNGExport() {
-        requestedAction = .exportPNG
+    public func exportPNG(to destinationURL: URL) async {
+        do {
+            let image = try renderer.makeCGImage()
+            let data = try Self.pngData(from: image)
+            try await Task.detached {
+                try data.write(to: destinationURL, options: .atomic)
+            }.value
+            error = nil
+        } catch {
+            self.error = StudioFailure(
+                message: "Could not export PNG to \(destinationURL.lastPathComponent): \(error.localizedDescription)"
+            )
+        }
     }
 
     public func dismissError() {
@@ -404,6 +425,27 @@ public final class StudioModel: ObservableObject {
         project = editor.project
         refreshCapabilities()
         onDocumentUpdate?(project)
+    }
+
+    private func performHistoryMove(_ move: (inout ProjectEditor) -> Void) {
+        var updatedEditor = editor
+        move(&updatedEditor)
+        let updatedProject = updatedEditor.project
+        let nextSelection = updatedProject.layers.contains(where: { $0.id == selectedLayerID })
+            ? selectedLayerID
+            : updatedProject.layers[0].id
+
+        do {
+            let candidateRenderer = try renderer.makeCandidate(project: updatedProject)
+            replaceRenderer(with: candidateRenderer)
+            publishSuccessfulEdit(
+                editor: updatedEditor,
+                project: updatedProject,
+                selectedLayerID: nextSelection
+            )
+        } catch {
+            self.error = StudioFailure(message: error.localizedDescription)
+        }
     }
 
     @discardableResult
@@ -505,6 +547,23 @@ public final class StudioModel: ObservableObject {
             canRedo: editor.canRedo
         )
     }
+
+    private static func pngData(from image: CGImage) throws -> Data {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            data,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw StudioCoordinationError.pngEncoding
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw StudioCoordinationError.pngEncoding
+        }
+        return data as Data
+    }
 }
 
 @MainActor
@@ -530,11 +589,14 @@ private final class CanvasRendererDelegate: NSObject, MTKViewDelegate {
 
 private enum StudioCoordinationError: LocalizedError {
     case strokeLayerUnavailable(UUID)
+    case pngEncoding
 
     var errorDescription: String? {
         switch self {
         case let .strokeLayerUnavailable(identifier):
             "Stroke layer \(identifier.uuidString) is not part of this project."
+        case .pngEncoding:
+            "Image I/O could not encode the composited canvas."
         }
     }
 }

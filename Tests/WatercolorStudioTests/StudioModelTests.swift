@@ -774,20 +774,16 @@ import WatercolorCore
         #expect(model.pan == .zero)
     }
 
-    @Test func deferredCommandsExposeTheirRequestWithoutMutatingTheProject() throws {
+    @Test func unavailableFocusedCommandsAreSilentNoOps() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
         let renderer = try WatercolorRenderer(project: project, device: device)
         let model = StudioModel(project: project, renderer: renderer)
 
-        model.requestUndo()
-        #expect(model.requestedAction == .undo)
-        model.requestRedo()
-        #expect(model.requestedAction == .redo)
-        model.requestDrySelectedLayer()
-        #expect(model.requestedAction == .dryLayer(project.layers[0].id))
-        model.requestPNGExport()
-        #expect(model.requestedAction == .exportPNG)
+        model.undo()
+        model.redo()
+        model.selectedLayerID = UUID()
+        model.drySelectedLayer()
         #expect(model.project == project)
     }
 

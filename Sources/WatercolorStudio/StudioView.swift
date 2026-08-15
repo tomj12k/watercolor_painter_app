@@ -141,13 +141,13 @@ public struct StudioView: View {
     @ToolbarContentBuilder
     private var studioToolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .navigation) {
-            Button(action: model.requestUndo) {
+            Button(action: model.undo) {
                 Label("Undo", systemImage: "arrow.uturn.backward")
             }
             .disabled(!model.capabilities.canUndo)
             .help("Undo (Command-Z)")
 
-            Button(action: model.requestRedo) {
+            Button(action: model.redo) {
                 Label("Redo", systemImage: "arrow.uturn.forward")
             }
             .disabled(!model.capabilities.canRedo)
@@ -182,13 +182,15 @@ public struct StudioView: View {
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
-            Button(action: model.requestDrySelectedLayer) {
+            Button(action: model.drySelectedLayer) {
                 Label("Dry layer", systemImage: "wind")
             }
             .disabled(!model.capabilities.canPaint)
             .help("Dry selected layer")
 
-            Button(action: model.requestPNGExport) {
+            Button {
+                StudioPNGExportPanel.present(for: model)
+            } label: {
                 Label("Export PNG", systemImage: "square.and.arrow.up")
             }
             .help("Export PNG")

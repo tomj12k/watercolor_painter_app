@@ -191,6 +191,13 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         try render(stroke: stroke, waitUntilCompleted: true)
     }
 
+    public func recordRenderedStroke(_ stroke: StrokeCommand) throws {
+        guard project.layers.contains(where: { $0.id == stroke.layerID }) else {
+            throw RendererError.unknownLayer(stroke.layerID)
+        }
+        project.commands.append(.stroke(stroke))
+    }
+
     private func render(stroke: StrokeCommand, waitUntilCompleted: Bool) throws {
         guard project.layers.contains(where: { $0.id == stroke.layerID }),
               let slice = layerSlices[stroke.layerID]
@@ -1245,6 +1252,18 @@ struct RendererDebugWetnessReductionResources: Equatable {
 }
 
 extension WatercolorRenderer {
+    func pixelChecksum() throws -> UInt64 {
+        let image = try makeCGImage()
+        guard let data = image.dataProvider?.data,
+              let bytes = CFDataGetBytePtr(data)
+        else {
+            throw RendererError.readback("The pixel checksum could not access image bytes")
+        }
+        return (0..<CFDataGetLength(data)).reduce(UInt64(0)) { checksum, index in
+            (checksum &* 16_777_619) ^ UInt64(bytes[index])
+        }
+    }
+
     var debugResources: RendererDebugResources {
         RendererDebugResources(
             pigmentTextures: pigmentTextures.map { ObjectIdentifier($0 as AnyObject) },
