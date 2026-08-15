@@ -74,11 +74,6 @@ public final class CanvasEventView: MTKView {
     public init(model: StudioModel) {
         self.model = model
         super.init(frame: .zero, device: nil)
-        isPaused = true
-        enableSetNeedsDisplay = true
-        autoResizeDrawable = true
-        colorPixelFormat = .bgra8Unorm
-        clearColor = MTLClearColor(red: 0.12, green: 0.12, blue: 0.13, alpha: 1)
     }
 
     @available(*, unavailable)
@@ -172,7 +167,7 @@ public final class CanvasEventView: MTKView {
         guard newZoom != oldZoom else { return }
 
         let location = convert(event.locationInWindow, from: nil)
-        let anchoredCanvasPoint = canvasTransform.canvasPoint(fromView: location)
+        let anchoredCanvasPoint = canvasTransform.viewportPoint(fromView: location)
         model.zoom = newZoom
         let shiftedLocation = canvasTransform.viewPoint(fromCanvas: anchoredCanvasPoint)
         model.pan.width += location.x - shiftedLocation.x
@@ -270,8 +265,7 @@ public final class CanvasEventView: MTKView {
     }
 
     private func requestCanvasDraw() {
-        model.configureCanvas(self)
-        needsDisplay = true
+        model.updateCanvasDisplay(self)
     }
 
     private static let pressureEventTypes: Set<NSEvent.EventType> = [

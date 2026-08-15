@@ -52,6 +52,49 @@ import Testing
         #expect(transform.canvasPoint(fromView: .init(x: 1100, y: -100)) == .init(x: 1600, y: 1200))
     }
 
+    @Test func viewportAnchorsOutsideThePaperAreNotClamped() {
+        let transform = CanvasTransform(
+            viewSize: .init(width: 1000, height: 800),
+            canvasSize: .init(width: 1600, height: 1200),
+            zoom: 1,
+            pan: .zero
+        )
+        let topLetterboxPoint = CGPoint(x: 500, y: 800)
+
+        #expect(transform.canvasPoint(fromView: topLetterboxPoint) == .init(x: 800, y: 0))
+        #expect(transform.viewportPoint(fromView: topLetterboxPoint) == .init(x: 800, y: -40))
+    }
+
+    @Test func letterboxViewportAnchorRemainsFixedAcrossZoom() {
+        let anchorInView = CGPoint(x: 500, y: 800)
+        let before = CanvasTransform(
+            viewSize: .init(width: 1000, height: 800),
+            canvasSize: .init(width: 1600, height: 1200),
+            zoom: 1,
+            pan: .zero
+        )
+        let anchorInCanvas = before.viewportPoint(fromView: anchorInView)
+        let provisional = CanvasTransform(
+            viewSize: before.viewSize,
+            canvasSize: before.canvasSize,
+            zoom: 2,
+            pan: before.pan
+        )
+        let shiftedAnchor = provisional.viewPoint(fromCanvas: anchorInCanvas)
+        let adjustedPan = CGSize(
+            width: before.pan.width + anchorInView.x - shiftedAnchor.x,
+            height: before.pan.height + anchorInView.y - shiftedAnchor.y
+        )
+        let after = CanvasTransform(
+            viewSize: before.viewSize,
+            canvasSize: before.canvasSize,
+            zoom: 2,
+            pan: adjustedPan
+        )
+
+        #expect(after.viewPoint(fromCanvas: anchorInCanvas) == anchorInView)
+    }
+
     @Test func normalizedPaperRectUsesTopLeftDisplayCoordinates() {
         let transform = CanvasTransform(
             viewSize: .init(width: 1000, height: 800),

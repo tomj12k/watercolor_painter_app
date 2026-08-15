@@ -11,12 +11,10 @@ public struct MetalCanvasView: NSViewRepresentable {
     public func makeNSView(context: Context) -> CanvasEventView {
         let view = CanvasEventView(model: model)
         model.configureCanvas(view)
-        view.needsDisplay = true
         return view
     }
 
     public func updateNSView(_ view: CanvasEventView, context: Context) {
-        model.configureCanvas(view)
         view.synchronize(with: model)
     }
 }

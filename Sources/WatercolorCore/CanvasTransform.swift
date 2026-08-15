@@ -49,18 +49,27 @@ public struct CanvasTransform: Equatable, Sendable {
     }
 
     public func canvasPoint(fromView point: CGPoint) -> CGPoint {
+        let point = viewportPoint(fromView: point)
+        return CGPoint(
+            x: point.x.clamped(to: 0...canvasSize.width),
+            y: point.y.clamped(to: 0...canvasSize.height)
+        )
+    }
+
+    /// Maps a view point into the unbounded canvas plane for viewport gesture anchors.
+    public func viewportPoint(fromView point: CGPoint) -> CGPoint {
         guard scale > 0 else { return .zero }
 
         return CGPoint(
-            x: ((point.x - paperRect.minX) / scale).clamped(to: 0...canvasSize.width),
-            y: (canvasSize.height - (point.y - paperRect.minY) / scale).clamped(to: 0...canvasSize.height)
+            x: (point.x - paperRect.minX) / scale,
+            y: canvasSize.height - (point.y - paperRect.minY) / scale
         )
     }
 
     public func viewPoint(fromCanvas point: CGPoint) -> CGPoint {
         CGPoint(
-            x: paperRect.minX + point.x.clamped(to: 0...canvasSize.width) * scale,
-            y: paperRect.minY + (canvasSize.height - point.y.clamped(to: 0...canvasSize.height)) * scale
+            x: paperRect.minX + point.x * scale,
+            y: paperRect.minY + (canvasSize.height - point.y) * scale
         )
     }
 }

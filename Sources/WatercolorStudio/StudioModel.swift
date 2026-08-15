@@ -74,19 +74,10 @@ public final class StudioModel: ObservableObject {
         refreshCapabilities()
     }
 
-    public func completeStroke(_ stroke: StrokeCommand) {
-        guard project.layers.contains(where: { $0.id == selectedLayerID }) else {
+    func completeStroke(_ stroke: StrokeCommand) {
+        guard project.layers.contains(where: { $0.id == stroke.layerID }) else {
             error = StudioFailure(
-                message: StudioCoordinationError.selectedLayerUnavailable(selectedLayerID).localizedDescription
-            )
-            return
-        }
-        guard stroke.layerID == selectedLayerID else {
-            error = StudioFailure(
-                message: StudioCoordinationError.strokeLayerMismatch(
-                    selected: selectedLayerID,
-                    stroke: stroke.layerID
-                ).localizedDescription
+                message: StudioCoordinationError.strokeLayerUnavailable(stroke.layerID).localizedDescription
             )
             return
         }
@@ -107,7 +98,16 @@ public final class StudioModel: ObservableObject {
         view.device = renderer.renderedTexture.device
         view.colorPixelFormat = .bgra8Unorm
         view.delegate = canvasDelegate
+        view.isPaused = true
+        view.enableSetNeedsDisplay = true
+        view.autoResizeDrawable = true
+        view.clearColor = MTLClearColor(red: 0.12, green: 0.12, blue: 0.13, alpha: 1)
+        updateCanvasDisplay(view)
+    }
+
+    func updateCanvasDisplay(_ view: MTKView) {
         renderer.configureDisplay(zoom: zoom, pan: pan)
+        view.setNeedsDisplay(view.bounds)
     }
 
     private func publishEditorProject() {
@@ -143,15 +143,12 @@ private final class CanvasRendererDelegate: NSObject, MTKViewDelegate {
 }
 
 private enum StudioCoordinationError: LocalizedError {
-    case selectedLayerUnavailable(UUID)
-    case strokeLayerMismatch(selected: UUID, stroke: UUID)
+    case strokeLayerUnavailable(UUID)
 
     var errorDescription: String? {
         switch self {
-        case let .selectedLayerUnavailable(identifier):
-            "The selected layer \(identifier.uuidString) is not part of this project."
-        case let .strokeLayerMismatch(selected, stroke):
-            "Stroke layer \(stroke.uuidString) does not match selected layer \(selected.uuidString)."
+        case let .strokeLayerUnavailable(identifier):
+            "Stroke layer \(identifier.uuidString) is not part of this project."
         }
     }
 }

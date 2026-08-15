@@ -45,7 +45,7 @@ import WatercolorCore
         #expect(model.error == nil)
     }
 
-    @Test func selectingAnUnknownLayerDisablesPaintingAndRejectsAStroke() throws {
+    @Test func selectingAnUnknownLayerDisablesNewPaintingButPreservesAnInFlightStroke() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
         let renderer = try WatercolorRenderer(project: project, device: device)
@@ -56,17 +56,18 @@ import WatercolorCore
             onDocumentUpdate: { _ in documentUpdateCount += 1 }
         )
 
+        let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
         model.selectedLayerID = UUID(uuidString: "187C458F-D40D-427D-970F-3E7A40FD301B")!
-        model.completeStroke(.studioTestStroke(layerID: project.layers[0].id))
+        model.completeStroke(stroke)
 
         #expect(!model.capabilities.canPaint)
-        #expect(model.project == project)
-        #expect(documentUpdateCount == 0)
-        #expect(model.error != nil)
-        #expect(try renderer.debugPixel(x: 128, y: 128).alpha == 0)
+        #expect(model.project.commands == [.stroke(stroke)])
+        #expect(documentUpdateCount == 1)
+        #expect(model.error == nil)
+        #expect(try renderer.debugPixel(x: 128, y: 128).alpha > 0.05)
     }
 
-    @Test func strokeLayerMustMatchTheSelectedLayer() throws {
+    @Test func completedStrokeTargetsThePointerDownLayerAfterSelectionChanges() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         var project = PaintingProject.studioTestProject()
         let otherLayer = PaintLayer(
@@ -82,11 +83,14 @@ import WatercolorCore
             onDocumentUpdate: { _ in documentUpdateCount += 1 }
         )
 
-        model.completeStroke(.studioTestStroke(layerID: otherLayer.id))
+        let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
+        model.selectedLayerID = otherLayer.id
+        model.completeStroke(stroke)
 
-        #expect(model.project == project)
-        #expect(documentUpdateCount == 0)
-        #expect(model.error?.message.contains(otherLayer.id.uuidString) == true)
+        #expect(model.project.commands == [.stroke(stroke)])
+        #expect(documentUpdateCount == 1)
+        #expect(model.error == nil)
+        #expect(try renderer.debugPixel(x: 128, y: 128, layerID: project.layers[0].id).alpha > 0.05)
         #expect(try renderer.debugPixel(x: 128, y: 128, layerID: otherLayer.id).alpha == 0)
     }
 
@@ -167,6 +171,27 @@ import WatercolorCore
         #expect(renderer.viewportSize == CGSize(width: 320, height: 240))
     }
 
+    @Test func displayStateUpdatesInvalidateWithoutReattachingCanvasConfiguration() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        let view = InvalidatingMTKView(frame: CGRect(x: 0, y: 0, width: 320, height: 240))
+        model.configureCanvas(view)
+        view.delegate = nil
+        view.colorPixelFormat = .rgba8Unorm
+        view.invalidationCount = 0
+
+        model.zoom = 2
+        model.pan = CGSize(width: 10, height: 20)
+        model.updateCanvasDisplay(view)
+
+        #expect(view.delegate == nil)
+        #expect(view.colorPixelFormat == .rgba8Unorm)
+        #expect(view.device === device)
+        #expect(view.invalidationCount == 1)
+    }
+
     @Test func renderFailurePreservesTheProjectAndReportsTheError() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
@@ -185,6 +210,16 @@ import WatercolorCore
         #expect(documentUpdateCount == 0)
         #expect(model.error?.message.contains(missingLayerID.uuidString) == true)
         #expect(!model.capabilities.canUndo)
+    }
+}
+
+@MainActor
+private final class InvalidatingMTKView: MTKView {
+    var invalidationCount = 0
+
+    override func setNeedsDisplay(_ invalidRect: NSRect) {
+        invalidationCount += 1
+        super.setNeedsDisplay(invalidRect)
     }
 }
 

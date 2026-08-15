@@ -1,7 +1,9 @@
 import CoreGraphics
 import Foundation
+import Metal
 import Testing
 import WatercolorCore
+@testable import WatercolorEngine
 @testable import WatercolorStudio
 
 @Suite struct CanvasStrokeBuilderTests {
@@ -58,5 +60,36 @@ import WatercolorCore
         let stroke = try #require(completedStroke)
         #expect(stroke.points == [point])
         #expect(builder.finish() == nil)
+    }
+}
+
+@Suite @MainActor struct CanvasStrokeIntegrationTests {
+    @Test func builderStrokeCompletesToItsSnapshottedLayerAfterSelectionChanges() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let firstLayer = PaintLayer(name: "First")
+        let secondLayer = PaintLayer(name: "Second")
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [firstLayer, secondLayer]
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        var builder = CanvasStrokeBuilder(canvasSize: .init(width: 256, height: 256))
+        builder.begin(
+            layerID: model.selectedLayerID,
+            tool: model.selectedTool,
+            brush: model.brush,
+            point: StrokePoint(x: 128, y: 128, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
+        )
+
+        model.selectedLayerID = secondLayer.id
+        let completedStroke = builder.finish()
+        let stroke = try #require(completedStroke)
+        model.completeStroke(stroke)
+
+        #expect(model.project.commands == [.stroke(stroke)])
+        #expect(try renderer.debugPixel(x: 128, y: 128, layerID: firstLayer.id).alpha > 0.05)
+        #expect(try renderer.debugPixel(x: 128, y: 128, layerID: secondLayer.id).alpha == 0)
     }
 }
