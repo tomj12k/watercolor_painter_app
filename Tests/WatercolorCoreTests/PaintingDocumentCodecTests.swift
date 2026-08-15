@@ -3,6 +3,36 @@ import Testing
 @testable import WatercolorCore
 
 @Suite struct PaintingDocumentCodecTests {
+    @Test func codecRejectsDataAboveTheDocumentByteLimitBeforeDecoding() {
+        let data = Data(repeating: 0, count: PaintingDocumentCodec.maximumDocumentBytes + 1)
+
+        #expect(throws: DocumentCodecError.validationFailed(.documentByteLimitExceeded(data.count))) {
+            _ = try PaintingDocumentCodec.decode(data)
+        }
+    }
+
+    @Test func codecRejectsProjectsWhoseAggregateStrokePointsExceedTheLimit() {
+        var project = PaintingProject.newDefault()
+        let points = Array(
+            repeating: StrokePoint(x: 1, y: 1, pressure: 1, tiltX: 0, tiltY: 0, time: 0),
+            count: PaintingProject.maximumStrokePointCount
+        )
+        let strokeCount = 31
+        project.commands = (0..<strokeCount).map { _ in
+            .stroke(StrokeCommand(
+                layerID: project.layers[0].id,
+                tool: .brush,
+                brush: .default,
+                points: points
+            ))
+        }
+        let totalPointCount = 2_031_616
+
+        #expect(throws: DocumentCodecError.validationFailed(.totalStrokePointLimitExceeded(totalPointCount))) {
+            _ = try PaintingDocumentCodec.encode(project)
+        }
+    }
+
     @Test func codecRoundTripsAProject() throws {
         var project = PaintingProject.newDefault()
         project.commands = [

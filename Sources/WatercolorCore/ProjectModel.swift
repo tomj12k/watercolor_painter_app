@@ -354,6 +354,8 @@ public enum ProjectValidationError: Error, Equatable, Sendable {
     case invalidLayerName(UUID)
     case invalidLayerOpacity(UUID, Double)
     case commandLimitExceeded(Int)
+    case documentByteLimitExceeded(Int)
+    case totalStrokePointLimitExceeded(Int)
     case duplicateCommandIdentifier(UUID)
     case invalidCommandIdentifier(UUID)
     case invalidCommandRelationship(UUID)
@@ -373,6 +375,7 @@ public struct PaintingProject: Codable, Equatable, Sendable {
     public static let maximumLayerCount = 12
     public static let maximumCommandCount = 100_000
     public static let maximumStrokePointCount = 65_536
+    public static let maximumTotalStrokePointCount = 2_000_000
     public static let maximumDryStepCount = 4_096
     public static let brushSizeRange = 1.0...300.0
 
@@ -466,6 +469,7 @@ public struct PaintingProject: Codable, Equatable, Sendable {
 
         var commandIdentifiers = Set<UUID>()
         var duplicateDestinations = Set<UUID>()
+        var totalStrokePointCount = 0
         for command in commands {
             guard command.id != Self.zeroIdentifier else {
                 throw ProjectValidationError.invalidCommandIdentifier(command.id)
@@ -479,6 +483,13 @@ public struct PaintingProject: Codable, Equatable, Sendable {
                 guard stroke.layerID != Self.zeroIdentifier else {
                     throw ProjectValidationError.invalidCommandRelationship(stroke.id)
                 }
+                let (updatedTotal, didOverflow) = totalStrokePointCount.addingReportingOverflow(stroke.points.count)
+                guard !didOverflow, updatedTotal <= Self.maximumTotalStrokePointCount else {
+                    throw ProjectValidationError.totalStrokePointLimitExceeded(
+                        didOverflow ? Int.max : updatedTotal
+                    )
+                }
+                totalStrokePointCount = updatedTotal
                 try validate(stroke)
             case let .clearLayer(clear):
                 guard clear.layerID != Self.zeroIdentifier else {

@@ -45,6 +45,40 @@ import WatercolorCore
         #expect(model.error == nil)
     }
 
+    @Test func commandCapacityIsCheckedBeforeRendering() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.studioTestProject()
+        project.commands = (0..<PaintingProject.maximumCommandCount).map { _ in
+            .clearLayer(LayerCommand(layerID: UUID()))
+        }
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+        let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
+        let checksumBefore = try renderer.studioChecksum()
+
+        model.beginStrokePreview(stroke)
+
+        #expect(!model.isStrokePreviewActive)
+        #expect(model.project.commands.count == PaintingProject.maximumCommandCount)
+        #expect(model.rendererProject.commands.count == PaintingProject.maximumCommandCount)
+        #expect(documentUpdates.isEmpty)
+        #expect(model.error?.message.contains("100000") == true)
+        #expect(try renderer.studioChecksum() == checksumBefore)
+
+        model.completeStroke(stroke)
+
+        #expect(model.project.commands.count == PaintingProject.maximumCommandCount)
+        #expect(model.rendererProject.commands.count == PaintingProject.maximumCommandCount)
+        #expect(documentUpdates.isEmpty)
+        #expect(model.error?.message.contains("100000") == true)
+        #expect(try renderer.studioChecksum() == checksumBefore)
+    }
+
     @Test func liveStrokePreviewRendersDuringDragAndCommitsExactlyOneCommand() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()

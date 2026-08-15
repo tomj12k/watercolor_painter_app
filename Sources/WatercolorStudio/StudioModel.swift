@@ -154,6 +154,10 @@ public final class StudioModel: ObservableObject {
         activeStrokePreviewID != nil
     }
 
+    private var canAppendCommand: Bool {
+        project.commands.count < PaintingProject.maximumCommandCount
+    }
+
     public convenience init(
         project: PaintingProject,
         onDocumentUpdate: ((PaintingProject) -> Void)? = nil
@@ -197,6 +201,10 @@ public final class StudioModel: ObservableObject {
     }
 
     func beginStrokePreview(_ stroke: StrokeCommand) {
+        guard canAppendCommand else {
+            reportCommandCapacityFailure()
+            return
+        }
         guard activeStrokePreviewID == nil,
               project.layers.contains(where: { $0.id == stroke.layerID })
         else { return }
@@ -317,6 +325,10 @@ public final class StudioModel: ObservableObject {
     }
 
     func completeStroke(_ stroke: StrokeCommand) {
+        guard canAppendCommand else {
+            reportCommandCapacityFailure()
+            return
+        }
         guard project.layers.contains(where: { $0.id == stroke.layerID }) else {
             error = StudioFailure(
                 message: StudioCoordinationError.strokeLayerUnavailable(stroke.layerID).localizedDescription
@@ -336,6 +348,12 @@ public final class StudioModel: ObservableObject {
             try? renderer.replay(project: project)
             self.error = failure
         }
+    }
+
+    private func reportCommandCapacityFailure() {
+        error = StudioFailure(
+            message: "The project has reached its command capacity of \(PaintingProject.maximumCommandCount)."
+        )
     }
 
     public func addLayer() {

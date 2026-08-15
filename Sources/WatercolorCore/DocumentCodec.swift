@@ -20,6 +20,8 @@ extension DocumentCodecError: LocalizedError {
 }
 
 public enum PaintingDocumentCodec {
+    public static let maximumDocumentBytes = 256 * 1024 * 1024
+
     public static func encode(_ project: PaintingProject) throws -> Data {
         try validate(project)
 
@@ -29,6 +31,10 @@ public enum PaintingDocumentCodec {
     }
 
     public static func decode(_ data: Data) throws -> PaintingProject {
+        guard data.count <= maximumDocumentBytes else {
+            throw DocumentCodecError.validationFailed(.documentByteLimitExceeded(data.count))
+        }
+
         let decoder = JSONDecoder()
         let header: SchemaHeader
         do {
