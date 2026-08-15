@@ -112,7 +112,8 @@ import WatercolorCore
 
     @Test func rapidMouseStyleUpdatesCoalesceGPUPreviewWork() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let project = PaintingProject.studioTestProject()
+        var project = PaintingProject.studioTestProject()
+        project.canvas = CanvasSize(width: 1_600, height: 1_200)
         let previewSubmissions = CommandBufferLabelCounter(label: "Watercolor stroke preview")
         let renderer = try WatercolorRenderer(
             project: project,
