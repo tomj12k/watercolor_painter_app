@@ -8,9 +8,11 @@
     <string>Watercolor Studio</string>
     <key>CFBundleExecutable</key>
     <string>WatercolorStudio</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.watercolorstudio.app</string>
-    <key>CFBundleInfoDictionaryVersion</key>
+	<key>CFBundleIdentifier</key>
+	<string>com.watercolorstudio.app</string>
+	<key>CFBundleIconFile</key>
+	<string>WatercolorStudio</string>
+	<key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
     <string>Watercolor Studio</string>
