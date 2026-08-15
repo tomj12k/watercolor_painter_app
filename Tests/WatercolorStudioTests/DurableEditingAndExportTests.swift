@@ -278,9 +278,10 @@ import WatercolorCore
         let export = Task { @MainActor in
             await model.exportPNG(to: URL(fileURLWithPath: "/tmp/blocked-export.png"))
         }
-        await Task.detached {
+        let startResult = await Task.detached {
             blockingGate.waitUntilBlocked()
         }.value
+        #expect(startResult == .blocked)
 
         let mainActorRanWhileBlocked = await Task { @MainActor in
             let isBlocked = blockingGate.isBlocked
@@ -291,6 +292,17 @@ import WatercolorCore
         #expect(mainActorRanWhileBlocked)
         await export.value
         #expect(blockingGate.wasReleasedByMainActor)
+    }
+
+    @Test func exportGateFailSafeWakesWaiterBeforeWorkerStarts() async {
+        let blockingGate = BlockingExportGate()
+        let waiter = Task.detached {
+            blockingGate.waitUntilBlocked()
+        }
+
+        blockingGate.failSafeRelease()
+
+        #expect(await waiter.value == .failSafe)
     }
 
     @Test func olderExportSuccessDoesNotClearALaterActionFailure() async throws {
@@ -405,34 +417,52 @@ import WatercolorCore
 }
 
 private final class BlockingExportGate: @unchecked Sendable {
+    enum StartResult: Sendable {
+        case blocked
+        case failSafe
+    }
+
     private enum ReleaseReason {
         case mainActor
         case failSafe
     }
 
     private let lock = NSLock()
-    private let started = DispatchSemaphore(value: 0)
+    private let startResolved = DispatchSemaphore(value: 0)
     private let releaseGate = DispatchSemaphore(value: 0)
     private var blocked = false
-    private var failSafeRequested = false
+    private var startResult: StartResult?
     private var releaseReason: ReleaseReason?
 
     func block() {
-        let shouldWait = lock.withLock {
+        let state = lock.withLock {
             blocked = true
-            guard failSafeRequested else { return true }
-            releaseReason = .failSafe
-            return false
+            guard releaseReason != .failSafe else {
+                return (signalStart: false, shouldWait: false)
+            }
+            let signalStart = startResult == nil
+            if signalStart {
+                startResult = .blocked
+            }
+            return (signalStart: signalStart, shouldWait: true)
         }
-        started.signal()
-        if shouldWait {
+        if state.signalStart {
+            startResolved.signal()
+        }
+        if state.shouldWait {
             releaseGate.wait()
         }
         lock.withLock { blocked = false }
     }
 
-    func waitUntilBlocked() {
-        started.wait()
+    func waitUntilBlocked() -> StartResult {
+        startResolved.wait()
+        return lock.withLock {
+            guard let startResult else {
+                preconditionFailure("Start semaphore signaled without a result")
+            }
+            return startResult
+        }
     }
 
     var isBlocked: Bool {
@@ -444,16 +474,21 @@ private final class BlockingExportGate: @unchecked Sendable {
     }
 
     func failSafeRelease() {
-        let shouldSignal = lock.withLock {
-            guard releaseReason == nil else { return false }
-            guard blocked else {
-                failSafeRequested = true
-                return false
+        let state = lock.withLock {
+            guard releaseReason == nil else {
+                return (signalStart: false, signalRelease: false)
             }
             releaseReason = .failSafe
-            return true
+            let signalStart = startResult == nil
+            if signalStart {
+                startResult = .failSafe
+            }
+            return (signalStart: signalStart, signalRelease: blocked)
         }
-        if shouldSignal {
+        if state.signalStart {
+            startResolved.signal()
+        }
+        if state.signalRelease {
             releaseGate.signal()
         }
     }
