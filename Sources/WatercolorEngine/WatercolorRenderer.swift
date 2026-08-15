@@ -278,7 +278,9 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
 
         guard transaction.renderedPointCount < stroke.points.count else { return }
         let capturesCommittedState = transaction.renderedPointCount == 0
-        activeSimulationRegions = transaction.committedSimulationRegions
+        if capturesCommittedState {
+            activeSimulationRegions = transaction.committedSimulationRegions
+        }
         try await renderPreview(
             stroke: stroke,
             capturesCommittedState: capturesCommittedState,
@@ -302,9 +304,16 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         }
 
         let commandBuffer = try makeCommandBuffer(label: "Commit watercolor stroke preview")
+        activeSimulationRegions = transaction.committedSimulationRegions
+        try encodeStrokePreviewSnapshotRestore(transaction, with: commandBuffer)
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw RendererError.allocation("a stroke preview completion encoder")
         }
+        guard let slice = layerSlices[stroke.layerID] else {
+            throw RendererError.unknownLayer(stroke.layerID)
+        }
+        encodeStrokeAndSimulation(stroke: stroke, slice: slice, with: encoder)
+        encodeComposite(with: encoder)
         prepareCanvasWetnessMeasurement()
         encodeCanvasWetnessMeasurement(with: encoder)
         encoder.endEncoding()
@@ -385,16 +394,19 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         let commandBuffer = try makeCommandBuffer(label: "Watercolor stroke preview")
         if capturesCommittedState {
             try encodeStrokePreviewSnapshotCapture(transaction, with: commandBuffer)
-        } else {
-            try encodeStrokePreviewSnapshotRestore(transaction, with: commandBuffer)
         }
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw RendererError.allocation("a live stroke preview encoder")
         }
         encoder.label = "Live watercolor stroke preview"
+        let pointIndexOffset = transaction.renderedPointCount
+        var appendedStroke = stroke
+        appendedStroke.points = Array(stroke.points.dropFirst(pointIndexOffset))
         encodeStrokeAndSimulation(
-            stroke: stroke,
+            stroke: appendedStroke,
             slice: slice,
+            pointIndexOffset: pointIndexOffset,
+            initialPreviousPoint: pointIndexOffset > 0 ? stroke.points[pointIndexOffset - 1] : nil,
             with: encoder
         )
         encodeComposite(with: encoder)

@@ -151,6 +151,47 @@ import WatercolorCore
         #expect(try renderer.studioChecksum() == replayed.studioChecksum())
     }
 
+    @Test func livePreviewUpdateProcessesOnlyNewMousePoints() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.studioTestProject()
+        project.canvas = CanvasSize(width: 1_600, height: 1_200)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        var stroke = StrokeCommand.studioTestStroke(
+            id: UUID(uuidString: "EA7F7A56-E65E-4FCB-A530-54215C5F72F4")!,
+            layerID: project.layers[0].id,
+            x: 100,
+            y: 400
+        )
+        stroke.points = (0..<32).map { index in
+            StrokePoint(
+                x: Double(100 + index * 8),
+                y: 400,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 120
+            )
+        }
+
+        model.beginStrokePreview(stroke)
+        await model.waitForStrokePreviewIdle()
+        stroke.points.append(StrokePoint(
+            x: 356,
+            y: 400,
+            pressure: 1,
+            tiltX: 0,
+            tiltY: 0,
+            time: 32.0 / 120
+        ))
+        model.updateStrokePreview(stroke)
+        await model.waitForStrokePreviewIdle()
+
+        #expect(renderer.debugLastStrokeDispatch.stampBatchCount == 1)
+        #expect(renderer.debugLastStrokeDispatch.simulationStepCount == 2)
+        model.cancelStrokePreview()
+    }
+
     @Test func cancellingLiveStrokePreviewRestoresTheCommittedRaster() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
