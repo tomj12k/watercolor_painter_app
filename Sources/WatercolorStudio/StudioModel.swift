@@ -69,6 +69,7 @@ struct StudioPNGExportWorker: Sendable {
 public final class StudioModel: ObservableObject {
     public static let brushSizeRange = 1.0...300.0
     private static let dryStepCount = 24
+    private static let maximumRendererCheckpointCount = 2
 
     @Published public private(set) var project: PaintingProject
     @Published public var selectedLayerID: UUID {
@@ -96,6 +97,10 @@ public final class StudioModel: ObservableObject {
     #if DEBUG
     var rendererForTesting: WatercolorRenderer {
         renderer
+    }
+
+    var rendererCheckpointCountForTesting: Int {
+        rendererCheckpoints.count
     }
     #endif
 
@@ -133,6 +138,7 @@ public final class StudioModel: ObservableObject {
     private var currentPNGExportFailureID: UUID?
     private weak var attachedCanvas: MTKView?
     private var activeStrokePreviewID: UUID?
+    private var rendererCheckpoints: [RendererCheckpoint]
 
     public var isStrokePreviewActive: Bool {
         activeStrokePreviewID != nil
@@ -168,6 +174,7 @@ public final class StudioModel: ObservableObject {
         latestPNGExportID = nil
         currentPNGExportFailureID = nil
         activeStrokePreviewID = nil
+        rendererCheckpoints = []
         canvasDelegate = CanvasRendererDelegate(renderer: renderer)
         self.onDocumentUpdate = onDocumentUpdate
         refreshCapabilities()
@@ -519,6 +526,7 @@ public final class StudioModel: ObservableObject {
             editor = ProjectEditor(project: replacement)
             project = replacement
             selectedLayerID = nextSelection
+            rendererCheckpoints.removeAll()
             replaceRenderer(with: candidateRenderer)
             refreshCapabilities()
             error = nil
@@ -561,8 +569,12 @@ public final class StudioModel: ObservableObject {
             : updatedProject.layers[0].id
 
         do {
-            let candidateRenderer = try renderer.makeCandidate(project: updatedProject)
-            replaceRenderer(with: candidateRenderer)
+            if let checkpointRenderer = takeRendererCheckpoint(for: updatedProject) {
+                replaceRenderer(with: checkpointRenderer, checkpointCurrent: true)
+            } else {
+                let candidateRenderer = try renderer.makeCandidate(project: updatedProject)
+                replaceRenderer(with: candidateRenderer)
+            }
             publishSuccessfulEdit(
                 editor: updatedEditor,
                 project: updatedProject,
@@ -586,7 +598,7 @@ public final class StudioModel: ObservableObject {
             let updatedProject = updatedEditor.project
             guard updatedProject != previousProject else { return true }
             let candidateRenderer = try renderer.makeCandidate(project: updatedProject)
-            replaceRenderer(with: candidateRenderer)
+            replaceRenderer(with: candidateRenderer, checkpointCurrent: true)
             publishSuccessfulEdit(
                 editor: updatedEditor,
                 project: updatedProject,
@@ -642,7 +654,13 @@ public final class StudioModel: ObservableObject {
         error = nil
     }
 
-    private func replaceRenderer(with renderer: WatercolorRenderer) {
+    private func replaceRenderer(
+        with renderer: WatercolorRenderer,
+        checkpointCurrent: Bool = false
+    ) {
+        if checkpointCurrent {
+            storeRendererCheckpoint(project: project, renderer: self.renderer)
+        }
         self.renderer = renderer
         canvasWetness = renderer.canvasWetness
         layerOpacityPreviews.removeAll()
@@ -650,6 +668,25 @@ public final class StudioModel: ObservableObject {
         guard let attachedCanvas else { return }
         attachedCanvas.device = renderer.renderedTexture.device
         updateCanvasDisplay(attachedCanvas)
+    }
+
+    private func storeRendererCheckpoint(project: PaintingProject, renderer: WatercolorRenderer) {
+        rendererCheckpoints.removeAll { checkpoint in
+            checkpoint.project == project || checkpoint.renderer === renderer
+        }
+        rendererCheckpoints.append(RendererCheckpoint(project: project, renderer: renderer))
+        if rendererCheckpoints.count > Self.maximumRendererCheckpointCount {
+            rendererCheckpoints.removeFirst(
+                rendererCheckpoints.count - Self.maximumRendererCheckpointCount
+            )
+        }
+    }
+
+    private func takeRendererCheckpoint(for project: PaintingProject) -> WatercolorRenderer? {
+        guard let index = rendererCheckpoints.lastIndex(where: { $0.project == project }) else {
+            return nil
+        }
+        return rendererCheckpoints.remove(at: index).renderer
     }
 
     private func nextLayerName() -> String {
@@ -673,6 +710,12 @@ public final class StudioModel: ObservableObject {
         )
     }
 
+}
+
+@MainActor
+private struct RendererCheckpoint {
+    let project: PaintingProject
+    let renderer: WatercolorRenderer
 }
 
 @MainActor

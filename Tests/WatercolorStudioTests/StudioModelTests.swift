@@ -963,6 +963,57 @@ import WatercolorCore
         #expect(model.error?.message.contains("deterministic structural replay failure") == true)
         #expect(failedReplayCount == 1)
     }
+
+    @Test func structuralUndoAndRedoRestoreBoundedRendererCheckpointsWithoutReplay() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        var replayCount = 0
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugCommandBufferError: { commandBuffer in
+                if commandBuffer.label == "Watercolor replay" { replayCount += 1 }
+                return commandBuffer.error
+            }
+        )
+        let model = StudioModel(project: project, renderer: renderer)
+        let originalIdentity = model.rendererIdentity
+        let originalChecksum = try renderer.studioChecksum()
+
+        model.addLayer()
+        let addedProject = model.project
+        let addedIdentity = model.rendererIdentity
+        let replayCountAfterEdit = replayCount
+
+        model.undo()
+        #expect(model.project == project)
+        #expect(model.rendererIdentity == originalIdentity)
+        #expect(try model.rendererForTesting.studioChecksum() == originalChecksum)
+        #expect(replayCount == replayCountAfterEdit)
+
+        model.redo()
+        #expect(model.project == addedProject)
+        #expect(model.rendererIdentity == addedIdentity)
+        #expect(replayCount == replayCountAfterEdit)
+        #expect(model.rendererCheckpointCountForTesting <= 2)
+    }
+
+    @Test func rendererCheckpointCacheIsDeduplicatedAndBounded() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+
+        model.addLayer()
+        model.addLayer()
+        model.addLayer()
+        #expect(model.rendererCheckpointCountForTesting == 2)
+
+        model.undo()
+        model.redo()
+        model.undo()
+        #expect(model.rendererCheckpointCountForTesting <= 2)
+    }
 }
 
 @MainActor
