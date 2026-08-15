@@ -447,8 +447,12 @@ import WatercolorCore
         #expect(abs(horizontal.after.centroidY - horizontal.before.centroidY) < 0.2)
         #expect(vertical.after.centroidY > vertical.before.centroidY + 0.2)
         #expect(abs(vertical.after.centroidX - vertical.before.centroidX) < 0.2)
-        #expect(horizontal.after.mass <= horizontal.before.mass * 1.01)
-        #expect(vertical.after.mass <= vertical.before.mass * 1.01)
+        let horizontalMassDelta = abs(horizontal.after.mass - horizontal.before.mass)
+        let verticalMassDelta = abs(vertical.after.mass - vertical.before.mass)
+        #expect(horizontalMassDelta < 0.5)
+        #expect(horizontalMassDelta / horizontal.before.mass < 0.005)
+        #expect(verticalMassDelta < 0.5)
+        #expect(verticalMassDelta / vertical.before.mass < 0.005)
     }
 
     @Test func smearFollowsACurvedPathAndConservesPigmentMass() throws {
@@ -475,7 +479,34 @@ import WatercolorCore
 
         #expect(after.centroidX > before.centroidX + 0.2)
         #expect(after.centroidY > before.centroidY + 0.2)
-        #expect(after.mass <= before.mass * 1.01)
+        let absoluteMassDelta = abs(after.mass - before.mass)
+        #expect(absoluteMassDelta < 0.5)
+        #expect(absoluteMassDelta / before.mass < 0.005)
+    }
+
+    @Test func smudgeAtCanvasBoundaryConservesPigmentInsteadOfDiscardingOutflow() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        try renderer.renderAndWait(stroke: .testDot(layerID: project.layers[0].id, x: 54, y: 32))
+        let before = try renderer.debugPigmentMoments(layerID: project.layers[0].id)
+        var brush = BrushSettings.default
+        brush.size = 20
+
+        try renderer.renderAndWait(stroke: StrokeCommand(
+            layerID: project.layers[0].id,
+            tool: .smudge,
+            brush: brush,
+            points: [
+                StrokePoint(x: 52, y: 32, pressure: 1, tiltX: 0, tiltY: 0, time: 0),
+                StrokePoint(x: 63, y: 32, pressure: 1, tiltX: 0, tiltY: 0, time: 1)
+            ]
+        ))
+        let after = try renderer.debugPigmentMoments(layerID: project.layers[0].id)
+        let absoluteMassDelta = abs(after.mass - before.mass)
+
+        #expect(absoluteMassDelta < 0.5)
+        #expect(absoluteMassDelta / before.mass < 0.005)
     }
 
     @Test func everyBrushAndPaperEnumChangesTheDeposit() throws {

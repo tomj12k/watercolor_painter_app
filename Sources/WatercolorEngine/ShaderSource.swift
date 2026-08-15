@@ -303,24 +303,49 @@ enum ShaderSource {
         if (position.x >= sourcePigment.get_width() || position.y >= sourcePigment.get_height()) return;
 
         uint slice = parameters.extra.x;
-        float2 normalized = (float2(position) + 0.5f - parameters.centerRadius.xy) / parameters.centerRadius.zw;
-        float coverage = clamp((1.0f - length(normalized)) / 0.3f, 0.0f, 1.0f);
         float strength = parameters.directionStrength.z;
-        float distance = parameters.centerRadius.z * parameters.directionStrength.w * coverage;
-        float2 upstream = float2(position) - parameters.directionStrength.xy * distance;
-        uint2 sourcePosition = uint2(clamp(
-            round(upstream),
-            float2(0.0f),
-            float2(sourcePigment.get_width() - 1u, sourcePigment.get_height() - 1u)
-        ));
-        float amount = clamp(coverage * strength, 0.0f, 0.92f);
+        float distance = max(parameters.centerRadius.z * parameters.directionStrength.w, 1.0f);
+        int2 offset = int2(round(parameters.directionStrength.xy * distance));
+        if (offset.x == 0 && offset.y == 0) {
+            offset = abs(parameters.directionStrength.x) >= abs(parameters.directionStrength.y)
+                ? int2(parameters.directionStrength.x < 0.0f ? -1 : 1, 0)
+                : int2(0, parameters.directionStrength.y < 0.0f ? -1 : 1);
+        }
+        int2 dimensions = int2(sourcePigment.get_width(), sourcePigment.get_height());
+        int2 signedPosition = int2(position);
+        int2 downstreamPosition = signedPosition + offset;
+        int2 upstreamPosition = signedPosition - offset;
+        bool downstreamIsInBounds = all(downstreamPosition >= int2(0))
+            && all(downstreamPosition < dimensions);
+        bool upstreamIsInBounds = all(upstreamPosition >= int2(0))
+            && all(upstreamPosition < dimensions);
+
+        float2 normalized = (float2(position) + 0.5f - parameters.centerRadius.xy)
+            / parameters.centerRadius.zw;
+        float outgoingCoverage = clamp((1.0f - length(normalized)) / 0.3f, 0.0f, 1.0f);
+        float outgoingAmount = downstreamIsInBounds
+            ? clamp(outgoingCoverage * strength, 0.0f, 0.92f)
+            : 0.0f;
+        float incomingAmount = 0.0f;
+        float4 incomingPigment = float4(0.0f);
+        float incomingWetness = 0.0f;
+        if (upstreamIsInBounds) {
+            float2 upstreamNormalized = (float2(upstreamPosition) + 0.5f - parameters.centerRadius.xy)
+                / parameters.centerRadius.zw;
+            float incomingCoverage = clamp((1.0f - length(upstreamNormalized)) / 0.3f, 0.0f, 1.0f);
+            incomingAmount = clamp(incomingCoverage * strength, 0.0f, 0.92f);
+            incomingPigment = float4(sourcePigment.read(uint2(upstreamPosition), slice));
+            incomingWetness = float(sourceWetness.read(uint2(upstreamPosition), slice).r);
+        }
         float4 center = float4(sourcePigment.read(position, slice));
-        float4 transported = float4(sourcePigment.read(sourcePosition, slice));
-        float4 nextPigment = mix(center, transported, amount);
+        float4 nextPigment = center * (1.0f - outgoingAmount) + incomingPigment * incomingAmount;
         float centerWetness = float(sourceWetness.read(position, slice).r);
-        float transportedWetness = float(sourceWetness.read(sourcePosition, slice).r);
         destinationPigment.write(half4(clamp(nextPigment, 0.0f, 8.0f)), position, slice);
-        destinationWetness.write(half4(clamp(mix(centerWetness, transportedWetness, amount), 0.0f, 1.0f)), position, slice);
+        destinationWetness.write(
+            half4(clamp(centerWetness * (1.0f - outgoingAmount) + incomingWetness * incomingAmount, 0.0f, 1.0f)),
+            position,
+            slice
+        );
     }
 
     kernel void clearKernel(
