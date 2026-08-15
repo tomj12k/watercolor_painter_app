@@ -368,6 +368,86 @@ import WatercolorCore
         }
     }
 
+    @Test func dryWorkRejectionSubmitsNoReplayAndLeavesRendererUsable() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let original = PaintingProject.testCanvas(64)
+        var replaySubmissions = 0
+        let renderer = try WatercolorRenderer(
+            project: original,
+            device: device,
+            debugWorkPolicy: RendererWorkPolicy(
+                maximumCommandThreads: 6_000,
+                maximumProjectThreads: 1_000_000
+            ),
+            debugCommandBufferError: { commandBuffer in
+                if commandBuffer.label == "Watercolor replay" {
+                    replaySubmissions += 1
+                }
+                return commandBuffer.error
+            }
+        )
+        replaySubmissions = 0
+        let checksumBefore = try renderer.compositeChecksum()
+        var hostile = original
+        hostile.commands = [
+            .stroke(.testDot(layerID: original.layers[0].id)),
+            .dryLayer(DryLayerCommand(layerID: original.layers[0].id, steps: 100))
+        ]
+
+        #expect(
+            throws: RendererError.workBudgetExceeded(required: 819_200, available: 6_000)
+        ) {
+            try renderer.replay(project: hostile)
+        }
+
+        #expect(replaySubmissions == 0)
+        #expect(renderer.project == original)
+        #expect(try renderer.compositeChecksum() == checksumBefore)
+        try renderer.renderAndWait(stroke: .testDot(layerID: original.layers[0].id))
+        #expect(try renderer.debugPixel(x: 32, y: 32).alpha > 0.1)
+    }
+
+    @Test func liveStrokeWorkRejectionSubmitsNothingAndPreservesState() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        var strokeSubmissions = 0
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugWorkPolicy: RendererWorkPolicy(
+                maximumCommandThreads: 6_000,
+                maximumProjectThreads: 1_000_000
+            ),
+            debugCommandBufferError: { commandBuffer in
+                if commandBuffer.label == "Watercolor stroke" {
+                    strokeSubmissions += 1
+                }
+                return commandBuffer.error
+            }
+        )
+        let checksumBefore = try renderer.compositeChecksum()
+        var hostile = StrokeCommand.testDot(layerID: project.layers[0].id, x: 10)
+        hostile.points.append(StrokePoint(
+            x: 54,
+            y: 32,
+            pressure: 1,
+            tiltX: 0,
+            tiltY: 0,
+            time: 1
+        ))
+
+        #expect(
+            throws: RendererError.workBudgetExceeded(required: 21_504, available: 6_000)
+        ) {
+            try renderer.renderAndWait(stroke: hostile)
+        }
+
+        #expect(strokeSubmissions == 0)
+        #expect(try renderer.compositeChecksum() == checksumBefore)
+        try renderer.renderAndWait(stroke: .testDot(layerID: project.layers[0].id))
+        #expect(try renderer.debugPixel(x: 32, y: 32).alpha > 0.1)
+    }
+
     @Test func failedCompletedStrokeDoesNotPoisonRecoveryOrTheNextStroke() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)

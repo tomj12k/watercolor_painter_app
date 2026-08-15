@@ -348,6 +348,22 @@ import Testing
             _ = try PaintingDocumentCodec.encode(project)
         }
     }
+
+    @Test func codecPreservesMaximumDryStepsWithoutClamping() throws {
+        var project = PaintingProject.newDefault()
+        project.commands = [.dryLayer(DryLayerCommand(
+            layerID: project.layers[0].id,
+            steps: PaintingProject.maximumDryStepCount
+        ))]
+
+        let decoded = try PaintingDocumentCodec.decode(PaintingDocumentCodec.encode(project))
+        guard case let .dryLayer(dry) = try #require(decoded.commands.first) else {
+            Issue.record("Expected the dry command to survive the document round trip")
+            return
+        }
+
+        #expect(dry.steps == PaintingProject.maximumDryStepCount)
+    }
 }
 
 private struct SchemaVersionFixture: Decodable {

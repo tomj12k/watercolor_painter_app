@@ -9,6 +9,7 @@ public enum RendererError: Error, Equatable, Sendable {
     case shaderCompilation(String)
     case allocation(String)
     case resourceBudgetExceeded(required: Int, available: Int)
+    case workBudgetExceeded(required: UInt64, available: UInt64)
     case invalidProject(ProjectValidationError)
     case unknownLayer(UUID)
     case invalidStrokePreview
@@ -27,6 +28,8 @@ extension RendererError: LocalizedError {
             "The watercolor renderer could not allocate \(resource)."
         case let .resourceBudgetExceeded(required, available):
             "This canvas needs \(Self.requiredMiB(for: required)) MiB, but Watercolor Studio can safely use \(Self.availableMiB(for: available)) MiB. Reduce the canvas size or layer count."
+        case let .workBudgetExceeded(required, available):
+            "This painting needs \(required) simulation threads in one rendering budget, but Watercolor Studio safely allows \(available). Reduce the canvas size, stroke count, or drying steps."
         case let .invalidProject(error):
             "The watercolor project is unsafe to render: \(String(describing: error))."
         case let .unknownLayer(identifier):
@@ -86,6 +89,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
 
     private let device: MTLDevice
     private let resourcePolicy: RendererResourcePolicy
+    private let workPolicy: RendererWorkPolicy
     private let commandQueue: MTLCommandQueue
     private let pipelineResources: RendererPipelineResources
     private var stampPipeline: MTLComputePipelineState { pipelineResources.stamp }
@@ -131,6 +135,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             device: requestedDevice,
             pipelineResources: nil,
             resourcePolicy: nil,
+            workPolicy: nil,
             performsResourceAdmission: true,
             commandBufferError: { $0.error }
         )
@@ -147,6 +152,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             device: requestedDevice,
             pipelineResources: nil,
             resourcePolicy: nil,
+            workPolicy: nil,
             performsResourceAdmission: true,
             commandBufferError: debugCommandBufferError
         )
@@ -162,8 +168,42 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             device: requestedDevice,
             pipelineResources: nil,
             resourcePolicy: debugResourcePolicy,
+            workPolicy: nil,
             performsResourceAdmission: true,
             commandBufferError: { $0.error }
+        )
+    }
+
+    convenience init(
+        project: PaintingProject,
+        device requestedDevice: MTLDevice?,
+        debugWorkPolicy: RendererWorkPolicy
+    ) throws {
+        try self.init(
+            project: project,
+            device: requestedDevice,
+            pipelineResources: nil,
+            resourcePolicy: nil,
+            workPolicy: debugWorkPolicy,
+            performsResourceAdmission: true,
+            commandBufferError: { $0.error }
+        )
+    }
+
+    convenience init(
+        project: PaintingProject,
+        device requestedDevice: MTLDevice?,
+        debugWorkPolicy: RendererWorkPolicy,
+        debugCommandBufferError: @escaping (MTLCommandBuffer) -> Error?
+    ) throws {
+        try self.init(
+            project: project,
+            device: requestedDevice,
+            pipelineResources: nil,
+            resourcePolicy: nil,
+            workPolicy: debugWorkPolicy,
+            performsResourceAdmission: true,
+            commandBufferError: debugCommandBufferError
         )
     }
     #endif
@@ -173,6 +213,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         device requestedDevice: MTLDevice?,
         pipelineResources sharedPipelineResources: RendererPipelineResources?,
         resourcePolicy requestedResourcePolicy: RendererResourcePolicy?,
+        workPolicy requestedWorkPolicy: RendererWorkPolicy?,
         performsResourceAdmission: Bool,
         commandBufferError: @escaping (MTLCommandBuffer) -> Error?
     ) throws {
@@ -196,6 +237,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
 
         self.device = requestedDevice
         resourcePolicy = resolvedResourcePolicy
+        workPolicy = requestedWorkPolicy ?? .live
         self.commandQueue = commandQueue
         let resolvedPipelineResources = try sharedPipelineResources
             ?? RendererPipelineResources(device: requestedDevice)
@@ -272,6 +314,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             device: device,
             pipelineResources: pipelineResources,
             resourcePolicy: resourcePolicy,
+            workPolicy: workPolicy,
             performsResourceAdmission: false,
             commandBufferError: commandBufferErrorProvider.operation
         )
@@ -366,8 +409,9 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.invalidProject(error)
         }
 
+        var workBudget = workPolicy.makeProjectBudget()
+        let previousSimulationState = simulationStateSnapshot
         let commandBuffer = try makeCommandBuffer(label: "Commit watercolor stroke preview")
-        activeSimulationRegions = transaction.committedSimulationRegions
         try encodeStrokePreviewSnapshotRestore(transaction, with: commandBuffer)
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw RendererError.allocation("a stroke preview completion encoder")
@@ -375,7 +419,19 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         guard let slice = layerSlices[stroke.layerID] else {
             throw RendererError.unknownLayer(stroke.layerID)
         }
-        encodeStrokeAndSimulation(stroke: stroke, slice: slice, with: encoder)
+        activeSimulationRegions = transaction.committedSimulationRegions
+        do {
+            try encodeStrokeAndSimulation(
+                stroke: stroke,
+                slice: slice,
+                workBudget: &workBudget,
+                with: encoder
+            )
+        } catch {
+            encoder.endEncoding()
+            restoreSimulationState(previousSimulationState)
+            throw error
+        }
         encodeComposite(with: encoder)
         prepareCanvasWetnessMeasurement()
         encodeCanvasWetnessMeasurement(with: encoder)
@@ -425,12 +481,25 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.unknownLayer(stroke.layerID)
         }
 
+        var workBudget = workPolicy.makeProjectBudget()
+        let previousSimulationState = simulationStateSnapshot
         let commandBuffer = try makeCommandBuffer(label: "Watercolor stroke")
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw RendererError.allocation("a stroke command encoder")
         }
         encoder.label = "Watercolor stroke and simulation"
-        encodeStrokeAndSimulation(stroke: stroke, slice: slice, with: encoder)
+        do {
+            try encodeStrokeAndSimulation(
+                stroke: stroke,
+                slice: slice,
+                workBudget: &workBudget,
+                with: encoder
+            )
+        } catch {
+            encoder.endEncoding()
+            restoreSimulationState(previousSimulationState)
+            throw error
+        }
         encodeComposite(with: encoder)
         if waitUntilCompleted {
             prepareCanvasWetnessMeasurement()
@@ -454,6 +523,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.unknownLayer(stroke.layerID)
         }
 
+        var workBudget = workPolicy.makeProjectBudget()
+        let previousSimulationState = simulationStateSnapshot
         let commandBuffer = try makeCommandBuffer(label: "Watercolor stroke preview")
         if capturesCommittedState {
             try encodeStrokePreviewSnapshotCapture(transaction, with: commandBuffer)
@@ -465,13 +536,20 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         let pointIndexOffset = transaction.renderedPointCount
         var appendedStroke = stroke
         appendedStroke.points = Array(stroke.points.dropFirst(pointIndexOffset))
-        encodeStrokeAndSimulation(
-            stroke: appendedStroke,
-            slice: slice,
-            pointIndexOffset: pointIndexOffset,
-            initialPreviousPoint: pointIndexOffset > 0 ? stroke.points[pointIndexOffset - 1] : nil,
-            with: encoder
-        )
+        do {
+            try encodeStrokeAndSimulation(
+                stroke: appendedStroke,
+                slice: slice,
+                pointIndexOffset: pointIndexOffset,
+                initialPreviousPoint: pointIndexOffset > 0 ? stroke.points[pointIndexOffset - 1] : nil,
+                workBudget: &workBudget,
+                with: encoder
+            )
+        } catch {
+            encoder.endEncoding()
+            restoreSimulationState(previousSimulationState)
+            throw error
+        }
         encodeComposite(with: encoder)
         encoder.endEncoding()
         let provider = commandBufferErrorProvider
@@ -607,62 +685,106 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         }
         encoder.label = "Deterministic watercolor replay"
 
-        if let replacementTextures {
-            pigmentTextures = replacementTextures.pigment
-            wetnessTextures = replacementTextures.wetness
-            compositeTexture = replacementTextures.composite
-            transactionCompositeTexture = replacementTextures.transactionComposite
-            layerCapacity = replayPlan.layerCapacity
-            viewportSize = CGSize(width: newProject.canvas.width, height: newProject.canvas.height)
-        }
-        if let replacementWetnessTileMaximumBuffer {
-            wetnessTileMaximumBuffer = replacementWetnessTileMaximumBuffer
-        }
-        project = newProject
-        layerSlices = replayPlan.finalLayerSlices
-        layerOpacityPreviews.removeAll()
-        frontTextureIndex = 0
-        activeSimulationRegions = [:]
-        updateLayerMetadata()
+        let previousPigmentTextures = pigmentTextures
+        let previousWetnessTextures = wetnessTextures
+        let previousCompositeTexture = compositeTexture
+        let previousTransactionCompositeTexture = transactionCompositeTexture
+        let previousWetnessTileMaximumBuffer = wetnessTileMaximumBuffer
+        let previousLayerCapacity = layerCapacity
+        let previousProject = project
+        let previousViewportSize = viewportSize
+        let previousLayerSlices = layerSlices
+        let previousLayerOpacityPreviews = layerOpacityPreviews
+        let previousSimulationState = simulationStateSnapshot
+        #if DEBUG
+        let previousLastStrokeDispatch = lastStrokeDispatch
+        #endif
 
-        encodeClear(targetSlice: Self.allLayers, texturesAt: 0, with: encoder)
-        encodeClear(targetSlice: Self.allLayers, texturesAt: 1, with: encoder)
-
-        for action in replayPlan.actions {
-            switch action {
-            case let .stroke(stroke, slice):
-                encodeStrokeAndSimulation(stroke: stroke, slice: slice, with: encoder)
-            case let .simulateDiscardedStroke(pointCount):
-                _ = encodeActiveSimulation(
-                    steps: Self.simulationStepsPerStroke * pointCount,
-                    with: encoder
-                )
-            case let .clear(slice):
-                encodeClear(targetSlice: UInt32(slice), texturesAt: 0, with: encoder)
-                encodeClear(targetSlice: UInt32(slice), texturesAt: 1, with: encoder)
-                activeSimulationRegions.removeValue(forKey: slice)
-            case let .duplicate(source, destination):
-                encodeCopy(source: source, destination: destination, with: encoder)
-                activeSimulationRegions[destination] = activeSimulationRegions[source]
-            case let .merge(command, source, destination):
-                encodeMerge(command: command, source: source, destination: destination, with: encoder)
-                let mergedRegions = (activeSimulationRegions[destination] ?? [])
-                    + (activeSimulationRegions[source] ?? [])
-                activeSimulationRegions[destination] = coalescedActiveRegions(mergedRegions)
-                activeSimulationRegions.removeValue(forKey: source)
-            case let .dry(slice, steps):
-                _ = encodeActiveSimulation(
-                    steps: steps,
-                    restrictingTo: Set([slice]),
-                    with: encoder
-                )
+        do {
+            if let replacementTextures {
+                pigmentTextures = replacementTextures.pigment
+                wetnessTextures = replacementTextures.wetness
+                compositeTexture = replacementTextures.composite
+                transactionCompositeTexture = replacementTextures.transactionComposite
+                layerCapacity = replayPlan.layerCapacity
+                viewportSize = CGSize(width: newProject.canvas.width, height: newProject.canvas.height)
             }
-        }
+            if let replacementWetnessTileMaximumBuffer {
+                wetnessTileMaximumBuffer = replacementWetnessTileMaximumBuffer
+            }
+            project = newProject
+            layerSlices = replayPlan.finalLayerSlices
+            layerOpacityPreviews.removeAll()
+            frontTextureIndex = 0
+            activeSimulationRegions = [:]
+            updateLayerMetadata()
 
-        encodeComposite(with: encoder)
-        prepareCanvasWetnessMeasurement()
-        encodeCanvasWetnessMeasurement(with: encoder)
-        encoder.endEncoding()
+            encodeClear(targetSlice: Self.allLayers, texturesAt: 0, with: encoder)
+            encodeClear(targetSlice: Self.allLayers, texturesAt: 1, with: encoder)
+
+            var workBudget = workPolicy.makeProjectBudget()
+            for action in replayPlan.actions {
+                workBudget.beginCommand()
+                switch action {
+                case let .stroke(stroke, slice):
+                    try encodeStrokeAndSimulation(
+                        stroke: stroke,
+                        slice: slice,
+                        workBudget: &workBudget,
+                        with: encoder
+                    )
+                case let .simulateDiscardedStroke(pointCount):
+                    _ = try encodeActiveSimulation(
+                        steps: Self.simulationStepsPerStroke * pointCount,
+                        workBudget: &workBudget,
+                        with: encoder
+                    )
+                case let .clear(slice):
+                    encodeClear(targetSlice: UInt32(slice), texturesAt: 0, with: encoder)
+                    encodeClear(targetSlice: UInt32(slice), texturesAt: 1, with: encoder)
+                    activeSimulationRegions.removeValue(forKey: slice)
+                case let .duplicate(source, destination):
+                    encodeCopy(source: source, destination: destination, with: encoder)
+                    activeSimulationRegions[destination] = activeSimulationRegions[source]
+                case let .merge(command, source, destination):
+                    encodeMerge(command: command, source: source, destination: destination, with: encoder)
+                    let mergedRegions = (activeSimulationRegions[destination] ?? [])
+                        + (activeSimulationRegions[source] ?? [])
+                    activeSimulationRegions[destination] = coalescedActiveRegions(mergedRegions)
+                    activeSimulationRegions.removeValue(forKey: source)
+                case let .dry(slice, steps):
+                    _ = try encodeActiveSimulation(
+                        steps: steps,
+                        restrictingTo: Set([slice]),
+                        workBudget: &workBudget,
+                        with: encoder
+                    )
+                }
+            }
+
+            encodeComposite(with: encoder)
+            prepareCanvasWetnessMeasurement()
+            encodeCanvasWetnessMeasurement(with: encoder)
+            encoder.endEncoding()
+        } catch {
+            encoder.endEncoding()
+            pigmentTextures = previousPigmentTextures
+            wetnessTextures = previousWetnessTextures
+            compositeTexture = previousCompositeTexture
+            transactionCompositeTexture = previousTransactionCompositeTexture
+            wetnessTileMaximumBuffer = previousWetnessTileMaximumBuffer
+            layerCapacity = previousLayerCapacity
+            project = previousProject
+            viewportSize = previousViewportSize
+            layerSlices = previousLayerSlices
+            layerOpacityPreviews = previousLayerOpacityPreviews
+            restoreSimulationState(previousSimulationState)
+            #if DEBUG
+            lastStrokeDispatch = previousLastStrokeDispatch
+            #endif
+            updateLayerMetadata()
+            throw error
+        }
         try submit(commandBuffer, wait: true)
         readCanvasWetnessMeasurement()
     }
@@ -696,15 +818,24 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.unknownLayer(layerID)
         }
 
+        var workBudget = workPolicy.makeProjectBudget()
+        let previousSimulationState = simulationStateSnapshot
         let commandBuffer = try makeCommandBuffer(label: "Dry watercolor layer")
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw RendererError.allocation("a drying command encoder")
         }
-        _ = encodeActiveSimulation(
-            steps: min(max(0, steps), PaintingProject.maximumDryStepCount),
-            restrictingTo: Set([slice]),
-            with: encoder
-        )
+        do {
+            _ = try encodeActiveSimulation(
+                steps: min(max(0, steps), PaintingProject.maximumDryStepCount),
+                restrictingTo: Set([slice]),
+                workBudget: &workBudget,
+                with: encoder
+            )
+        } catch {
+            encoder.endEncoding()
+            restoreSimulationState(previousSimulationState)
+            throw error
+        }
         encodeComposite(with: encoder)
         prepareCanvasWetnessMeasurement()
         encodeCanvasWetnessMeasurement(with: encoder)
@@ -928,7 +1059,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                         layerSlices: &layerSlices,
                         freeSlices: &freeSlices
                     )
-                    actions.append(.dry(slice, max(0, dry.steps)))
+                    actions.append(.dry(slice, dry.steps))
                 }
             }
             peakLayerCount = max(peakLayerCount, layerSlices.count)
@@ -1028,8 +1159,9 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         slice: Int,
         pointIndexOffset: Int = 0,
         initialPreviousPoint: StrokePoint? = nil,
+        workBudget: inout RenderWorkBudget,
         with encoder: MTLComputeCommandEncoder
-    ) {
+    ) throws {
         guard !stroke.points.isEmpty else { return }
         var stampBatchCount = 0
         var simulationStepCount = 0
@@ -1052,8 +1184,9 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             guard let stampRegion = CanvasRegion.forStroke(batch, canvas: project.canvas) else { continue }
             let stepCount = Self.simulationStepsPerStroke * batch.points.count
             registerActiveSimulationRegion(stampRegion, slice: slice)
-            let dispatches = encodeActiveSimulation(
+            let dispatches = try encodeActiveSimulation(
                 steps: stepCount,
+                workBudget: &workBudget,
                 with: encoder
             )
             stampBatchCount += 1
@@ -1089,12 +1222,25 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         )
     }
 
+    private var simulationStateSnapshot: SimulationStateSnapshot {
+        SimulationStateSnapshot(
+            frontTextureIndex: frontTextureIndex,
+            activeSimulationRegions: activeSimulationRegions
+        )
+    }
+
+    private func restoreSimulationState(_ snapshot: SimulationStateSnapshot) {
+        frontTextureIndex = snapshot.frontTextureIndex
+        activeSimulationRegions = snapshot.activeSimulationRegions
+    }
+
     @discardableResult
     private func encodeActiveSimulation(
         steps: Int,
         restrictingTo restrictedSlices: Set<Int>? = nil,
+        workBudget: inout RenderWorkBudget,
         with encoder: MTLComputeCommandEncoder
-    ) -> [SimulationDispatch] {
+    ) throws -> [SimulationDispatch] {
         guard steps > 0 else { return [] }
         let slices = activeSimulationRegions.keys
             .filter { restrictedSlices?.contains($0) ?? true }
@@ -1106,10 +1252,11 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             var advancedRegions: [ActiveSimulationRegion] = []
             for activeRegion in regions {
                 let simulationRegion = activeRegion.region.padded(by: steps, canvas: project.canvas)
-                encodeSimulation(
+                try encodeSimulation(
                     steps: steps,
                     targetSlice: UInt32(slice),
                     region: simulationRegion,
+                    workBudget: &workBudget,
                     with: encoder
                 )
                 dispatches.append(SimulationDispatch(
@@ -1298,9 +1445,17 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         steps: Int,
         targetSlice: UInt32,
         region: CanvasRegion?,
+        workBudget: inout RenderWorkBudget,
         with encoder: MTLComputeCommandEncoder
-    ) {
+    ) throws {
         guard steps > 0, let region, region.width > 0, region.height > 0 else { return }
+        let sliceDepth = targetSlice == Self.allLayers ? layerCapacity : 1
+        try workBudget.consume(
+            regionArea: region.area,
+            steps: steps,
+            sliceDepth: sliceDepth,
+            passCount: 2
+        )
         encoder.setComputePipelineState(simulationPipeline)
         var parameters = SimulationParameters(
             rates: SIMD4(0.24, 0.055, 0.985, 0),
@@ -1323,7 +1478,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                 MTLSize(
                     width: region.width,
                     height: region.height,
-                    depth: targetSlice == Self.allLayers ? layerCapacity : 1
+                    depth: sliceDepth
                 ),
                 threadsPerThreadgroup: threadgroupSize(for: simulationPipeline)
             )
@@ -1951,6 +2106,11 @@ private struct CanvasRegion: Equatable {
 private struct ActiveSimulationRegion: Equatable {
     let region: CanvasRegion
     let remainingSteps: Int
+}
+
+private struct SimulationStateSnapshot {
+    let frontTextureIndex: Int
+    let activeSimulationRegions: [Int: [ActiveSimulationRegion]]
 }
 
 private struct SimulationDispatch {
