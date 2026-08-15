@@ -43,6 +43,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private static let maximumLayerCapacity = PaintingProject.maximumLayerCount
     private static let simulationStepsPerStroke = 2
     private static let stampBatchSize = 8
+    private static let activeRegionLifetimeSteps = 256
     private static let allLayers = UInt32.max
 
     public private(set) var project: PaintingProject
@@ -81,7 +82,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private var lastCommandBuffer: MTLCommandBuffer?
     private let commandBufferErrorProvider: CommandBufferErrorProvider
     private var strokePreview: StrokePreviewTransaction?
-    private var activeSimulationRegion: CanvasRegion?
+    private var activeSimulationRegions: [Int: [ActiveSimulationRegion]]
     private var displayZoom: CGFloat = 1
     private var displayPan: CGSize = .zero
     #if DEBUG
@@ -164,7 +165,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         )
         commandBufferErrorProvider = CommandBufferErrorProvider(commandBufferError)
         strokePreview = nil
-        activeSimulationRegion = nil
+        activeSimulationRegions = [:]
 
         let textures = try Self.makeTextures(
             device: requestedDevice,
@@ -232,7 +233,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             stroke: stroke,
             pigmentSnapshot: snapshot.pigment,
             wetnessSnapshot: snapshot.wetness,
-            committedSimulationRegion: activeSimulationRegion
+            committedSimulationRegions: activeSimulationRegions
         )
         strokePreview = transaction
         do {
@@ -259,7 +260,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
 
         guard transaction.renderedPointCount < stroke.points.count else { return }
         let capturesCommittedState = transaction.renderedPointCount == 0
-        activeSimulationRegion = transaction.committedSimulationRegion
+        activeSimulationRegions = transaction.committedSimulationRegions
         try renderPreview(
             stroke: stroke,
             capturesCommittedState: capturesCommittedState,
@@ -311,7 +312,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     public func cancelStrokePreview() throws {
         guard let transaction = strokePreview else { return }
         strokePreview = nil
-        activeSimulationRegion = transaction.committedSimulationRegion
+        activeSimulationRegions = transaction.committedSimulationRegions
         let commandBuffer = try makeCommandBuffer(label: "Cancel watercolor stroke preview")
         try encodeStrokePreviewSnapshotRestore(transaction, with: commandBuffer)
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
@@ -506,7 +507,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         layerSlices = replayPlan.finalLayerSlices
         layerOpacityPreviews.removeAll()
         frontTextureIndex = 0
-        activeSimulationRegion = nil
+        activeSimulationRegions = [:]
         updateLayerMetadata()
 
         encodeClear(targetSlice: Self.allLayers, texturesAt: 0, with: encoder)
@@ -517,24 +518,27 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             case let .stroke(stroke, slice):
                 encodeStrokeAndSimulation(stroke: stroke, slice: slice, with: encoder)
             case let .simulateDiscardedStroke(pointCount):
-                encodeSimulation(
+                _ = encodeActiveSimulation(
                     steps: Self.simulationStepsPerStroke * pointCount,
-                    targetSlice: Self.allLayers,
-                    region: activeSimulationRegion,
                     with: encoder
                 )
             case let .clear(slice):
                 encodeClear(targetSlice: UInt32(slice), texturesAt: 0, with: encoder)
                 encodeClear(targetSlice: UInt32(slice), texturesAt: 1, with: encoder)
+                activeSimulationRegions.removeValue(forKey: slice)
             case let .duplicate(source, destination):
                 encodeCopy(source: source, destination: destination, with: encoder)
+                activeSimulationRegions[destination] = activeSimulationRegions[source]
             case let .merge(command, source, destination):
                 encodeMerge(command: command, source: source, destination: destination, with: encoder)
+                let mergedRegions = (activeSimulationRegions[destination] ?? [])
+                    + (activeSimulationRegions[source] ?? [])
+                activeSimulationRegions[destination] = coalescedActiveRegions(mergedRegions)
+                activeSimulationRegions.removeValue(forKey: source)
             case let .dry(slice, steps):
-                encodeSimulation(
+                _ = encodeActiveSimulation(
                     steps: steps,
-                    targetSlice: UInt32(slice),
-                    region: activeSimulationRegion,
+                    restrictingTo: Set([slice]),
                     with: encoder
                 )
             }
@@ -581,10 +585,9 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw RendererError.allocation("a drying command encoder")
         }
-        encodeSimulation(
+        _ = encodeActiveSimulation(
             steps: min(max(0, steps), PaintingProject.maximumDryStepCount),
-            targetSlice: UInt32(slice),
-            region: activeSimulationRegion,
+            restrictingTo: Set([slice]),
             with: encoder
         )
         encodeComposite(with: encoder)
@@ -916,7 +919,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         var stampBatchCount = 0
         var simulationStepCount = 0
         var simulationThreadCount = 0
-        var dispatchedRegion: CanvasRegion?
+        var largestDispatchedRegion: CanvasRegion?
+        var simulatedSlices = Set<Int>()
 
         for batchStart in stride(from: 0, to: stroke.points.count, by: Self.stampBatchSize) {
             let batchEnd = min(batchStart + Self.stampBatchSize, stroke.points.count)
@@ -932,23 +936,20 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
 
             guard let stampRegion = CanvasRegion.forStroke(batch, canvas: project.canvas) else { continue }
             let stepCount = Self.simulationStepsPerStroke * batch.points.count
-            activeSimulationRegion = activeSimulationRegion?.union(stampRegion) ?? stampRegion
-            let simulationRegion = activeSimulationRegion?.padded(
-                by: stepCount + 2,
-                canvas: project.canvas
-            )
-            activeSimulationRegion = simulationRegion
-            encodeSimulation(
+            registerActiveSimulationRegion(stampRegion, slice: slice)
+            let dispatches = encodeActiveSimulation(
                 steps: stepCount,
-                targetSlice: Self.allLayers,
-                region: simulationRegion,
                 with: encoder
             )
             stampBatchCount += 1
             simulationStepCount += stepCount
-            if let simulationRegion {
-                dispatchedRegion = dispatchedRegion?.union(simulationRegion) ?? simulationRegion
-                simulationThreadCount += simulationRegion.area * stepCount
+            for dispatch in dispatches {
+                simulatedSlices.insert(dispatch.slice)
+                simulationThreadCount += dispatch.region.area * dispatch.steps * dispatch.gridDepth
+                if largestDispatchedRegion == nil
+                    || dispatch.region.area > largestDispatchedRegion!.area {
+                    largestDispatchedRegion = dispatch.region
+                }
             }
         }
 
@@ -956,11 +957,94 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         lastStrokeDispatch = RendererDebugStrokeDispatch(
             stampBatchCount: stampBatchCount,
             simulationStepCount: simulationStepCount,
-            activeSliceDepth: 1,
-            simulationRegion: dispatchedRegion?.cgRect ?? .zero,
+            activeSliceDepth: simulatedSlices.count,
+            simulationRegion: largestDispatchedRegion?.cgRect ?? .zero,
             simulationThreadCount: simulationThreadCount
         )
         #endif
+    }
+
+    private func registerActiveSimulationRegion(_ region: CanvasRegion, slice: Int) {
+        let newRegion = ActiveSimulationRegion(
+            region: region.padded(by: 2, canvas: project.canvas),
+            remainingSteps: Self.activeRegionLifetimeSteps
+        )
+        activeSimulationRegions[slice] = coalescedActiveRegions(
+            (activeSimulationRegions[slice] ?? []) + [newRegion]
+        )
+    }
+
+    @discardableResult
+    private func encodeActiveSimulation(
+        steps: Int,
+        restrictingTo restrictedSlices: Set<Int>? = nil,
+        with encoder: MTLComputeCommandEncoder
+    ) -> [SimulationDispatch] {
+        guard steps > 0 else { return [] }
+        let slices = activeSimulationRegions.keys
+            .filter { restrictedSlices?.contains($0) ?? true }
+            .sorted()
+        var dispatches: [SimulationDispatch] = []
+
+        for slice in slices {
+            let regions = coalescedActiveRegions(activeSimulationRegions[slice] ?? [])
+            var advancedRegions: [ActiveSimulationRegion] = []
+            for activeRegion in regions {
+                let simulationRegion = activeRegion.region.padded(by: steps, canvas: project.canvas)
+                encodeSimulation(
+                    steps: steps,
+                    targetSlice: UInt32(slice),
+                    region: simulationRegion,
+                    with: encoder
+                )
+                dispatches.append(SimulationDispatch(
+                    slice: slice,
+                    region: simulationRegion,
+                    steps: steps,
+                    gridDepth: 1
+                ))
+                let remainingSteps = activeRegion.remainingSteps - steps
+                if remainingSteps > 0 {
+                    advancedRegions.append(ActiveSimulationRegion(
+                        region: simulationRegion,
+                        remainingSteps: remainingSteps
+                    ))
+                }
+            }
+            let coalesced = coalescedActiveRegions(advancedRegions)
+            if coalesced.isEmpty {
+                activeSimulationRegions.removeValue(forKey: slice)
+            } else {
+                activeSimulationRegions[slice] = coalesced
+            }
+        }
+        return dispatches
+    }
+
+    private func coalescedActiveRegions(
+        _ regions: [ActiveSimulationRegion]
+    ) -> [ActiveSimulationRegion] {
+        var result: [ActiveSimulationRegion] = []
+        for candidate in regions {
+            var merged = candidate
+            var index = result.count - 1
+            while index >= 0 {
+                guard merged.region.intersectsOrTouches(result[index].region) else {
+                    index -= 1
+                    continue
+                }
+                let existing = result.remove(at: index)
+                merged = ActiveSimulationRegion(
+                    region: merged.region.union(existing.region),
+                    remainingSteps: max(merged.remainingSteps, existing.remainingSteps)
+                )
+                index = result.count - 1
+            }
+            result.append(merged)
+        }
+        return result.sorted {
+            ($0.region.minY, $0.region.minX) < ($1.region.minY, $1.region.minX)
+        }
     }
 
     private func encode(
@@ -1729,6 +1813,11 @@ private struct CanvasRegion: Equatable {
         )
     }
 
+    func intersectsOrTouches(_ other: Self) -> Bool {
+        minX <= other.maxX && maxX >= other.minX
+            && minY <= other.maxY && maxY >= other.minY
+    }
+
     static func forStroke(_ stroke: StrokeCommand, canvas: CanvasSize) -> Self? {
         stroke.points.reduce(nil as Self?) { result, point in
             let pressure = min(max(point.pressure, 0), 1)
@@ -1742,6 +1831,18 @@ private struct CanvasRegion: Equatable {
             return result?.union(pointRegion) ?? pointRegion
         }
     }
+}
+
+private struct ActiveSimulationRegion: Equatable {
+    let region: CanvasRegion
+    let remainingSteps: Int
+}
+
+private struct SimulationDispatch {
+    let slice: Int
+    let region: CanvasRegion
+    let steps: Int
+    let gridDepth: Int
 }
 
 private final class CommandBufferErrorProvider: @unchecked Sendable {
@@ -1761,7 +1862,7 @@ private final class StrokePreviewTransaction: @unchecked Sendable {
     let layerID: UUID
     let pigmentSnapshot: MTLTexture
     let wetnessSnapshot: MTLTexture
-    let committedSimulationRegion: CanvasRegion?
+    let committedSimulationRegions: [Int: [ActiveSimulationRegion]]
     var renderedPointCount = 0
 
     private let lock = NSLock()
@@ -1771,13 +1872,13 @@ private final class StrokePreviewTransaction: @unchecked Sendable {
         stroke: StrokeCommand,
         pigmentSnapshot: MTLTexture,
         wetnessSnapshot: MTLTexture,
-        committedSimulationRegion: CanvasRegion?
+        committedSimulationRegions: [Int: [ActiveSimulationRegion]]
     ) {
         strokeID = stroke.id
         layerID = stroke.layerID
         self.pigmentSnapshot = pigmentSnapshot
         self.wetnessSnapshot = wetnessSnapshot
-        self.committedSimulationRegion = committedSimulationRegion
+        self.committedSimulationRegions = committedSimulationRegions
     }
 
     func record(_ error: Error?) {

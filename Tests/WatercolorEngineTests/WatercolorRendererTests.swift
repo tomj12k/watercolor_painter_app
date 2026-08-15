@@ -168,6 +168,28 @@ import WatercolorCore
         #expect(dispatch.simulationThreadCount < project.canvas.width * project.canvas.height * 34)
     }
 
+    @Test func distantStrokesKeepSeparateDirtyRegionsAndAdvanceOnlyExplicitWetSlices() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let layers = [PaintLayer(name: "First wet layer"), PaintLayer(name: "Dry layer"), PaintLayer(name: "Second wet layer")]
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .rough,
+            layers: layers
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        try renderer.renderAndWait(stroke: .testDot(layerID: layers[0].id, tool: .water, x: 32, y: 32))
+        let firstWetness = try renderer.debugWetness(x: 32, y: 32, layerID: layers[0].id)
+
+        try renderer.renderAndWait(stroke: .testDot(layerID: layers[2].id, tool: .water, x: 224, y: 224))
+        let dispatch = renderer.debugLastStrokeDispatch
+
+        #expect(try renderer.debugWetness(x: 32, y: 32, layerID: layers[0].id) < firstWetness)
+        #expect(dispatch.activeSliceDepth == 2)
+        #expect(dispatch.simulationRegion.width < 96)
+        #expect(dispatch.simulationRegion.height < 96)
+        #expect(dispatch.simulationThreadCount < 25_000)
+    }
+
     @Test func paperFibersModulateSimulationEvolution() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         func evolution(on paper: PaperTexture) throws -> Double {
