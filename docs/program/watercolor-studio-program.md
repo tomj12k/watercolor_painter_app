@@ -36,12 +36,12 @@ The UI model and shader research may proceed beside P2, but the first end-to-end
 
 | Milestone | Status | Release-verification evidence (2026-08-15) |
 |---|---|---|
-| **M1 — Running native shell** | Complete | `swift package clean && make test && make app` exited 0; `make app` produced the arm64 `.app` bundle. |
+| **M1 — Running native shell** | Qualified — visual/manual launch pending | `swift package clean && make test && make app` exited 0; `make app` produced the arm64 `.app` bundle. The packaged executable passed a process-liveness check, but an observed app-window launch via `swift run` was not performed. |
 | **M2 — First colored mark** | Complete | The Metal renderer’s GPU-backed tests cover pigment deposit and readback; the `CanvasStrokeIntegrationTests` suite covers pointer stroke completion. |
 | **M3 — Watercolor behavior** | Complete | Metal API and GPU validation were enabled for 27 `WatercolorRendererTests`, including wet color mixing, wetness decay, every brush/paper enum, and every tool effect; all passed without validation findings. |
 | **M4 — Complete studio** | Complete | Source audit confirms visible controls and model/renderer paths for five papers, styles, shapes, hairs, textures, six tools, color picker, numeric brush controls, viewport controls, and 12-layer actions. The retained design variance is direct drag reordering: the shipped UI uses accessible Move up/Move down controls. |
 | **M5 — Durable artwork** | Complete | The 125-test suite covers command history, document codec/schema rejection, deterministic replay, `.watercolor` `FileDocument` lifecycle, and non-mutating PNG export. |
-| **M6 — Release candidate** | Complete | Fresh clean test/build and plist/executable checks passed. The packaged executable remained alive for five seconds under its exact launched PID and was then terminated deliberately. |
+| **M6 — Release candidate** | Qualified — manual smoke pending | Fresh clean test/build and plist/executable checks passed. The packaged executable remained alive for five seconds under its exact launched PID and was then terminated deliberately. This was process-liveness only, not a visual/manual app smoke test. |
 
 ## Decision rights
 
@@ -57,6 +57,7 @@ The UI model and shader research may proceed beside P2, but the first end-to-end
 | Assumption | Apple Silicon is the primary target | Sponsor | Intel-only support becomes required | Fresh verification ran on arm64/Apple Silicon. Intel support was not tested. Retained. |
 | Risk | Physical tablet/input acceptance | P4 | Tablet pressure, tilt, rapid strokes, or focus transitions misbehave on hardware | Builder/event-bridge tests and compilation passed; no physical tablet was available for this release verification. Retained. |
 | Risk | Accessibility and visual acceptance | P5 | VoiceOver semantics or appearance/regressions are discovered in use | Native accessibility labels are present in source, but VoiceOver and visual screen-capture acceptance were not performed. Retained. |
+| Risk | Native app-window/manual smoke acceptance | P1/P6 | The packaged app starts but fails to present or work correctly in a visible desktop session | Only exact-PID process liveness was tested; no observed window launch through `swift run` or manual packaged-app interaction was performed. Retained. |
 | Scope variance | Direct drag layer reordering and custom canvas dimensions | P5 | Product requires those design-specified UI interactions in this release | Layer ordering is exposed by Move up/Move down; the model supports 256–4,096 dimensions but the document UI does not expose custom-size creation. Retained for product decision. |
 
 ### Closed release risks
@@ -65,7 +66,7 @@ The UI model and shader research may proceed beside P2, but the first end-to-end
 |---|---|
 | Metal API/Swift 6 integration friction | Fresh production build passed; 27 renderer tests passed with Metal API Validation and Metal GPU Validation enabled and no findings. |
 | Deterministic replay drift | Independent-renderer replay checksum, saved/decoded duplicate replay, and paper-change reopen tests passed in the full suite. |
-| App bundle lacks runtime resources | `make app` produced an executable bundle; plist lint and executable checks passed; the packaged executable survived an exact-PID five-second smoke launch. |
+| App bundle lacks runtime resources | `make app` produced an executable bundle; plist lint and executable checks passed; the packaged executable survived an exact-PID five-second process-liveness check. Visible app-window acceptance remains open. |
 | Command schema/replay dependency | Stable schema validation and all semantic command cases are covered by codec and replay tests. |
 
 ## Status rules
@@ -96,6 +97,6 @@ test -x '.build/release/Watercolor Studio.app/Contents/MacOS/WatercolorStudio'
 
 Result: plist `OK`; bundle contains `Contents/Info.plist` and executable `Contents/MacOS/WatercolorStudio` (arm64). The executable’s exact spawned PID stayed alive for five seconds before controlled termination (expected status 143).
 
-The release smoke is process-liveness only. It did not test physical tablet hardware, VoiceOver, signing/notarization, App Store submission, direct drag reordering, or visual screen capture.
+The launch check is process-liveness only. It did not observe an app window, perform a visual/manual app smoke, or test physical tablet hardware, VoiceOver, signing/notarization, App Store submission, direct drag reordering, or visual screen capture.
 
 Closed tasks are reflected in the implementation plan and git history. Residual risks above remain release follow-ups rather than unsubstantiated completion claims.
