@@ -58,12 +58,14 @@ import WatercolorCore
         var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id, x: 64, y: 64)
 
         model.beginStrokePreview(stroke)
+        await model.waitForStrokePreviewIdle()
         #expect(model.isStrokePreviewActive)
         #expect(model.project.commands.isEmpty)
         #expect(try renderer.debugPixel(x: 64, y: 64).alpha > 0.05)
 
         stroke.points.append(StrokePoint(x: 96, y: 64, pressure: 1, tiltX: 0, tiltY: 0, time: 1))
         model.updateStrokePreview(stroke)
+        await model.waitForStrokePreviewIdle()
         #expect(model.project.commands.isEmpty)
         #expect(try renderer.debugPixel(x: 96, y: 64).alpha > 0.05)
 
@@ -108,7 +110,47 @@ import WatercolorCore
         #expect(try renderer.studioChecksum() == replayed.studioChecksum())
     }
 
-    @Test func cancellingLiveStrokePreviewRestoresTheCommittedRaster() throws {
+    @Test func rapidMouseStyleUpdatesCoalesceGPUPreviewWork() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let previewSubmissions = CommandBufferLabelCounter(label: "Watercolor stroke preview")
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugCommandBufferError: { commandBuffer in
+                previewSubmissions.record(commandBuffer.label)
+                return commandBuffer.error
+            }
+        )
+        let model = StudioModel(project: project, renderer: renderer)
+        var stroke = StrokeCommand.studioTestStroke(
+            id: UUID(uuidString: "31C771C7-B8A6-48AC-995A-F7C2C468BA93")!,
+            layerID: project.layers[0].id,
+            x: 24,
+            y: 72
+        )
+
+        model.beginStrokePreview(stroke)
+        for index in 1..<24 {
+            stroke.points.append(StrokePoint(
+                x: Double(24 + index * 6),
+                y: Double(72 + index % 3),
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 120
+            ))
+            model.updateStrokePreview(stroke)
+        }
+        await model.commitStrokePreview(stroke)
+
+        let replayed = try WatercolorRenderer(project: model.project, device: device)
+        #expect(previewSubmissions.count <= 3)
+        #expect(model.project.commands == [.stroke(stroke)])
+        #expect(try renderer.studioChecksum() == replayed.studioChecksum())
+    }
+
+    @Test func cancellingLiveStrokePreviewRestoresTheCommittedRaster() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
         let renderer = try WatercolorRenderer(project: project, device: device)
@@ -116,6 +158,7 @@ import WatercolorCore
         let before = try renderer.studioChecksum()
 
         model.beginStrokePreview(.studioTestStroke(layerID: project.layers[0].id, x: 64, y: 64))
+        await model.waitForStrokePreviewIdle()
         #expect(try renderer.debugPixel(x: 64, y: 64).alpha > 0.05)
 
         model.cancelStrokePreview()
@@ -1140,6 +1183,29 @@ import WatercolorCore
         #expect(model.recentColors.first == colors[3])
         #expect(model.recentColors.filter { $0 == colors[3] }.count == 1)
         #expect(model.brush.color == colors[3])
+    }
+}
+
+private final class CommandBufferLabelCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let label: String
+    private var storage = 0
+
+    init(label: String) {
+        self.label = label
+    }
+
+    func record(_ candidate: String?) {
+        guard candidate == label else { return }
+        lock.lock()
+        storage += 1
+        lock.unlock()
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
     }
 }
 

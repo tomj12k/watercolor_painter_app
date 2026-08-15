@@ -239,6 +239,14 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         guard strokePreview == nil else {
             throw RendererError.invalidStrokePreview
         }
+        do {
+            try project.validateForRendering(stroke)
+        } catch let error as ProjectValidationError {
+            throw RendererError.invalidProject(error)
+        }
+        guard project.layers.contains(where: { $0.id == stroke.layerID }) else {
+            throw RendererError.unknownLayer(stroke.layerID)
+        }
         let snapshot = try Self.makeStrokePreviewSnapshot(
             device: device,
             width: compositeTexture.width,
@@ -252,15 +260,9 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             committedSimulationRegions: activeSimulationRegions
         )
         strokePreview = transaction
-        do {
-            try updateStrokePreview(stroke)
-        } catch {
-            strokePreview = nil
-            throw error
-        }
     }
 
-    public func updateStrokePreview(_ stroke: StrokeCommand) throws {
+    public func updateStrokePreview(_ stroke: StrokeCommand) async throws {
         guard let transaction = strokePreview,
               transaction.strokeID == stroke.id,
               transaction.layerID == stroke.layerID,
@@ -277,7 +279,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         guard transaction.renderedPointCount < stroke.points.count else { return }
         let capturesCommittedState = transaction.renderedPointCount == 0
         activeSimulationRegions = transaction.committedSimulationRegions
-        try renderPreview(
+        try await renderPreview(
             stroke: stroke,
             capturesCommittedState: capturesCommittedState,
             transaction: transaction
@@ -373,7 +375,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         stroke: StrokeCommand,
         capturesCommittedState: Bool,
         transaction: StrokePreviewTransaction
-    ) throws {
+    ) async throws {
         guard project.layers.contains(where: { $0.id == stroke.layerID }),
               let slice = layerSlices[stroke.layerID]
         else {
@@ -398,10 +400,20 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         encodeComposite(with: encoder)
         encoder.endEncoding()
         let provider = commandBufferErrorProvider
-        commandBuffer.addCompletedHandler { completed in
-            transaction.record(provider.error(for: completed))
+        lastCommandBuffer = commandBuffer
+        await withCheckedContinuation { continuation in
+            commandBuffer.addCompletedHandler { completed in
+                transaction.record(provider.error(for: completed))
+                continuation.resume()
+            }
+            commandBuffer.commit()
         }
-        try submit(commandBuffer, wait: false)
+        if lastCommandBuffer === commandBuffer {
+            lastCommandBuffer = nil
+        }
+        if let failure = transaction.failureDescription {
+            throw RendererError.allocation("GPU execution: \(failure)")
+        }
     }
 
     private func encodeStrokePreviewSnapshotCapture(
