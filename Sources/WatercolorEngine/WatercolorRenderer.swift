@@ -57,7 +57,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private var frontTextureIndex = 0
     private var layerSlices: [UUID: Int] = [:]
     private var lastCommandBuffer: MTLCommandBuffer?
-    private let completedStrokeCheck: (MTLCommandBuffer) throws -> Void
+    private let commandBufferError: (MTLCommandBuffer) -> Error?
 
     public convenience init(
         project: PaintingProject,
@@ -66,14 +66,28 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         try self.init(
             project: project,
             device: requestedDevice,
-            completedStrokeCheck: { _ in }
+            commandBufferError: { $0.error }
         )
     }
 
-    init(
+    #if DEBUG
+    convenience init(
         project: PaintingProject,
         device requestedDevice: MTLDevice?,
-        completedStrokeCheck: @escaping (MTLCommandBuffer) throws -> Void
+        debugCommandBufferError: @escaping (MTLCommandBuffer) -> Error?
+    ) throws {
+        try self.init(
+            project: project,
+            device: requestedDevice,
+            commandBufferError: debugCommandBufferError
+        )
+    }
+    #endif
+
+    private init(
+        project: PaintingProject,
+        device requestedDevice: MTLDevice?,
+        commandBufferError: @escaping (MTLCommandBuffer) -> Error?
     ) throws {
         guard let requestedDevice else {
             throw RendererError.metalUnavailable
@@ -105,7 +119,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.allocation("layer metadata")
         }
         self.layerMetadataBuffer = layerMetadataBuffer
-        self.completedStrokeCheck = completedStrokeCheck
+        self.commandBufferError = commandBufferError
 
         let textures = try Self.makeTextures(
             device: requestedDevice,
@@ -151,9 +165,6 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         encodeComposite(with: encoder)
         encoder.endEncoding()
         try submit(commandBuffer, wait: waitUntilCompleted)
-        if waitUntilCompleted {
-            try completedStrokeCheck(commandBuffer)
-        }
     }
 
     public func replay(project newProject: PaintingProject) throws {
@@ -571,16 +582,18 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         lastCommandBuffer = commandBuffer
         if wait {
             commandBuffer.waitUntilCompleted()
-            if let error = commandBuffer.error {
+            lastCommandBuffer = nil
+            if let error = commandBufferError(commandBuffer) {
                 throw RendererError.allocation("GPU execution: \(error.localizedDescription)")
             }
         }
     }
 
     private func synchronizeGPU(readback: Bool) throws {
-        guard let lastCommandBuffer else { return }
-        lastCommandBuffer.waitUntilCompleted()
-        if let error = lastCommandBuffer.error {
+        guard let commandBuffer = lastCommandBuffer else { return }
+        commandBuffer.waitUntilCompleted()
+        lastCommandBuffer = nil
+        if let error = commandBufferError(commandBuffer) {
             if readback {
                 throw RendererError.readback(error.localizedDescription)
             }

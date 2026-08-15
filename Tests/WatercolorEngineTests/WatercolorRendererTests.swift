@@ -145,24 +145,53 @@ import WatercolorCore
         }
     }
 
-    @Test func completedStrokeWaitsBeforeReturningACompletionFailure() throws {
+    @Test func failedCompletedStrokeDoesNotPoisonRecoveryOrTheNextStroke() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
-        let expected = RendererError.allocation("deterministic completed-stroke failure")
+        let injectedError = NSError(
+            domain: "WatercolorRendererTests",
+            code: 7,
+            userInfo: [NSLocalizedDescriptionKey: "deterministic GPU execution failure"]
+        )
+        var failedBuffer: MTLCommandBuffer?
         var observedStatus: MTLCommandBufferStatus?
         let renderer = try WatercolorRenderer(
             project: project,
             device: device,
-            completedStrokeCheck: { commandBuffer in
+            debugCommandBufferError: { commandBuffer in
+                if failedBuffer == nil, commandBuffer.label == "Watercolor stroke" {
+                    failedBuffer = commandBuffer
+                }
+                guard let failedBuffer, commandBuffer === failedBuffer else {
+                    return commandBuffer.error
+                }
                 observedStatus = commandBuffer.status
-                throw expected
+                return injectedError
             }
         )
+        let checksumBefore = try renderer.compositeChecksum()
 
-        #expect(throws: expected) {
-            try renderer.renderAndWait(stroke: .testDot(layerID: project.layers[0].id))
+        #expect(throws: RendererError.self) {
+            try renderer.renderAndWait(stroke: .testDot(
+                layerID: project.layers[0].id,
+                x: 20,
+                y: 32
+            ))
         }
         #expect(observedStatus == .completed)
+
+        try renderer.replay(project: project)
+        #expect(try renderer.compositeChecksum() == checksumBefore)
+
+        try renderer.renderAndWait(stroke: .testDot(
+            id: UUID(uuidString: "FECCAE3B-FB8B-43E4-A44D-695946AFDDC1")!,
+            layerID: project.layers[0].id,
+            color: PaintColor(red: 0, green: 0, blue: 1),
+            x: 44,
+            y: 32
+        ))
+        #expect(try renderer.debugPixel(x: 20, y: 32).alpha == 0)
+        #expect(try renderer.debugPixel(x: 44, y: 32).blue > 0.1)
     }
 
     @Test func everyToolHasItsOwnPigmentOrWetnessEffect() throws {

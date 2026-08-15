@@ -1,3 +1,4 @@
+import Foundation
 import Metal
 import MetalKit
 import Testing
@@ -92,27 +93,61 @@ import WatercolorCore
     @Test func completedStrokeFailureDoesNotPersistTheCommand() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
+        let injectedError = NSError(
+            domain: "StudioModelTests",
+            code: 7,
+            userInfo: [NSLocalizedDescriptionKey: "deterministic GPU execution failure"]
+        )
+        var failedBuffer: MTLCommandBuffer?
         let renderer = try WatercolorRenderer(
             project: project,
             device: device,
-            completedStrokeCheck: { _ in
-                throw RendererError.allocation("deterministic completed-stroke failure")
+            debugCommandBufferError: { commandBuffer in
+                if failedBuffer == nil, commandBuffer.label == "Watercolor stroke" {
+                    failedBuffer = commandBuffer
+                }
+                guard let failedBuffer, commandBuffer === failedBuffer else {
+                    return commandBuffer.error
+                }
+                return injectedError
             }
         )
-        var documentUpdateCount = 0
+        var documentUpdates: [PaintingProject] = []
         let model = StudioModel(
             project: project,
             renderer: renderer,
-            onDocumentUpdate: { _ in documentUpdateCount += 1 }
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+        let checksumBefore = try renderer.studioChecksum()
+        let failedStroke = StrokeCommand.studioTestStroke(
+            id: UUID(uuidString: "89204F9E-83C1-45F2-A9E7-4850732544AA")!,
+            layerID: project.layers[0].id,
+            x: 64,
+            y: 64
         )
 
-        model.completeStroke(.studioTestStroke(layerID: project.layers[0].id))
+        model.completeStroke(failedStroke)
 
         #expect(model.project == project)
-        #expect(documentUpdateCount == 0)
-        #expect(model.error?.message.contains("deterministic completed-stroke failure") == true)
+        #expect(documentUpdates.isEmpty)
+        #expect(model.error?.message.contains("deterministic GPU execution failure") == true)
         #expect(!model.capabilities.canUndo)
-        #expect(try renderer.debugPixel(x: 128, y: 128).alpha == 0)
+        #expect(try renderer.studioChecksum() == checksumBefore)
+        #expect(try renderer.debugPixel(x: 64, y: 64).alpha == 0)
+
+        let validStroke = StrokeCommand.studioTestStroke(
+            id: UUID(uuidString: "664296E0-1872-47D9-9A08-E2FCFCB5DC80")!,
+            layerID: project.layers[0].id,
+            x: 192,
+            y: 192
+        )
+        model.completeStroke(validStroke)
+
+        #expect(model.project.commands == [.stroke(validStroke)])
+        #expect(documentUpdates == [model.project])
+        #expect(model.error == nil)
+        #expect(try renderer.debugPixel(x: 64, y: 64).alpha == 0)
+        #expect(try renderer.debugPixel(x: 192, y: 192).alpha > 0.1)
     }
 
     @Test func configuringACanvasAttachesOnlyTheDisplayDelegate() throws {
@@ -169,13 +204,32 @@ private extension PaintingProject {
 }
 
 private extension StrokeCommand {
-    static func studioTestStroke(layerID: UUID) -> Self {
+    static func studioTestStroke(
+        id: UUID = UUID(uuidString: "364E8548-E972-4B33-AC9B-CB7977A89AF3")!,
+        layerID: UUID,
+        x: Double = 128,
+        y: Double = 128
+    ) -> Self {
         Self(
-            id: UUID(uuidString: "364E8548-E972-4B33-AC9B-CB7977A89AF3")!,
+            id: id,
             layerID: layerID,
             tool: .brush,
             brush: .default,
-            points: [StrokePoint(x: 128, y: 128, pressure: 1, tiltX: 0, tiltY: 0, time: 0)]
+            points: [StrokePoint(x: x, y: y, pressure: 1, tiltX: 0, tiltY: 0, time: 0)]
         )
+    }
+}
+
+private extension WatercolorRenderer {
+    func studioChecksum() throws -> UInt64 {
+        let image = try makeCGImage()
+        guard let data = image.dataProvider?.data,
+              let bytes = CFDataGetBytePtr(data)
+        else {
+            throw RendererError.readback("The test could not access image bytes")
+        }
+        return (0..<CFDataGetLength(data)).reduce(UInt64(0)) { checksum, index in
+            (checksum &* 16_777_619) ^ UInt64(bytes[index])
+        }
     }
 }
