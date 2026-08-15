@@ -8,6 +8,7 @@ public enum RendererError: Error, Equatable, Sendable {
     case metalUnavailable
     case shaderCompilation(String)
     case allocation(String)
+    case resourceBudgetExceeded(required: Int, available: Int)
     case invalidProject(ProjectValidationError)
     case unknownLayer(UUID)
     case invalidStrokePreview
@@ -24,6 +25,8 @@ extension RendererError: LocalizedError {
             "The watercolor shaders could not be compiled: \(message)"
         case let .allocation(resource):
             "The watercolor renderer could not allocate \(resource)."
+        case let .resourceBudgetExceeded(required, available):
+            "This canvas needs \(Self.requiredMiB(for: required)) MiB, but Watercolor Studio can safely use \(Self.availableMiB(for: available)) MiB. Reduce the canvas size or layer count."
         case let .invalidProject(error):
             "The watercolor project is unsafe to render: \(String(describing: error))."
         case let .unknownLayer(identifier):
@@ -35,6 +38,18 @@ extension RendererError: LocalizedError {
         case let .readback(message):
             "The rendered image could not be read back: \(message)"
         }
+    }
+
+    private static func requiredMiB(for bytes: Int) -> Int {
+        let bytesPerMiB = 1_048_576
+        let quotient = bytes / bytesPerMiB
+        guard bytes % bytesPerMiB != 0 else { return quotient }
+        let (roundedUp, didOverflow) = quotient.addingReportingOverflow(1)
+        return didOverflow ? .max : roundedUp
+    }
+
+    private static func availableMiB(for bytes: Int) -> Int {
+        bytes / 1_048_576
     }
 }
 
@@ -70,6 +85,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     }
 
     private let device: MTLDevice
+    private let resourcePolicy: RendererResourcePolicy
     private let commandQueue: MTLCommandQueue
     private let pipelineResources: RendererPipelineResources
     private var stampPipeline: MTLComputePipelineState { pipelineResources.stamp }
@@ -114,6 +130,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             project: project,
             device: requestedDevice,
             pipelineResources: nil,
+            resourcePolicy: nil,
+            performsResourceAdmission: true,
             commandBufferError: { $0.error }
         )
     }
@@ -128,7 +146,24 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             project: project,
             device: requestedDevice,
             pipelineResources: nil,
+            resourcePolicy: nil,
+            performsResourceAdmission: true,
             commandBufferError: debugCommandBufferError
+        )
+    }
+
+    convenience init(
+        project: PaintingProject,
+        device requestedDevice: MTLDevice?,
+        debugResourcePolicy: RendererResourcePolicy
+    ) throws {
+        try self.init(
+            project: project,
+            device: requestedDevice,
+            pipelineResources: nil,
+            resourcePolicy: debugResourcePolicy,
+            performsResourceAdmission: true,
+            commandBufferError: { $0.error }
         )
     }
     #endif
@@ -137,6 +172,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         project: PaintingProject,
         device requestedDevice: MTLDevice?,
         pipelineResources sharedPipelineResources: RendererPipelineResources?,
+        resourcePolicy requestedResourcePolicy: RendererResourcePolicy?,
+        performsResourceAdmission: Bool,
         commandBufferError: @escaping (MTLCommandBuffer) -> Error?
     ) throws {
         try Self.validateForRendering(project)
@@ -144,11 +181,21 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         guard let requestedDevice else {
             throw RendererError.metalUnavailable
         }
+        let resolvedResourcePolicy = requestedResourcePolicy ?? .live(device: requestedDevice)
+        if performsResourceAdmission {
+            try resolvedResourcePolicy.admit(
+                width: project.canvas.width,
+                height: project.canvas.height,
+                layerCapacity: initialReplayPlan.layerCapacity,
+                structuralCandidateCapacity: initialReplayPlan.layerCapacity
+            )
+        }
         guard let commandQueue = requestedDevice.makeCommandQueue() else {
             throw RendererError.allocation("a Metal command queue")
         }
 
         self.device = requestedDevice
+        resourcePolicy = resolvedResourcePolicy
         self.commandQueue = commandQueue
         let resolvedPipelineResources = try sharedPipelineResources
             ?? RendererPipelineResources(device: requestedDevice)
@@ -199,7 +246,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         canvasWetness = 0
 
         super.init()
-        try replay(project: project)
+        try replay(project: project, admittingResources: false)
     }
 
     public func resizeViewport(_ size: CGSize) {
@@ -212,10 +259,20 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     }
 
     public func makeCandidate(project: PaintingProject) throws -> WatercolorRenderer {
-        try WatercolorRenderer(
+        try Self.validateForRendering(project)
+        let candidateReplayPlan = try Self.makeReplayPlan(for: project)
+        try resourcePolicy.admit(
+            width: max(compositeTexture.width, project.canvas.width),
+            height: max(compositeTexture.height, project.canvas.height),
+            layerCapacity: layerCapacity,
+            structuralCandidateCapacity: candidateReplayPlan.layerCapacity
+        )
+        return try WatercolorRenderer(
             project: project,
             device: device,
             pipelineResources: pipelineResources,
+            resourcePolicy: resourcePolicy,
+            performsResourceAdmission: false,
             commandBufferError: commandBufferErrorProvider.operation
         )
     }
@@ -247,6 +304,12 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         guard project.layers.contains(where: { $0.id == stroke.layerID }) else {
             throw RendererError.unknownLayer(stroke.layerID)
         }
+        try resourcePolicy.admit(
+            width: compositeTexture.width,
+            height: compositeTexture.height,
+            layerCapacity: layerCapacity,
+            structuralCandidateCapacity: layerCapacity
+        )
         let snapshot = try Self.makeStrokePreviewSnapshot(
             device: device,
             width: compositeTexture.width,
@@ -486,11 +549,23 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     }
 
     public func replay(project newProject: PaintingProject) throws {
+        try replay(project: newProject, admittingResources: true)
+    }
+
+    private func replay(project newProject: PaintingProject, admittingResources: Bool) throws {
         try Self.validateForRendering(newProject)
         #if DEBUG
         replayCount += 1
         #endif
         let replayPlan = try Self.makeReplayPlan(for: newProject)
+        if admittingResources {
+            try resourcePolicy.admit(
+                width: max(compositeTexture.width, newProject.canvas.width),
+                height: max(compositeTexture.height, newProject.canvas.height),
+                layerCapacity: layerCapacity,
+                structuralCandidateCapacity: replayPlan.layerCapacity
+            )
+        }
         try synchronizeGPU(readback: false)
         let replacementTextures: (
             pigment: [MTLTexture],

@@ -1,3 +1,4 @@
+import CoreGraphics
 import Metal
 import SwiftUI
 import Testing
@@ -117,6 +118,56 @@ import WatercolorCore
         #expect(host.model?.project == project)
         #expect(host.failure?.message.contains("canvas texture allocation failed") == true)
     }
+
+    @Test func resourceRejectionKeepsTheExistingDocumentAndRendererUsable() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioHostTestProject(layerName: "Initial")
+        let document = StudioDocumentBox(PaintingDocument(project: project))
+        let binding = Binding(
+            get: { document.value },
+            set: { document.value = $0 }
+        )
+        let policy = RendererResourcePolicy(maximumWorkingSetBytes: 30_000_000)
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugResourcePolicy: policy
+        )
+        let host = StudioDocumentHost(
+            document: binding,
+            modelFactory: { project, update in
+                StudioModel(project: project, renderer: renderer, onDocumentUpdate: update)
+            }
+        )
+        let model = try #require(host.model)
+        let rendererIdentity = model.rendererIdentity
+        let checksumBefore = try renderer.hostChecksum()
+
+        let configured = host.configureNewDocument(
+            NewCanvasConfiguration(width: 1_024, height: 1_024, paper: .rough)
+        )
+
+        #expect(!configured)
+        #expect(document.value.project == project)
+        #expect(model.project == project)
+        #expect(model.rendererIdentity == rendererIdentity)
+        #expect(try renderer.hostChecksum() == checksumBefore)
+        #expect(
+            host.failure?.message.contains("Reduce the canvas size or layer count.") == true
+        )
+
+        let stroke = StrokeCommand(
+            layerID: project.layers[0].id,
+            tool: .brush,
+            brush: .default,
+            points: [StrokePoint(x: 32, y: 32, pressure: 1, tiltX: 0, tiltY: 0, time: 0)]
+        )
+        model.completeStroke(stroke)
+
+        #expect(model.project.commands == [.stroke(stroke)])
+        #expect(document.value.project == model.project)
+        #expect(model.rendererIdentity == rendererIdentity)
+    }
 }
 
 @MainActor
@@ -125,6 +176,20 @@ private final class StudioDocumentBox {
 
     init(_ value: PaintingDocument) {
         self.value = value
+    }
+}
+
+private extension WatercolorRenderer {
+    func hostChecksum() throws -> UInt64 {
+        let image = try makeCGImage()
+        guard let data = image.dataProvider?.data,
+              let bytes = CFDataGetBytePtr(data)
+        else {
+            throw RendererError.readback("The test could not access image bytes")
+        }
+        return (0..<CFDataGetLength(data)).reduce(UInt64(0)) { checksum, index in
+            (checksum &* 16_777_619) ^ UInt64(bytes[index])
+        }
     }
 }
 
