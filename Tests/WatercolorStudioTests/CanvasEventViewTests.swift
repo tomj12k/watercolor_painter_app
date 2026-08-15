@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Foundation
 import Metal
@@ -92,4 +93,77 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 128, y: 128, layerID: firstLayer.id).alpha > 0.05)
         #expect(try renderer.debugPixel(x: 128, y: 128, layerID: secondLayer.id).alpha == 0)
     }
+
+    @Test func replacingTheStudioModelReattachesOnceAndTransfersDisplayAndInputOwnership() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let oldLayer = PaintLayer(name: "Old")
+        let newLayer = PaintLayer(name: "New")
+        let oldProject = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [oldLayer]
+        )
+        let newProject = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .rough,
+            layers: [newLayer]
+        )
+        let oldRenderer = try WatercolorRenderer(project: oldProject, device: device)
+        let newRenderer = try WatercolorRenderer(project: newProject, device: device)
+        let oldModel = StudioModel(project: oldProject, renderer: oldRenderer)
+        let newModel = StudioModel(project: newProject, renderer: newRenderer)
+        let view = CanvasEventView(model: oldModel)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+
+        oldModel.configureCanvas(view)
+        let oldDelegate = try #require(view.delegate)
+        oldDelegate.mtkView(view, drawableSizeWillChange: CGSize(width: 100, height: 100))
+        view.synchronize(with: oldModel)
+        #expect(view.delegate === oldDelegate)
+        view.mouseDown(with: try #require(canvasMouseEvent(.leftMouseDown, timestamp: 0, eventNumber: 0)))
+
+        newModel.zoom = 2
+        newModel.pan = CGSize(width: 12, height: -8)
+        view.synchronize(with: newModel)
+        let newDelegate = try #require(view.delegate)
+        #expect(newDelegate !== oldDelegate)
+        newDelegate.mtkView(view, drawableSizeWillChange: CGSize(width: 200, height: 150))
+        #expect(oldRenderer.viewportSize == CGSize(width: 100, height: 100))
+        #expect(newRenderer.viewportSize == CGSize(width: 200, height: 150))
+        view.mouseUp(with: try #require(canvasMouseEvent(.leftMouseUp, timestamp: 0.5, eventNumber: 1)))
+        #expect(newModel.project.commands.isEmpty)
+        #expect(newModel.error == nil)
+
+        view.synchronize(with: newModel)
+        #expect(view.delegate === newDelegate)
+
+        let down = try #require(canvasMouseEvent(.leftMouseDown, timestamp: 1, eventNumber: 2))
+        let up = try #require(canvasMouseEvent(.leftMouseUp, timestamp: 2, eventNumber: 3))
+        view.mouseDown(with: down)
+        view.mouseUp(with: up)
+
+        #expect(oldModel.project.commands.isEmpty)
+        #expect(newModel.project.commands.count == 1)
+        #expect(try oldRenderer.debugPixel(x: 128, y: 128, layerID: oldLayer.id).alpha == 0)
+        #expect(try newRenderer.debugPixel(x: 128, y: 128, layerID: newLayer.id).alpha > 0.05)
+    }
+}
+
+@MainActor
+private func canvasMouseEvent(
+    _ type: NSEvent.EventType,
+    timestamp: TimeInterval,
+    eventNumber: Int
+) -> NSEvent? {
+    NSEvent.mouseEvent(
+        with: type,
+        location: CGPoint(x: 128, y: 128),
+        modifierFlags: [],
+        timestamp: timestamp,
+        windowNumber: 0,
+        context: nil,
+        eventNumber: eventNumber,
+        clickCount: 1,
+        pressure: 1
+    )
 }

@@ -84,8 +84,16 @@ public final class CanvasEventView: MTKView {
     public override var acceptsFirstResponder: Bool { true }
 
     func synchronize(with model: StudioModel) {
+        guard self.model !== model else {
+            requestCanvasDraw()
+            return
+        }
+
+        strokeBuilder = nil
+        panAnchor = nil
+        spaceKeyDown = false
         self.model = model
-        requestCanvasDraw()
+        model.configureCanvas(self)
     }
 
     public override func keyDown(with event: NSEvent) {
