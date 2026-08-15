@@ -874,7 +874,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             simulationStepCount += stepCount
             if let simulationRegion {
                 dispatchedRegion = dispatchedRegion?.union(simulationRegion) ?? simulationRegion
-                simulationThreadCount += simulationRegion.area * layerCapacity * stepCount
+                simulationThreadCount += simulationRegion.area * stepCount
             }
         }
 
@@ -882,7 +882,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         lastStrokeDispatch = RendererDebugStrokeDispatch(
             stampBatchCount: stampBatchCount,
             simulationStepCount: simulationStepCount,
-            activeSliceDepth: layerCapacity,
+            activeSliceDepth: 1,
             simulationRegion: dispatchedRegion?.cgRect ?? .zero,
             simulationThreadCount: simulationThreadCount
         )
@@ -1047,7 +1047,11 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             encoder.setTexture(pigmentTextures[destination], index: 2)
             encoder.setTexture(wetnessTextures[destination], index: 3)
             encoder.dispatchThreads(
-                MTLSize(width: region.width, height: region.height, depth: layerCapacity),
+                MTLSize(
+                    width: region.width,
+                    height: region.height,
+                    depth: targetSlice == Self.allLayers ? layerCapacity : 1
+                ),
                 threadsPerThreadgroup: threadgroupSize(for: simulationPipeline)
             )
             encoder.memoryBarrier(scope: .textures)
@@ -1079,7 +1083,11 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         encoder.setTexture(wetnessTextures[1 - frontTextureIndex], index: 3)
         encoder.setBytes(&parameters, length: MemoryLayout<SimulationParameters>.stride, index: 0)
         encoder.dispatchThreads(
-            MTLSize(width: region.width, height: region.height, depth: layerCapacity),
+            MTLSize(
+                width: region.width,
+                height: region.height,
+                depth: targetSlice == Self.allLayers ? layerCapacity : 1
+            ),
             threadsPerThreadgroup: threadgroupSize(for: synchronizeRegionPipeline)
         )
         encoder.memoryBarrier(scope: .textures)

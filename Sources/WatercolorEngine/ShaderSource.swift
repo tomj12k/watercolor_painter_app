@@ -225,24 +225,19 @@ enum ShaderSource {
         constant SimulationParameters& parameters [[buffer(0)]],
         uint3 localPosition [[thread_position_in_grid]]
     ) {
+        uint slice = parameters.selection.x == allLayers ? localPosition.z : parameters.selection.x;
         uint3 position = uint3(
             localPosition.x + parameters.selection.z,
             localPosition.y + parameters.selection.w,
-            localPosition.z
+            slice
         );
         if (position.x >= sourcePigment.get_width() || position.y >= sourcePigment.get_height() || position.z >= sourcePigment.get_array_size()) {
             return;
         }
 
         uint2 pixel = position.xy;
-        uint slice = position.z;
         half4 centerPigment = sourcePigment.read(pixel, slice);
         half centerWetness = sourceWetness.read(pixel, slice).r;
-        if (parameters.selection.x != allLayers && slice != parameters.selection.x) {
-            destinationPigment.write(centerPigment, pixel, slice);
-            destinationWetness.write(half4(centerWetness), pixel, slice);
-            return;
-        }
 
         uint2 left = uint2(pixel.x == 0u ? 0u : pixel.x - 1u, pixel.y);
         uint2 right = uint2(min(pixel.x + 1u, sourcePigment.get_width() - 1u), pixel.y);
@@ -283,14 +278,14 @@ enum ShaderSource {
         constant SimulationParameters& parameters [[buffer(0)]],
         uint3 localPosition [[thread_position_in_grid]]
     ) {
+        uint slice = parameters.selection.x == allLayers ? localPosition.z : parameters.selection.x;
         uint3 position = uint3(
             localPosition.x + parameters.selection.z,
             localPosition.y + parameters.selection.w,
-            localPosition.z
+            slice
         );
         if (position.x >= sourcePigment.get_width() || position.y >= sourcePigment.get_height()
             || position.z >= sourcePigment.get_array_size()) return;
-        if (parameters.selection.x != allLayers && position.z != parameters.selection.x) return;
         destinationPigment.write(sourcePigment.read(position.xy, position.z), position.xy, position.z);
         destinationWetness.write(sourceWetness.read(position.xy, position.z), position.xy, position.z);
     }

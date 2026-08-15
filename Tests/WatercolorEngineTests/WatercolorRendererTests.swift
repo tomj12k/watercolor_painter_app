@@ -96,9 +96,54 @@ import WatercolorCore
         #expect(twelve.debugResources.wetnessArrayLength == 12)
     }
 
+    @Test func benchmark1600By1200AtEightAndTwelveLayers() throws {
+        guard ProcessInfo.processInfo.environment["WATERCOLOR_RUN_BENCHMARK"] == "1",
+              let device = MTLCreateSystemDefaultDevice()
+        else { return }
+
+        for layerCount in [8, 12] {
+            let layers = (1...layerCount).map { PaintLayer(name: "Layer \($0)") }
+            let project = PaintingProject(
+                canvas: CanvasSize(width: 1600, height: 1200),
+                paper: .rough,
+                layers: layers
+            )
+            let allocationStart = ProcessInfo.processInfo.systemUptime
+            let renderer = try WatercolorRenderer(project: project, device: device)
+            let allocationDuration = ProcessInfo.processInfo.systemUptime - allocationStart
+            var stroke = StrokeCommand.testDot(layerID: layers[0].id)
+            stroke.points = (0...32).map { index in
+                let progress = Double(index) / 32
+                return StrokePoint(
+                    x: 200 + 1200 * progress,
+                    y: 600 + sin(progress * .pi * 2) * 100,
+                    pressure: 0.8,
+                    tiltX: 0,
+                    tiltY: 0,
+                    time: progress
+                )
+            }
+            let strokeStart = ProcessInfo.processInfo.systemUptime
+            try renderer.renderAndWait(stroke: stroke)
+            let strokeDuration = ProcessInfo.processInfo.systemUptime - strokeStart
+            let dispatch = renderer.debugLastStrokeDispatch
+
+            print(
+                "WATERCOLOR_BENCHMARK layers=\(layerCount) "
+                    + "allocation_replay_ms=\(Int((allocationDuration * 1000).rounded())) "
+                    + "stroke_ms=\(Int((strokeDuration * 1000).rounded())) "
+                    + "simulation_threads=\(dispatch.simulationThreadCount)"
+            )
+            #expect(renderer.debugResources.pigmentArrayLength == layerCount)
+            #expect(dispatch.activeSliceDepth == 1)
+            #expect(try renderer.compositeChecksum() != 0)
+        }
+    }
+
     @Test func strokeSimulationUsesBatchesPaddedDirtyRegionsAndActiveSlices() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let project = PaintingProject.testCanvas(256, paper: .rough)
+        var project = PaintingProject.testCanvas(256, paper: .rough)
+        project.layers.append(contentsOf: (2...12).map { PaintLayer(name: "Layer \($0)") })
         let renderer = try WatercolorRenderer(project: project, device: device)
         var stroke = StrokeCommand.testDot(layerID: project.layers[0].id, x: 128, y: 128)
         stroke.points = (0..<17).map { index in
