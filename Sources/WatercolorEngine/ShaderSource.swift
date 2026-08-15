@@ -155,7 +155,8 @@ enum ShaderSource {
             case 0: {
                 float granulation = mix(1.0f, mix(0.72f, 1.2f, grain), parameters.effects.x);
                 float deposited = amount * granulation;
-                float4 next = float4(existingPigment) + float4(parameters.color.rgb * deposited, deposited * parameters.color.a);
+                float alphaDeposit = deposited * clamp(parameters.color.a, 0.0f, 1.0f);
+                float4 next = float4(existingPigment) + float4(parameters.color.rgb * alphaDeposit, alphaDeposit);
                 pigment.write(half4(clamp(next, 0.0f, 8.0f)), position, slice);
                 wetness.write(half4(min(float(existingWetness) + waterAmount, 1.0f)), position, slice);
                 break;

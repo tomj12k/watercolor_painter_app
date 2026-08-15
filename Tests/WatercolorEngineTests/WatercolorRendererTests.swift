@@ -28,6 +28,26 @@ import WatercolorCore
         #expect(pixel.blue > 0.1)
     }
 
+    @Test func transparentPigmentDoesNotTintLaterMixing() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let layerID = project.layers[0].id
+
+        try renderer.render(stroke: .testDot(
+            layerID: layerID,
+            color: PaintColor(red: 1, green: 0, blue: 0, alpha: 0)
+        ))
+        try renderer.render(stroke: .testDot(
+            layerID: layerID,
+            color: PaintColor(red: 0, green: 0, blue: 1, alpha: 1)
+        ))
+
+        let mixed = try renderer.debugPixel(x: 32, y: 32)
+        #expect(mixed.red < 0.01)
+        #expect(mixed.blue > 0.1)
+    }
+
     @Test func eraserLowersConcentration() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
@@ -259,6 +279,79 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 32, y: 32, layerID: destination.id).alpha == 0)
     }
 
+    @Test func replayReusesSlicesForSequentialHistoricalLayers() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let base = PaintingProject.testCanvas(64)
+        let renderer = try WatercolorRenderer(project: base, device: device)
+        let destination = PaintLayer(name: "Surviving layer")
+        let historicalLayerIDs = (0..<13).map { _ in UUID() }
+        var project = PaintingProject(
+            canvas: CanvasSize(width: 64, height: 64),
+            paper: .coldPress,
+            layers: [destination]
+        )
+        project.commands = historicalLayerIDs.flatMap { sourceID in
+            [
+                .stroke(.testDot(
+                    layerID: sourceID,
+                    color: PaintColor(red: 1, green: 0, blue: 0)
+                )),
+                .mergeDown(MergeDownCommand(
+                    sourceLayerID: sourceID,
+                    destinationLayerID: destination.id
+                ))
+            ]
+        }
+
+        try renderer.replay(project: project)
+
+        let merged = try renderer.debugPixel(x: 32, y: 32, layerID: destination.id)
+        #expect(merged.red > 0.1)
+        #expect(merged.alpha > 0.1)
+        #expect(renderer.debugResources.pigmentArrayLength == 12)
+    }
+
+    @Test func rejectedReplayLeavesPreviousProjectAndImageUsable() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let original = PaintingProject.testCanvas(64)
+        let renderer = try WatercolorRenderer(project: original, device: device)
+        try renderer.render(stroke: .testDot(
+            layerID: original.layers[0].id,
+            color: PaintColor(red: 1, green: 0, blue: 0)
+        ))
+        let projectBefore = renderer.project
+        let checksumBefore = try renderer.compositeChecksum()
+        let pigmentBefore = try renderer.debugPixel(x: 32, y: 32, layerID: original.layers[0].id)
+        let destination = PaintLayer(name: "Destination")
+        let simultaneousSourceIDs = (0..<13).map { _ in UUID() }
+        var rejected = PaintingProject(
+            canvas: CanvasSize(width: 64, height: 64),
+            paper: .rough,
+            layers: [destination]
+        )
+        rejected.commands = simultaneousSourceIDs.map { sourceID in
+            .stroke(.testDot(layerID: sourceID))
+        } + simultaneousSourceIDs.map { sourceID in
+            .mergeDown(MergeDownCommand(
+                sourceLayerID: sourceID,
+                destinationLayerID: destination.id
+            ))
+        }
+
+        #expect(throws: RendererError.self) {
+            try renderer.replay(project: rejected)
+        }
+
+        #expect(renderer.project == projectBefore)
+        #expect(try renderer.compositeChecksum() == checksumBefore)
+        #expect(try renderer.debugPixel(x: 32, y: 32, layerID: original.layers[0].id) == pigmentBefore)
+        try renderer.render(stroke: .testDot(
+            layerID: original.layers[0].id,
+            color: PaintColor(red: 0, green: 0, blue: 1)
+        ))
+        #expect(try renderer.debugPixel(x: 32, y: 32, layerID: original.layers[0].id).blue > 0.1)
+    }
+
     @Test func pressureControlsDepositAndDryingEvaporatesWetness() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
@@ -374,6 +467,18 @@ private extension StrokeCommand {
 }
 
 private extension WatercolorRenderer {
+    func compositeChecksum() throws -> UInt64 {
+        let image = try makeCGImage()
+        guard let data = image.dataProvider?.data,
+              let bytes = CFDataGetBytePtr(data)
+        else {
+            throw RendererError.readback("The test could not access image bytes")
+        }
+        return (0..<CFDataGetLength(data)).reduce(UInt64(0)) { checksum, index in
+            (checksum &* 16_777_619) ^ UInt64(bytes[index])
+        }
+    }
+
     func compositePixel(x: Int, y: Int) throws -> PaintColor {
         let image = try makeCGImage()
         guard let data = image.dataProvider?.data,

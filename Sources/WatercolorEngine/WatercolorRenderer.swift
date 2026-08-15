@@ -132,58 +132,55 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     }
 
     public func replay(project newProject: PaintingProject) throws {
+        let replayPlan = try Self.makeReplayPlan(for: newProject)
         try synchronizeGPU(readback: false)
-        try ensureCanvas(width: newProject.canvas.width, height: newProject.canvas.height)
-
-        project = newProject
-        try rebuildLayerMapForReplay(newProject)
-        updateLayerMetadata()
-        frontTextureIndex = 0
+        let replacementTextures: (pigment: [MTLTexture], wetness: [MTLTexture], composite: MTLTexture)?
+        if newProject.canvas.width != compositeTexture.width || newProject.canvas.height != compositeTexture.height {
+            replacementTextures = try Self.makeTextures(
+                device: device,
+                width: newProject.canvas.width,
+                height: newProject.canvas.height
+            )
+        } else {
+            replacementTextures = nil
+        }
 
         let commandBuffer = try makeCommandBuffer(label: "Watercolor replay")
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw RendererError.allocation("a replay command encoder")
         }
         encoder.label = "Deterministic watercolor replay"
+
+        if let replacementTextures {
+            pigmentTextures = replacementTextures.pigment
+            wetnessTextures = replacementTextures.wetness
+            compositeTexture = replacementTextures.composite
+            viewportSize = CGSize(width: newProject.canvas.width, height: newProject.canvas.height)
+        }
+        project = newProject
+        layerSlices = replayPlan.finalLayerSlices
+        frontTextureIndex = 0
+        updateLayerMetadata()
+
         encodeClear(targetSlice: Self.allLayers, texturesAt: 0, with: encoder)
         encodeClear(targetSlice: Self.allLayers, texturesAt: 1, with: encoder)
 
-        do {
-            for command in newProject.commands {
-                switch command {
-                case let .stroke(stroke):
-                    guard let slice = layerSlices[stroke.layerID] else {
-                        throw RendererError.unknownLayer(stroke.layerID)
-                    }
-                    encode(stroke: stroke, slice: slice, with: encoder)
-                    encodeSimulation(
-                        steps: Self.simulationStepsPerStroke,
-                        targetSlice: Self.allLayers,
-                        with: encoder
-                    )
-                case let .clearLayer(clear):
-                    guard let slice = layerSlices[clear.layerID] else {
-                        throw RendererError.unknownLayer(clear.layerID)
-                    }
-                    encodeClear(targetSlice: UInt32(slice), texturesAt: frontTextureIndex, with: encoder)
-                case let .mergeDown(merge):
-                    guard let source = layerSlices[merge.sourceLayerID] else {
-                        throw RendererError.unknownLayer(merge.sourceLayerID)
-                    }
-                    guard let destination = layerSlices[merge.destinationLayerID] else {
-                        throw RendererError.unknownLayer(merge.destinationLayerID)
-                    }
-                    encodeMerge(source: source, destination: destination, with: encoder)
-                case let .dryLayer(dry):
-                    guard let slice = layerSlices[dry.layerID] else {
-                        throw RendererError.unknownLayer(dry.layerID)
-                    }
-                    encodeSimulation(steps: max(0, dry.steps), targetSlice: UInt32(slice), with: encoder)
-                }
+        for action in replayPlan.actions {
+            switch action {
+            case let .stroke(stroke, slice):
+                encode(stroke: stroke, slice: slice, with: encoder)
+                encodeSimulation(
+                    steps: Self.simulationStepsPerStroke,
+                    targetSlice: Self.allLayers,
+                    with: encoder
+                )
+            case let .clear(slice):
+                encodeClear(targetSlice: UInt32(slice), texturesAt: frontTextureIndex, with: encoder)
+            case let .merge(source, destination):
+                encodeMerge(source: source, destination: destination, with: encoder)
+            case let .dry(slice, steps):
+                encodeSimulation(steps: steps, targetSlice: UInt32(slice), with: encoder)
             }
-        } catch {
-            encoder.endEncoding()
-            throw error
         }
 
         encodeComposite(with: encoder)
@@ -273,38 +270,99 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         return image
     }
 
-    private func ensureCanvas(width: Int, height: Int) throws {
-        guard width != compositeTexture.width || height != compositeTexture.height else { return }
-        let textures = try Self.makeTextures(device: device, width: width, height: height)
-        pigmentTextures = textures.pigment
-        wetnessTextures = textures.wetness
-        compositeTexture = textures.composite
-        viewportSize = CGSize(width: width, height: height)
-    }
-
-    private func rebuildLayerMapForReplay(_ project: PaintingProject) throws {
+    private static func relevantLayerIDs(in project: PaintingProject) throws -> Set<UUID> {
         guard !project.layers.isEmpty, project.layers.count <= Self.layerCapacity else {
             throw RendererError.allocation("metadata for \(project.layers.count) layers")
         }
+        let currentIdentifiers = project.layers.map(\.id)
+        guard Set(currentIdentifiers).count == currentIdentifiers.count else {
+            throw RendererError.allocation("metadata for duplicate layer identifiers")
+        }
 
-        var identifiers = project.layers.map(\.id)
+        var relevant = Set(currentIdentifiers)
+        for command in project.commands.reversed() {
+            if case let .mergeDown(merge) = command,
+               relevant.contains(merge.destinationLayerID) {
+                relevant.insert(merge.sourceLayerID)
+            }
+        }
+        return relevant
+    }
+
+    private static func makeReplayPlan(for project: PaintingProject) throws -> ReplayPlan {
+        let relevantLayerIDs = try relevantLayerIDs(in: project)
+        var layerSlices: [UUID: Int] = [:]
+        var freeSlices = Array((0..<layerCapacity).reversed())
+        var actions: [ReplayAction] = []
+
         for command in project.commands {
-            let referenced: [UUID]
             switch command {
-            case let .stroke(stroke): referenced = [stroke.layerID]
-            case let .clearLayer(clear): referenced = [clear.layerID]
-            case let .mergeDown(merge): referenced = [merge.sourceLayerID, merge.destinationLayerID]
-            case let .dryLayer(dry): referenced = [dry.layerID]
-            }
-            for identifier in referenced where !identifiers.contains(identifier) {
-                identifiers.append(identifier)
+            case let .stroke(stroke):
+                guard relevantLayerIDs.contains(stroke.layerID) else { continue }
+                let slice = try acquireReplaySlice(
+                    for: stroke.layerID,
+                    layerSlices: &layerSlices,
+                    freeSlices: &freeSlices
+                )
+                actions.append(.stroke(stroke, slice))
+            case let .clearLayer(clear):
+                guard relevantLayerIDs.contains(clear.layerID) else { continue }
+                let slice = try acquireReplaySlice(
+                    for: clear.layerID,
+                    layerSlices: &layerSlices,
+                    freeSlices: &freeSlices
+                )
+                actions.append(.clear(slice))
+            case let .mergeDown(merge):
+                guard relevantLayerIDs.contains(merge.destinationLayerID) else { continue }
+                let source = try acquireReplaySlice(
+                    for: merge.sourceLayerID,
+                    layerSlices: &layerSlices,
+                    freeSlices: &freeSlices
+                )
+                let destination = try acquireReplaySlice(
+                    for: merge.destinationLayerID,
+                    layerSlices: &layerSlices,
+                    freeSlices: &freeSlices
+                )
+                actions.append(.merge(source, destination))
+                if source != destination {
+                    layerSlices.removeValue(forKey: merge.sourceLayerID)
+                    freeSlices.append(source)
+                }
+            case let .dryLayer(dry):
+                guard relevantLayerIDs.contains(dry.layerID) else { continue }
+                let slice = try acquireReplaySlice(
+                    for: dry.layerID,
+                    layerSlices: &layerSlices,
+                    freeSlices: &freeSlices
+                )
+                actions.append(.dry(slice, max(0, dry.steps)))
             }
         }
+        for layer in project.layers {
+            _ = try acquireReplaySlice(
+                for: layer.id,
+                layerSlices: &layerSlices,
+                freeSlices: &freeSlices
+            )
+        }
+        return ReplayPlan(actions: actions, finalLayerSlices: layerSlices)
+    }
 
-        guard identifiers.count <= Self.layerCapacity else {
-            throw RendererError.allocation("12 pigment slices for \(identifiers.count) referenced layers")
+    private static func acquireReplaySlice(
+        for layerID: UUID,
+        layerSlices: inout [UUID: Int],
+        freeSlices: inout [Int]
+    ) throws -> Int {
+        if let existing = layerSlices[layerID] {
+            return existing
         }
-        layerSlices = Dictionary(uniqueKeysWithValues: identifiers.enumerated().map { ($0.element, $0.offset) })
+        guard let slice = freeSlices.popLast() else {
+            throw RendererError.allocation("12 pigment slices for simultaneously active layers")
+        }
+        layerSlices[layerID] = slice
+        return slice
     }
 
     private func updateLayerMetadata() {
@@ -678,6 +736,18 @@ private struct SimulationParameters {
 
 private struct CompositeParameters {
     var dimensions: SIMD4<UInt32>
+}
+
+private struct ReplayPlan {
+    let actions: [ReplayAction]
+    let finalLayerSlices: [UUID: Int]
+}
+
+private enum ReplayAction {
+    case stroke(StrokeCommand, Int)
+    case clear(Int)
+    case merge(Int, Int)
+    case dry(Int, Int)
 }
 
 #if DEBUG
