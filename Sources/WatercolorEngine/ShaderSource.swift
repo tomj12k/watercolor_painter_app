@@ -340,10 +340,15 @@ enum ShaderSource {
 
     fragment float4 displayFragment(
         DisplayVertex input [[stage_in]],
-        texture2d<float, access::sample> image [[texture(0)]]
+        texture2d<float, access::sample> image [[texture(0)]],
+        constant float4& paperRect [[buffer(0)]]
     ) {
+        float2 paperCoordinate = (input.textureCoordinate - paperRect.xy) / paperRect.zw;
+        if (any(paperCoordinate < 0.0f) || any(paperCoordinate > 1.0f)) {
+            discard_fragment();
+        }
         constexpr sampler imageSampler(coord::normalized, address::clamp_to_edge, filter::linear);
-        return image.sample(imageSampler, input.textureCoordinate);
+        return image.sample(imageSampler, paperCoordinate);
     }
     """#
 }

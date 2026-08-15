@@ -58,6 +58,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private var layerSlices: [UUID: Int] = [:]
     private var lastCommandBuffer: MTLCommandBuffer?
     private let commandBufferError: (MTLCommandBuffer) -> Error?
+    private var displayZoom: CGFloat = 1
+    private var displayPan: CGSize = .zero
 
     public convenience init(
         project: PaintingProject,
@@ -138,6 +140,11 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
 
     public func resizeViewport(_ size: CGSize) {
         viewportSize = CGSize(width: max(size.width, 1), height: max(size.height, 1))
+    }
+
+    public func configureDisplay(zoom: CGFloat, pan: CGSize) {
+        displayZoom = zoom
+        displayPan = pan
     }
 
     public func render(stroke: StrokeCommand) throws {
@@ -261,6 +268,23 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         encoder.label = "Watercolor display pass"
         encoder.setRenderPipelineState(displayPipeline)
         encoder.setFragmentTexture(compositeTexture, index: 0)
+        let paperRect = CanvasTransform(
+            viewSize: view.bounds.size,
+            canvasSize: CGSize(width: compositeTexture.width, height: compositeTexture.height),
+            zoom: displayZoom,
+            pan: displayPan
+        ).normalizedPaperRect
+        var displayParameters = SIMD4<Float>(
+            Float(paperRect.minX),
+            Float(paperRect.minY),
+            Float(paperRect.width),
+            Float(paperRect.height)
+        )
+        encoder.setFragmentBytes(
+            &displayParameters,
+            length: MemoryLayout<SIMD4<Float>>.stride,
+            index: 0
+        )
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
         commandBuffer.present(drawable)

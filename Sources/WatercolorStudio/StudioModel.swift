@@ -107,6 +107,7 @@ public final class StudioModel: ObservableObject {
         view.device = renderer.renderedTexture.device
         view.colorPixelFormat = .bgra8Unorm
         view.delegate = canvasDelegate
+        renderer.configureDisplay(zoom: zoom, pan: pan)
     }
 
     private func publishEditorProject() {
