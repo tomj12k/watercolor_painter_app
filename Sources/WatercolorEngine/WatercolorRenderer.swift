@@ -222,7 +222,18 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         guard strokePreview == nil else {
             throw RendererError.invalidStrokePreview
         }
-        let transaction = StrokePreviewTransaction(stroke: stroke)
+        let snapshot = try Self.makeStrokePreviewSnapshot(
+            device: device,
+            width: compositeTexture.width,
+            height: compositeTexture.height,
+            layerCapacity: layerCapacity
+        )
+        let transaction = StrokePreviewTransaction(
+            stroke: stroke,
+            pigmentSnapshot: snapshot.pigment,
+            wetnessSnapshot: snapshot.wetness,
+            committedSimulationRegion: activeSimulationRegion
+        )
         strokePreview = transaction
         do {
             try updateStrokePreview(stroke)
@@ -246,19 +257,15 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.invalidProject(error)
         }
 
-        let pointOffset = transaction.renderedPointCount
-        let previousPoint = transaction.lastRenderedPoint
-        guard pointOffset < stroke.points.count else { return }
-        var segment = stroke
-        segment.points = Array(stroke.points[pointOffset...])
+        guard transaction.renderedPointCount < stroke.points.count else { return }
+        let capturesCommittedState = transaction.renderedPointCount == 0
+        activeSimulationRegion = transaction.committedSimulationRegion
         try renderPreview(
-            stroke: segment,
-            pointIndexOffset: pointOffset,
-            initialPreviousPoint: previousPoint,
+            stroke: stroke,
+            capturesCommittedState: capturesCommittedState,
             transaction: transaction
         )
         transaction.renderedPointCount = stroke.points.count
-        transaction.lastRenderedPoint = stroke.points.last
     }
 
     public func finishStrokePreview(_ stroke: StrokeCommand) async throws {
@@ -302,9 +309,17 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     }
 
     public func cancelStrokePreview() throws {
-        guard strokePreview != nil else { return }
+        guard let transaction = strokePreview else { return }
         strokePreview = nil
-        try replay(project: project)
+        activeSimulationRegion = transaction.committedSimulationRegion
+        let commandBuffer = try makeCommandBuffer(label: "Cancel watercolor stroke preview")
+        try encodeStrokePreviewSnapshotRestore(transaction, with: commandBuffer)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw RendererError.allocation("a stroke preview cancellation encoder")
+        }
+        encodeComposite(with: encoder)
+        encoder.endEncoding()
+        try submit(commandBuffer, wait: false)
     }
 
     private func render(stroke: StrokeCommand, waitUntilCompleted: Bool) throws {
@@ -339,8 +354,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
 
     private func renderPreview(
         stroke: StrokeCommand,
-        pointIndexOffset: Int,
-        initialPreviousPoint: StrokePoint?,
+        capturesCommittedState: Bool,
         transaction: StrokePreviewTransaction
     ) throws {
         guard project.layers.contains(where: { $0.id == stroke.layerID }),
@@ -350,6 +364,11 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         }
 
         let commandBuffer = try makeCommandBuffer(label: "Watercolor stroke preview")
+        if capturesCommittedState {
+            try encodeStrokePreviewSnapshotCapture(transaction, with: commandBuffer)
+        } else {
+            try encodeStrokePreviewSnapshotRestore(transaction, with: commandBuffer)
+        }
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw RendererError.allocation("a live stroke preview encoder")
         }
@@ -357,8 +376,6 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         encodeStrokeAndSimulation(
             stroke: stroke,
             slice: slice,
-            pointIndexOffset: pointIndexOffset,
-            initialPreviousPoint: initialPreviousPoint,
             with: encoder
         )
         encodeComposite(with: encoder)
@@ -368,6 +385,63 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             transaction.record(provider.error(for: completed))
         }
         try submit(commandBuffer, wait: false)
+    }
+
+    private func encodeStrokePreviewSnapshotCapture(
+        _ transaction: StrokePreviewTransaction,
+        with commandBuffer: MTLCommandBuffer
+    ) throws {
+        guard let encoder = commandBuffer.makeBlitCommandEncoder() else {
+            throw RendererError.allocation("a stroke preview snapshot encoder")
+        }
+        encodeTextureCopy(
+            from: pigmentTextures[frontTextureIndex],
+            to: transaction.pigmentSnapshot,
+            with: encoder
+        )
+        encodeTextureCopy(
+            from: wetnessTextures[frontTextureIndex],
+            to: transaction.wetnessSnapshot,
+            with: encoder
+        )
+        encoder.endEncoding()
+    }
+
+    private func encodeStrokePreviewSnapshotRestore(
+        _ transaction: StrokePreviewTransaction,
+        with commandBuffer: MTLCommandBuffer
+    ) throws {
+        guard let encoder = commandBuffer.makeBlitCommandEncoder() else {
+            throw RendererError.allocation("a stroke preview restore encoder")
+        }
+        for texture in pigmentTextures {
+            encodeTextureCopy(from: transaction.pigmentSnapshot, to: texture, with: encoder)
+        }
+        for texture in wetnessTextures {
+            encodeTextureCopy(from: transaction.wetnessSnapshot, to: texture, with: encoder)
+        }
+        encoder.endEncoding()
+    }
+
+    private func encodeTextureCopy(
+        from source: MTLTexture,
+        to destination: MTLTexture,
+        with encoder: MTLBlitCommandEncoder
+    ) {
+        let size = MTLSize(width: source.width, height: source.height, depth: 1)
+        for slice in 0..<min(source.arrayLength, destination.arrayLength) {
+            encoder.copy(
+                from: source,
+                sourceSlice: slice,
+                sourceLevel: 0,
+                sourceOrigin: .init(x: 0, y: 0, z: 0),
+                sourceSize: size,
+                to: destination,
+                destinationSlice: slice,
+                destinationLevel: 0,
+                destinationOrigin: .init(x: 0, y: 0, z: 0)
+            )
+        }
     }
 
     public func replay(project newProject: PaintingProject) throws {
@@ -1440,6 +1514,36 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         )
     }
 
+    private static func makeStrokePreviewSnapshot(
+        device: MTLDevice,
+        width: Int,
+        height: Int,
+        layerCapacity: Int
+    ) throws -> (pigment: MTLTexture, wetness: MTLTexture) {
+        func makeTexture(pixelFormat: MTLPixelFormat, label: String) throws -> MTLTexture {
+            let descriptor = MTLTextureDescriptor()
+            descriptor.textureType = .type2DArray
+            descriptor.pixelFormat = pixelFormat
+            descriptor.width = width
+            descriptor.height = height
+            descriptor.depth = 1
+            descriptor.mipmapLevelCount = 1
+            descriptor.arrayLength = layerCapacity
+            descriptor.sampleCount = 1
+            descriptor.storageMode = .private
+            descriptor.usage = [.shaderRead, .shaderWrite]
+            guard let texture = device.makeTexture(descriptor: descriptor) else {
+                throw RendererError.allocation(label)
+            }
+            texture.label = label
+            return texture
+        }
+        return (
+            try makeTexture(pixelFormat: .rgba16Float, label: "Committed stroke pigment snapshot"),
+            try makeTexture(pixelFormat: .r16Float, label: "Committed stroke wetness snapshot")
+        )
+    }
+
     private static func seed(for identifier: UUID) -> UInt32 {
         var uuid = identifier.uuid
         return withUnsafeBytes(of: &uuid) { bytes in
@@ -1655,15 +1759,25 @@ private final class CommandBufferErrorProvider: @unchecked Sendable {
 private final class StrokePreviewTransaction: @unchecked Sendable {
     let strokeID: UUID
     let layerID: UUID
+    let pigmentSnapshot: MTLTexture
+    let wetnessSnapshot: MTLTexture
+    let committedSimulationRegion: CanvasRegion?
     var renderedPointCount = 0
-    var lastRenderedPoint: StrokePoint?
 
     private let lock = NSLock()
     private var failure: String?
 
-    init(stroke: StrokeCommand) {
+    init(
+        stroke: StrokeCommand,
+        pigmentSnapshot: MTLTexture,
+        wetnessSnapshot: MTLTexture,
+        committedSimulationRegion: CanvasRegion?
+    ) {
         strokeID = stroke.id
         layerID = stroke.layerID
+        self.pigmentSnapshot = pigmentSnapshot
+        self.wetnessSnapshot = wetnessSnapshot
+        self.committedSimulationRegion = committedSimulationRegion
     }
 
     func record(_ error: Error?) {

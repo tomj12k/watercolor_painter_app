@@ -75,6 +75,39 @@ import WatercolorCore
         #expect(updates == [model.project])
     }
 
+    @Test func multiUpdatePreviewCommitExactlyMatchesFreshSemanticReplay() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        var completeStroke = StrokeCommand.studioTestStroke(
+            id: UUID(uuidString: "F7EDEAC6-20C3-45AA-8DC3-9796425789B4")!,
+            layerID: project.layers[0].id,
+            x: 48,
+            y: 96
+        )
+        completeStroke.points = (0..<17).map { index -> StrokePoint in
+            let x = Double(48 + index * 9)
+            let y = Double(96 + (index % 4) * 7)
+            let pressure = 0.45 + Double(index % 3) * 0.2
+            let time = Double(index) / 60.0
+            return StrokePoint(x: x, y: y, pressure: pressure, tiltX: 0, tiltY: 0, time: time)
+        }
+
+        var preview = completeStroke
+        preview.points = Array(completeStroke.points.prefix(1))
+        model.beginStrokePreview(preview)
+        for pointCount in [3, 9, 17] {
+            preview.points = Array(completeStroke.points.prefix(pointCount))
+            model.updateStrokePreview(preview)
+        }
+        await model.commitStrokePreview(preview)
+
+        let replayed = try WatercolorRenderer(project: model.project, device: device)
+        #expect(model.project.commands == [.stroke(completeStroke)])
+        #expect(try renderer.studioChecksum() == replayed.studioChecksum())
+    }
+
     @Test func cancellingLiveStrokePreviewRestoresTheCommittedRaster() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
