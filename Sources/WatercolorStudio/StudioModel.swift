@@ -58,6 +58,10 @@ public final class StudioModel: ObservableObject {
         renderer.project
     }
 
+    var rendererIdentity: ObjectIdentifier {
+        ObjectIdentifier(renderer)
+    }
+
     public var canAddLayer: Bool {
         project.layers.count < PaintingProject.maximumLayerCount
     }
@@ -180,7 +184,7 @@ public final class StudioModel: ObservableObject {
     public func moveSelectedLayerUp() {
         guard let selectedLayerIndex, canMoveSelectedLayerUp else { return }
         let layerID = selectedLayerID
-        performProjectEdit(
+        performMetadataEdit(
             { editor in try editor.moveLayer(id: layerID, to: selectedLayerIndex + 1) },
             selecting: { _ in layerID }
         )
@@ -189,7 +193,7 @@ public final class StudioModel: ObservableObject {
     public func moveSelectedLayerDown() {
         guard let selectedLayerIndex, canMoveSelectedLayerDown else { return }
         let layerID = selectedLayerID
-        performProjectEdit(
+        performMetadataEdit(
             { editor in try editor.moveLayer(id: layerID, to: selectedLayerIndex - 1) },
             selecting: { _ in layerID }
         )
@@ -199,7 +203,7 @@ public final class StudioModel: ObservableObject {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return }
         let selectedLayerID = selectedLayerID
-        performProjectEdit(
+        performMetadataEdit(
             { editor in try editor.renameLayer(id: id, to: trimmedName) },
             selecting: { project in
                 project.layers.first(where: { $0.id == selectedLayerID })?.id
@@ -209,7 +213,7 @@ public final class StudioModel: ObservableObject {
 
     public func setLayerVisibility(id: UUID, isVisible: Bool) {
         let selectedLayerID = selectedLayerID
-        performProjectEdit(
+        performMetadataEdit(
             { editor in try editor.setLayerVisibility(id: id, isVisible: isVisible) },
             selecting: { project in
                 project.layers.first(where: { $0.id == selectedLayerID })?.id
@@ -221,7 +225,7 @@ public final class StudioModel: ObservableObject {
         guard opacity.isFinite else { return }
         let clampedOpacity = min(max(opacity, 0), 1)
         let selectedLayerID = selectedLayerID
-        performProjectEdit(
+        performMetadataEdit(
             { editor in try editor.setLayerOpacity(id: id, opacity: clampedOpacity) },
             selecting: { project in
                 project.layers.first(where: { $0.id == selectedLayerID })?.id
@@ -252,7 +256,7 @@ public final class StudioModel: ObservableObject {
     public func commitLayerOpacity(id: UUID) {
         guard let opacity = layerOpacityPreviews[id] else { return }
         let selectedLayerID = selectedLayerID
-        let didCommit = performProjectEdit(
+        let didCommit = performMetadataEdit(
             { editor in try editor.setLayerOpacity(id: id, opacity: opacity) },
             selecting: { project in
                 project.layers.first(where: { $0.id == selectedLayerID })?.id
@@ -287,7 +291,7 @@ public final class StudioModel: ObservableObject {
 
     public func selectPaper(_ paper: PaperTexture) {
         let selectedLayerID = selectedLayerID
-        performProjectEdit(
+        performMetadataEdit(
             { editor in editor.setPaper(paper) },
             selecting: { project in
                 project.layers.first(where: { $0.id == selectedLayerID })?.id
@@ -410,18 +414,59 @@ public final class StudioModel: ObservableObject {
             guard updatedProject != previousProject else { return true }
             let candidateRenderer = try renderer.makeCandidate(project: updatedProject)
             replaceRenderer(with: candidateRenderer)
-            editor = updatedEditor
-            project = updatedProject
-            selectedLayerID = selection(updatedProject) ?? selectedLayerID
-            refreshCapabilities()
-            onDocumentUpdate?(project)
-            error = nil
+            publishSuccessfulEdit(
+                editor: updatedEditor,
+                project: updatedProject,
+                selectedLayerID: selection(updatedProject)
+            )
             return true
         } catch {
             let failure = StudioFailure(message: error.localizedDescription)
             self.error = failure
             return false
         }
+    }
+
+    @discardableResult
+    private func performMetadataEdit(
+        _ edit: (inout ProjectEditor) throws -> Void,
+        selecting selection: (PaintingProject) -> UUID?
+    ) -> Bool {
+        let previousProject = project
+        var updatedEditor = editor
+
+        do {
+            try edit(&updatedEditor)
+            let updatedProject = updatedEditor.project
+            guard updatedProject != previousProject else { return true }
+            try renderer.applyMetadata(project: updatedProject)
+            publishSuccessfulEdit(
+                editor: updatedEditor,
+                project: updatedProject,
+                selectedLayerID: selection(updatedProject)
+            )
+            if let attachedCanvas {
+                updateCanvasDisplay(attachedCanvas)
+            }
+            return true
+        } catch {
+            self.error = StudioFailure(message: error.localizedDescription)
+            return false
+        }
+    }
+
+    private func publishSuccessfulEdit(
+        editor: ProjectEditor,
+        project: PaintingProject,
+        selectedLayerID: UUID?
+    ) {
+        self.editor = editor
+        self.project = project
+        self.selectedLayerID = selectedLayerID ?? self.selectedLayerID
+        layerOpacityPreviews.removeAll()
+        refreshCapabilities()
+        onDocumentUpdate?(project)
+        error = nil
     }
 
     private func replaceRenderer(with renderer: WatercolorRenderer) {

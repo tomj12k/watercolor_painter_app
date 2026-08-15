@@ -379,6 +379,42 @@ import WatercolorCore
         #expect(documentUpdates == [model.project])
     }
 
+    @Test func metadataEditsReuseTheRendererAndCommitHistoryAndDocumentOnceEach() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.studioTestProject()
+        let top = PaintLayer(name: "Top")
+        project.layers.append(top)
+        project.commands = [
+            .stroke(.studioTestStroke(layerID: project.layers[0].id, x: 112, y: 128)),
+            .stroke(.studioTestStroke(layerID: top.id, x: 144, y: 128))
+        ]
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let resourcesBefore = renderer.debugResources
+        let replayCountBefore = renderer.debugReplayCount
+        let rendererIdentity = ObjectIdentifier(renderer)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+
+        model.renameLayer(id: project.layers[0].id, to: "Ground")
+        model.setLayerVisibility(id: project.layers[0].id, isVisible: false)
+        model.moveSelectedLayerUp()
+        model.selectPaper(.rough)
+        model.previewLayerOpacity(id: top.id, opacity: 0.35)
+        model.commitLayerOpacity(id: top.id)
+
+        #expect(model.rendererIdentity == rendererIdentity)
+        #expect(renderer.debugResources == resourcesBefore)
+        #expect(renderer.debugReplayCount == replayCountBefore)
+        #expect(model.rendererProject == model.project)
+        #expect(documentUpdates.count == 5)
+        #expect(model.capabilities.canUndo)
+        #expect(model.project.layers.first(where: { $0.id == top.id })?.opacity == 0.35)
+    }
+
     @Test func changingLayerOpacityClampsItToTheRenderersSupportedRange() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
@@ -437,13 +473,13 @@ import WatercolorCore
             userInfo: [NSLocalizedDescriptionKey: "persistent opacity commit failure"]
         )
         var shouldFail = false
-        var failedReplayCount = 0
+        var failedMetadataCount = 0
         let renderer = try WatercolorRenderer(
             project: project,
             device: device,
             debugCommandBufferError: { commandBuffer in
-                if shouldFail, commandBuffer.label == "Watercolor replay" {
-                    failedReplayCount += 1
+                if shouldFail, commandBuffer.label == "Apply layer metadata" {
+                    failedMetadataCount += 1
                     return injectedError
                 }
                 return commandBuffer.error
@@ -468,7 +504,7 @@ import WatercolorCore
         #expect(documentUpdates.isEmpty)
         #expect(!model.capabilities.canUndo)
         #expect(try renderer.studioChecksum() == committedChecksum)
-        #expect(failedReplayCount == 1)
+        #expect(failedMetadataCount == 1)
         #expect(model.error?.message.contains("persistent opacity commit failure") == true)
     }
 
@@ -681,6 +717,31 @@ import WatercolorCore
 
         model.selectedLayerID = UUID()
         #expect(!model.canDuplicateSelectedLayer)
+    }
+
+    @Test func duplicationRemainsAvailableAfterManyHistoricalDuplicateDeleteCycles() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let firstLayer = PaintLayer(name: "Generation 0")
+        var editor = ProjectEditor(project: PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [firstLayer],
+            commands: [.stroke(.studioTestStroke(layerID: firstLayer.id))]
+        ))
+        for generation in 1...16 {
+            let sourceID = try #require(editor.project.layers.first?.id)
+            try editor.duplicateLayer(id: sourceID, named: "Generation \(generation)")
+            try editor.removeLayer(id: sourceID)
+        }
+        let renderer = try WatercolorRenderer(project: editor.project, device: device)
+        let model = StudioModel(project: editor.project, renderer: renderer)
+
+        #expect(model.canDuplicateSelectedLayer)
+        model.duplicateSelectedLayer()
+
+        #expect(model.project.layers.count == 2)
+        #expect(model.selectedLayerID == model.project.layers[1].id)
+        #expect(model.error == nil)
     }
 
     @Test func dismissingTheAlertClearsTheIdentifiableFailure() throws {

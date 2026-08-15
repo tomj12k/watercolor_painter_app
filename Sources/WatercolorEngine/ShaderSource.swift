@@ -289,18 +289,63 @@ enum ShaderSource {
         wetness.write(wetness.read(position, slices.x), position, slices.y);
     }
 
-    kernel void wetnessMaximumKernel(
+    kernel void wetnessTileMaximumKernel(
         texture2d_array<half, access::read> wetness [[texture(0)]],
-        device atomic_uint* maximum [[buffer(0)]],
+        device uint* tileMaximums [[buffer(0)]],
         constant uint& activeSlices [[buffer(1)]],
-        uint3 position [[thread_position_in_grid]]
+        threadgroup uint* localMaximums [[threadgroup(0)]],
+        uint3 position [[thread_position_in_grid]],
+        uint localIndex [[thread_index_in_threadgroup]],
+        uint3 threadsInGroup [[threads_per_threadgroup]],
+        uint3 groupPosition [[threadgroup_position_in_grid]],
+        uint3 groupsPerGrid [[threadgroups_per_grid]]
     ) {
-        if (position.x >= wetness.get_width() || position.y >= wetness.get_height() || position.z >= wetness.get_array_size()) {
-            return;
+        uint value = 0u;
+        if (position.x < wetness.get_width() && position.y < wetness.get_height()
+            && position.z < wetness.get_array_size() && (activeSlices & (1u << position.z)) != 0u) {
+            value = uint(clamp(float(wetness.read(position.xy, position.z).r), 0.0f, 1.0f) * 1000000.0f);
         }
-        if ((activeSlices & (1u << position.z)) == 0u) return;
-        uint scaled = uint(clamp(float(wetness.read(position.xy, position.z).r), 0.0f, 1.0f) * 1000000.0f);
-        atomic_fetch_max_explicit(maximum, scaled, memory_order_relaxed);
+        localMaximums[localIndex] = value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint threadCount = threadsInGroup.x * threadsInGroup.y * threadsInGroup.z;
+        for (uint stride = threadCount / 2u; stride > 0u; stride /= 2u) {
+            if (localIndex < stride) {
+                localMaximums[localIndex] = max(localMaximums[localIndex], localMaximums[localIndex + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (localIndex == 0u) {
+            uint tileIndex = (groupPosition.z * groupsPerGrid.y + groupPosition.y) * groupsPerGrid.x + groupPosition.x;
+            tileMaximums[tileIndex] = localMaximums[0];
+        }
+    }
+
+    kernel void wetnessFinalMaximumKernel(
+        device const uint* tileMaximums [[buffer(0)]],
+        device uint* maximum [[buffer(1)]],
+        constant uint& tileCount [[buffer(2)]],
+        threadgroup uint* localMaximums [[threadgroup(0)]],
+        uint localIndex [[thread_index_in_threadgroup]],
+        uint3 threadsInGroup [[threads_per_threadgroup]]
+    ) {
+        uint threadCount = threadsInGroup.x * threadsInGroup.y * threadsInGroup.z;
+        uint value = 0u;
+        for (uint index = localIndex; index < tileCount; index += threadCount) {
+            value = max(value, tileMaximums[index]);
+        }
+        localMaximums[localIndex] = value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = threadCount / 2u; stride > 0u; stride /= 2u) {
+            if (localIndex < stride) {
+                localMaximums[localIndex] = max(localMaximums[localIndex], localMaximums[localIndex + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (localIndex == 0u) {
+            maximum[0] = localMaximums[0];
+        }
     }
 
     kernel void compositeKernel(

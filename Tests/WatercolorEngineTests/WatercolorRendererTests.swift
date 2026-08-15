@@ -77,6 +77,26 @@ import WatercolorCore
         #expect(before.compositePixelFormat == .bgra8Unorm)
     }
 
+    @Test func structuralCandidatesShareCompiledPipelinesButOwnTheirTextures() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var structuralProject = project
+        structuralProject.layers.append(PaintLayer(name: "Second"))
+
+        let candidate = try renderer.makeCandidate(project: structuralProject)
+
+        #expect(candidate.debugResources.pipelines == renderer.debugResources.pipelines)
+        #expect(
+            Set(candidate.debugResources.pigmentTextures)
+                .isDisjoint(with: Set(renderer.debugResources.pigmentTextures))
+        )
+        #expect(
+            candidate.debugResources.compositeTextures
+                .isDisjoint(with: renderer.debugResources.compositeTextures)
+        )
+    }
+
     @Test func replayIsDeterministic() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         var project = PaintingProject.testCanvas(64, paper: .rough)
@@ -327,6 +347,83 @@ import WatercolorCore
         #expect(renderer.project == project)
     }
 
+    @Test func metadataTransactionReusesResourcesWithoutReplayAndUpdatesTheComposite() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let bottom = PaintLayer(name: "Bottom")
+        let top = PaintLayer(name: "Top")
+        var project = PaintingProject(
+            canvas: CanvasSize(width: 64, height: 64),
+            paper: .coldPress,
+            layers: [bottom, top]
+        )
+        project.commands = [
+            .stroke(.testDot(layerID: bottom.id, color: PaintColor(red: 1, green: 0, blue: 0))),
+            .stroke(.testDot(layerID: top.id, color: PaintColor(red: 0, green: 0, blue: 1)))
+        ]
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let resourcesBefore = renderer.debugResources
+        let replayCountBefore = renderer.debugReplayCount
+        let checksumBefore = try renderer.compositeChecksum()
+        var updated = project
+        updated.layers.reverse()
+        updated.layers[0].opacity = 0.25
+        updated.paper = .rough
+
+        try renderer.applyMetadata(project: updated)
+
+        #expect(renderer.project == updated)
+        #expect(renderer.debugResources == resourcesBefore)
+        #expect(renderer.debugReplayCount == replayCountBefore)
+        #expect(try renderer.compositeChecksum() != checksumBefore)
+    }
+
+    @Test func failedOpacityPreviewLeavesCommittedMetadataAndAllowsTheNextPreview() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let bottom = PaintLayer(name: "Bottom")
+        let top = PaintLayer(name: "Top")
+        var project = PaintingProject(
+            canvas: CanvasSize(width: 64, height: 64),
+            paper: .hotPress,
+            layers: [bottom, top]
+        )
+        project.commands = [
+            .stroke(.testDot(layerID: bottom.id, color: PaintColor(red: 1, green: 0, blue: 0))),
+            .stroke(.testDot(layerID: top.id, color: PaintColor(red: 0, green: 0, blue: 1)))
+        ]
+        let injectedError = NSError(
+            domain: "WatercolorRendererTests",
+            code: 21,
+            userInfo: [NSLocalizedDescriptionKey: "preview recomposite failed"]
+        )
+        var shouldFailPreview = false
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugCommandBufferError: { commandBuffer in
+                if shouldFailPreview, commandBuffer.label == "Preview layer metadata" {
+                    return injectedError
+                }
+                return commandBuffer.error
+            }
+        )
+        let committedChecksum = try renderer.compositeChecksum()
+        shouldFailPreview = true
+
+        #expect(throws: RendererError.self) {
+            try renderer.previewLayerOpacity(id: top.id, opacity: 0.1)
+        }
+
+        #expect(try renderer.compositeChecksum() == committedChecksum)
+        shouldFailPreview = false
+        try renderer.clearLayerOpacityPreview(id: top.id)
+        #expect(try renderer.compositeChecksum() == committedChecksum)
+
+        try renderer.previewLayerOpacity(id: top.id, opacity: 0.2)
+        #expect(try renderer.compositeChecksum() != committedChecksum)
+        try renderer.clearLayerOpacityPreview(id: top.id)
+        #expect(try renderer.compositeChecksum() == committedChecksum)
+    }
+
     @Test func imageReadbackKeepsCanvasTopAtFirstRow() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         var project = PaintingProject.testCanvas(64, paper: .hotPress)
@@ -499,6 +596,82 @@ import WatercolorCore
         #expect(renderer.debugResources.pigmentArrayLength == 12)
     }
 
+    @Test func replayReleasesDuplicateSourcesAfterTheirLastRelevantUse() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let firstLayer = PaintLayer(name: "Generation 0")
+        let originalStroke = StrokeCommand.testDot(layerID: firstLayer.id, x: 32, y: 32)
+        let original = PaintingProject(
+            canvas: CanvasSize(width: 64, height: 64),
+            paper: .coldPress,
+            layers: [firstLayer],
+            commands: [.stroke(originalStroke)]
+        )
+        let expectedRenderer = try WatercolorRenderer(project: original, device: device)
+        let expectedPixel = try expectedRenderer.debugPixel(x: 32, y: 32)
+        let expectedWetness = try expectedRenderer.debugWetness(x: 32, y: 32)
+        var editor = ProjectEditor(project: original)
+
+        for generation in 1...16 {
+            let sourceID = try #require(editor.project.layers.first?.id)
+            try editor.duplicateLayer(id: sourceID, named: "Generation \(generation)")
+            try editor.removeLayer(id: sourceID)
+        }
+
+        let renderer = try WatercolorRenderer(project: editor.project, device: device)
+        let currentLayerID = try #require(editor.project.layers.first?.id)
+
+        #expect(editor.project.layers.count == 1)
+        #expect(try renderer.debugPixel(x: 32, y: 32, layerID: currentLayerID) == expectedPixel)
+        #expect(try renderer.debugWetness(x: 32, y: 32, layerID: currentLayerID) == expectedWetness)
+    }
+
+    @Test func aReusedHistoricalSliceStartsBlankAfterDuplicateSourceRelease() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let source = PaintLayer(name: "Source")
+        let destination = PaintLayer(name: "Destination")
+        let laterHistorical = PaintLayer(name: "Later historical")
+        let sourceStroke = StrokeCommand.testDot(
+            layerID: source.id,
+            color: PaintColor(red: 1, green: 0, blue: 0),
+            x: 20,
+            y: 32
+        )
+        let laterStroke = StrokeCommand.testDot(
+            layerID: laterHistorical.id,
+            color: PaintColor(red: 0, green: 0, blue: 1),
+            x: 44,
+            y: 32
+        )
+        let duplicate = PaintingCommand.duplicateLayer(DuplicateLayerCommand(
+            sourceLayerID: source.id,
+            destinationLayerID: destination.id
+        ))
+        let merge = PaintingCommand.mergeDown(MergeDownCommand(
+            sourceLayerID: laterHistorical.id,
+            destinationLayerID: destination.id
+        ))
+        let base = PaintingProject(
+            canvas: CanvasSize(width: 64, height: 64),
+            paper: .coldPress,
+            layers: [destination],
+            commands: [.stroke(sourceStroke), duplicate, .stroke(laterStroke), merge]
+        )
+        var explicitlyCleared = base
+        explicitlyCleared.commands.insert(
+            .clearLayer(LayerCommand(layerID: laterHistorical.id)),
+            at: 2
+        )
+
+        let renderer = try WatercolorRenderer(project: base, device: device)
+        let expectedRenderer = try WatercolorRenderer(project: explicitlyCleared, device: device)
+
+        #expect(try renderer.compositeChecksum() == expectedRenderer.compositeChecksum())
+        #expect(
+            try renderer.debugWetness(x: 20, y: 32, layerID: destination.id)
+                == expectedRenderer.debugWetness(x: 20, y: 32, layerID: destination.id)
+        )
+    }
+
     @Test func rejectedReplayLeavesPreviousProjectAndImageUsable() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let original = PaintingProject.testCanvas(64)
@@ -575,6 +748,47 @@ import WatercolorCore
 
         try renderer.replay(project: project)
         #expect(renderer.canvasWetness == 0)
+    }
+
+    @Test func stagedWetnessReductionIsAccurateBoundedAndReusesItsBuffers() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let bottom = PaintLayer(name: "Bottom")
+        let top = PaintLayer(name: "Top")
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 257, height: 259),
+            paper: .coldPress,
+            layers: [bottom, top]
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let resourcesBefore = renderer.debugWetnessReductionResources
+
+        try renderer.renderAndWait(stroke: .testDot(
+            id: UUID(uuidString: "00EB6EE7-13DD-4786-96AF-42796C94C70F")!,
+            layerID: bottom.id,
+            tool: .water,
+            x: 16,
+            y: 16
+        ))
+        try renderer.renderAndWait(stroke: .testDot(
+            id: UUID(uuidString: "DAB2E1AF-954F-4365-AC9C-8B52F0A48D3E")!,
+            layerID: top.id,
+            tool: .water,
+            x: 256,
+            y: 258
+        ))
+
+        let expectedMaximum = try renderer.debugMaximumWetness()
+        #expect(abs(renderer.canvasWetness - expectedMaximum) < 0.000_01)
+        #expect(renderer.debugWetnessReductionResources == resourcesBefore)
+        #expect(resourcesBefore.finalStageThreadgroupCount == 1)
+        #expect(
+            resourcesBefore.firstStageThreadgroupCount
+                < (project.canvas.width * project.canvas.height * PaintingProject.maximumLayerCount) / 32
+        )
+
+        try renderer.dry(layerID: bottom.id, steps: 8)
+        try renderer.dry(layerID: top.id, steps: 8)
+        #expect(renderer.debugWetnessReductionResources == resourcesBefore)
     }
 
     private func transformedSignature(
