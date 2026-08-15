@@ -30,7 +30,7 @@ import WatercolorCore
         ])
     }
 
-    @Test func consecutiveSamplesUseEighteenPercentOfPressureScaledDiameter() throws {
+    @Test func consecutiveSamplesUseEighteenPercentOfBrushDiameter() throws {
         var brush = BrushSettings.default
         brush.size = 100
         var builder = CanvasStrokeBuilder(canvasSize: .init(width: 1600, height: 1200))
@@ -42,12 +42,82 @@ import WatercolorCore
             brush: brush,
             point: .init(x: 0, y: 100, pressure: 0.5, tiltX: 0, tiltY: 0, time: 0)
         )
-        builder.append(.init(x: 18, y: 100, pressure: 0.5, tiltX: 0, tiltY: 0, time: 2))
+        _ = builder.append(.init(x: 18, y: 100, pressure: 0.5, tiltX: 0, tiltY: 0, time: 2))
 
         let completedStroke = builder.finish()
         let stroke = try #require(completedStroke)
-        #expect(stroke.points.map(\.x) == [0, 9, 18])
-        #expect(stroke.points.map(\.time) == [0, 1, 2])
+        #expect(stroke.points.map(\.x) == [0, 18])
+        #expect(stroke.points.map(\.time) == [0, 2])
+    }
+
+    @Test func equivalentCoarseAndFineEventsProduceTheSameGeometricStroke() throws {
+        var brush = BrushSettings.default
+        brush.size = 100
+        let start = StrokePoint(x: 0, y: 100, pressure: 0.5, tiltX: 0, tiltY: 0, time: 0)
+        let end = StrokePoint(x: 100, y: 100, pressure: 0.5, tiltX: 0, tiltY: 0, time: 10)
+
+        var coarse = CanvasStrokeBuilder(canvasSize: .init(width: 1600, height: 1200))
+        coarse.begin(layerID: UUID(), tool: .brush, brush: brush, point: start)
+        _ = coarse.append(end)
+
+        var fine = CanvasStrokeBuilder(canvasSize: .init(width: 1600, height: 1200))
+        fine.begin(layerID: UUID(), tool: .brush, brush: brush, point: start)
+        for x in 1...100 {
+            _ = fine.append(StrokePoint(
+                x: Double(x), y: 100, pressure: 0.5, tiltX: 0, tiltY: 0, time: Double(x) / 10
+            ))
+        }
+
+        let coarseResult = coarse.finish()
+        let fineResult = fine.finish()
+        let coarseStroke = try #require(coarseResult)
+        let fineStroke = try #require(fineResult)
+        #expect(coarseStroke.points.map(\.x) == fineStroke.points.map(\.x))
+    }
+
+    @Test func pressureDoesNotChangeSamplingCount() throws {
+        var brush = BrushSettings.default
+        brush.size = 100
+
+        var noPressure = CanvasStrokeBuilder(canvasSize: .init(width: 1600, height: 1200))
+        noPressure.begin(
+            layerID: UUID(), tool: .brush, brush: brush,
+            point: .init(x: 0, y: 100, pressure: 0, tiltX: 0, tiltY: 0, time: 0)
+        )
+        _ = noPressure.append(.init(x: 100, y: 100, pressure: 0, tiltX: 0, tiltY: 0, time: 1))
+
+        var fullPressure = CanvasStrokeBuilder(canvasSize: .init(width: 1600, height: 1200))
+        fullPressure.begin(
+            layerID: UUID(), tool: .brush, brush: brush,
+            point: .init(x: 0, y: 100, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
+        )
+        _ = fullPressure.append(.init(x: 100, y: 100, pressure: 1, tiltX: 0, tiltY: 0, time: 1))
+
+        let noPressureResult = noPressure.finish()
+        let fullPressureResult = fullPressure.finish()
+        let noPressureStroke = try #require(noPressureResult)
+        let fullPressureStroke = try #require(fullPressureResult)
+        #expect(noPressureStroke.points.count == fullPressureStroke.points.count)
+    }
+
+    @Test func sizeOneStrokeNeverStoresMoreThanTheDurablePointLimit() throws {
+        var brush = BrushSettings.default
+        brush.size = 1
+        var builder = CanvasStrokeBuilder(canvasSize: .init(width: 100_000, height: 100))
+        builder.begin(
+            layerID: UUID(), tool: .brush, brush: brush,
+            point: .init(x: 0, y: 50, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
+        )
+        let appendResult = builder.append(
+            .init(x: 50_000, y: 50, pressure: 1, tiltX: 0, tiltY: 0, time: 1)
+        )
+
+        let stroke = try #require(builder.currentStroke)
+        #expect(stroke.points.count == PaintingProject.maximumStrokePointCount)
+        #expect(appendResult.points.count == PaintingProject.maximumStrokePointCount - 1)
+        #expect(appendResult.isExhausted)
+        let completion = builder.finish(at: nil)
+        #expect(completion.isExhausted)
     }
 
     @Test func duplicateMouseAndTabletSamplesDoNotCreateExtraPointsOrCommands() throws {
@@ -55,12 +125,47 @@ import WatercolorCore
         let point = StrokePoint(x: 200, y: 300, pressure: 0.7, tiltX: 0.2, tiltY: -0.1, time: 4)
 
         builder.begin(layerID: UUID(), tool: .brush, brush: .default, point: point)
-        builder.append(point)
+        _ = builder.append(point)
 
         let completedStroke = builder.finish()
         let stroke = try #require(completedStroke)
         #expect(stroke.points == [point])
         #expect(builder.finish() == nil)
+    }
+
+    @Test func finishingAddsThePointerUpEndpointOnceAfterASubpixelPath() throws {
+        var brush = BrushSettings.default
+        brush.size = 1
+        var builder = CanvasStrokeBuilder(canvasSize: .init(width: 1600, height: 1200))
+        builder.begin(
+            layerID: UUID(), tool: .brush, brush: brush,
+            point: .init(x: 10, y: 10, pressure: 0, tiltX: 0, tiltY: 0, time: 0)
+        )
+
+        let completion = builder.finish(at: .init(
+            x: 10.25, y: 10, pressure: 1, tiltX: 0.5, tiltY: -0.5, time: 1
+        ))
+        let stroke = try #require(completion.stroke)
+
+        #expect(!completion.isExhausted)
+        #expect(stroke.points.map(\.x) == [10, 10.25])
+        #expect(stroke.points.allSatisfy {
+            $0.x.isFinite && $0.y.isFinite && $0.pressure.isFinite
+                && $0.tiltX.isFinite && $0.tiltY.isFinite && $0.time.isFinite
+        })
+    }
+
+    @Test func zeroContactUpdatesDoNotCreateSimulationPoints() throws {
+        var builder = CanvasStrokeBuilder(canvasSize: .init(width: 1600, height: 1200))
+        builder.begin(
+            layerID: UUID(), tool: .brush, brush: .default,
+            point: .init(x: 200, y: 300, pressure: 0.2, tiltX: 0, tiltY: 0, time: 0)
+        )
+        _ = builder.append(.init(x: 200, y: 300, pressure: 1, tiltX: 1, tiltY: -1, time: 1))
+
+        let completion = builder.finish(at: nil)
+        let stroke = try #require(completion.stroke)
+        #expect(stroke.points.count == 1)
     }
 }
 

@@ -3,12 +3,30 @@ import Foundation
 import MetalKit
 import WatercolorCore
 
+struct StrokeAppendResult: Equatable {
+    let points: [StrokePoint]
+    let isExhausted: Bool
+}
+
+struct StrokeFinishResult {
+    let stroke: StrokeCommand?
+    let isExhausted: Bool
+}
+
 struct CanvasStrokeBuilder {
     private let canvasSize: CGSize
+    private let maximumPointCount: Int
     private var stroke: StrokeCommand?
+    private var latestInputPoint: StrokePoint?
+    private var distanceToNextSample: Double?
+    private var isExhausted = false
 
-    init(canvasSize: CGSize) {
+    init(
+        canvasSize: CGSize,
+        maximumPointCount: Int = PaintingProject.maximumStrokePointCount
+    ) {
         self.canvasSize = canvasSize
+        self.maximumPointCount = max(maximumPointCount, 1)
     }
 
     var currentStroke: StrokeCommand? { stroke }
@@ -19,28 +37,85 @@ struct CanvasStrokeBuilder {
         brush: BrushSettings,
         point: StrokePoint
     ) {
+        let point = clamped(point)
         stroke = StrokeCommand(
             layerID: layerID,
             tool: tool,
             brush: brush,
-            points: [clamped(point)]
+            points: [point]
         )
+        latestInputPoint = point
+        distanceToNextSample = nil
+        isExhausted = false
     }
 
-    mutating func append(_ point: StrokePoint) {
-        guard var stroke, let previous = stroke.points.last else { return }
+    mutating func append(_ point: StrokePoint) -> StrokeAppendResult {
+        guard !isExhausted,
+              var stroke,
+              let previousInputPoint = latestInputPoint
+        else {
+            return StrokeAppendResult(points: [], isExhausted: isExhausted)
+        }
         let point = clamped(point)
-        guard point != previous else { return }
+        let spacing = samplingSpacing(for: stroke.brush)
+        let remainingCapacity = maximumPointCount - stroke.points.count
+        guard remainingCapacity > 0 else {
+            isExhausted = true
+            return StrokeAppendResult(points: [], isExhausted: true)
+        }
 
-        let pressureScale = max(point.pressure, 0.12)
-        let spacing = abs(stroke.brush.size) * pressureScale * 0.18
-        stroke.points.append(contentsOf: StrokeSampler.interpolate(from: previous, to: point, spacing: spacing))
+        let sampling = StrokeSampler.sample(
+            from: previousInputPoint,
+            to: point,
+            spacing: spacing,
+            distanceToNextSample: distanceToNextSample ?? spacing,
+            maximumPointCount: remainingCapacity
+        )
+        distanceToNextSample = sampling.distanceToNextSample
+        latestInputPoint = point
+        stroke.points.append(contentsOf: sampling.points)
         self.stroke = stroke
+        isExhausted = sampling.reachedPointLimit || stroke.points.count == maximumPointCount
+        return StrokeAppendResult(points: sampling.points, isExhausted: isExhausted)
     }
 
     mutating func finish() -> StrokeCommand? {
-        defer { stroke = nil }
-        return stroke
+        finish(at: nil).stroke
+    }
+
+    mutating func finish(at point: StrokePoint?) -> StrokeFinishResult {
+        defer {
+            stroke = nil
+            latestInputPoint = nil
+            distanceToNextSample = nil
+            isExhausted = false
+        }
+
+        if let point {
+            _ = append(point)
+        }
+        guard !isExhausted, var stroke, let endpoint = latestInputPoint else {
+            return StrokeFinishResult(stroke: nil, isExhausted: true)
+        }
+        guard let lastStoredPoint = stroke.points.last else {
+            return StrokeFinishResult(stroke: nil, isExhausted: false)
+        }
+        if !samePosition(lastStoredPoint, endpoint) {
+            guard stroke.points.count < maximumPointCount else {
+                return StrokeFinishResult(stroke: nil, isExhausted: true)
+            }
+            stroke.points.append(endpoint)
+        }
+        return StrokeFinishResult(stroke: stroke, isExhausted: false)
+    }
+
+    private func samplingSpacing(for brush: BrushSettings) -> Double {
+        let brushSpacing = abs(brush.size) * 0.18
+        return brushSpacing.isFinite ? max(brushSpacing, 0.75) : 0.75
+    }
+
+    private func samePosition(_ lhs: StrokePoint, _ rhs: StrokePoint) -> Bool {
+        lhs.x == rhs.x && lhs.y == rhs.y
     }
 
     private func clamped(_ point: StrokePoint) -> StrokePoint {
@@ -170,8 +245,7 @@ public final class CanvasEventView: MTKView {
         if panAnchor != nil {
             endPan()
         } else {
-            appendStrokePoint(from: event)
-            completeStroke()
+            completeStroke(with: event)
         }
     }
 
@@ -260,16 +334,30 @@ public final class CanvasEventView: MTKView {
     }
 
     private func appendStrokePoint(from event: NSEvent) {
-        strokeBuilder?.append(strokePoint(from: event))
-        if let stroke = strokeBuilder?.currentStroke {
+        guard var builder = strokeBuilder else { return }
+        let appendResult = builder.append(strokePoint(from: event))
+        strokeBuilder = builder
+        guard !appendResult.isExhausted else {
+            model.cancelStrokePreview()
+            strokeBuilder = nil
+            updateInputAvailability()
+            return
+        }
+        if let stroke = builder.currentStroke {
             model.updateStrokePreview(stroke)
         }
     }
 
-    private func completeStroke() {
+    private func completeStroke(with event: NSEvent) {
         guard var builder = strokeBuilder else { return }
         strokeBuilder = nil
-        guard let stroke = builder.finish() else { return }
+        let completion = builder.finish(at: strokePoint(from: event))
+        guard !completion.isExhausted else {
+            model.cancelStrokePreview()
+            updateInputAvailability()
+            return
+        }
+        guard let stroke = completion.stroke else { return }
         let model = model
         Task { @MainActor [weak self] in
             await model.commitStrokePreview(stroke)
