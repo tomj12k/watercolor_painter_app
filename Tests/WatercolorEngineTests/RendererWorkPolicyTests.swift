@@ -36,6 +36,20 @@ import Testing
         )
     }
 
+    @Test func finiteSliceDepthIsIncludedInRequiredWork() {
+        let policy = RendererWorkPolicy(
+            maximumCommandThreads: 59,
+            maximumProjectThreads: 1_000
+        )
+        var budget = policy.makeProjectBudget()
+
+        #expect(
+            throws: RendererError.workBudgetExceeded(required: 60, available: 59)
+        ) {
+            try budget.consume(regionArea: 5, steps: 2, sliceDepth: 3, passCount: 2)
+        }
+    }
+
     @Test func oneCommandAccumulatesItsActualDispatches() throws {
         let policy = RendererWorkPolicy(
             maximumCommandThreads: 100,

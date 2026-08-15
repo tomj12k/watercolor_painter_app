@@ -404,6 +404,23 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.invalidStrokePreview
         }
         do {
+            try await commitStrokePreview(stroke, transaction: transaction)
+        } catch {
+            let finishError = error
+            do {
+                try cancelStrokePreview()
+            } catch {
+                throw error
+            }
+            throw finishError
+        }
+    }
+
+    private func commitStrokePreview(
+        _ stroke: StrokeCommand,
+        transaction: StrokePreviewTransaction
+    ) async throws {
+        do {
             try project.validateForRendering(stroke)
         } catch let error as ProjectValidationError {
             throw RendererError.invalidProject(error)
@@ -448,17 +465,28 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         if lastCommandBuffer === commandBuffer {
             lastCommandBuffer = nil
         }
-        strokePreview = nil
         if let failure = transaction.failureDescription {
             throw RendererError.allocation("GPU execution: \(failure)")
         }
         readCanvasWetnessMeasurement()
+        strokePreview = nil
+        _ = transaction.resolveSnapshotCapture()
     }
 
     public func cancelStrokePreview() throws {
         guard let transaction = strokePreview else { return }
         strokePreview = nil
         activeSimulationRegions = transaction.committedSimulationRegions
+        guard let snapshotState = transaction.resolveSnapshotCapture() else { return }
+        switch snapshotState {
+        case .pending:
+            return
+        case .submitted:
+            try replay(project: project)
+            return
+        case .committed:
+            break
+        }
         let commandBuffer = try makeCommandBuffer(label: "Cancel watercolor stroke preview")
         try encodeStrokePreviewSnapshotRestore(transaction, with: commandBuffer)
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
@@ -556,8 +584,14 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         lastCommandBuffer = commandBuffer
         await withCheckedContinuation { continuation in
             commandBuffer.addCompletedHandler { completed in
+                if capturesCommittedState, completed.status == .completed {
+                    transaction.markSnapshotCaptureCompleted()
+                }
                 transaction.record(provider.error(for: completed))
                 continuation.resume()
+            }
+            if capturesCommittedState {
+                transaction.markSnapshotCaptureSubmitted()
             }
             commandBuffer.commit()
         }
@@ -2142,6 +2176,8 @@ private final class StrokePreviewTransaction: @unchecked Sendable {
 
     private let lock = NSLock()
     private var failure: String?
+    private var snapshotCaptureState = StrokePreviewSnapshotState.pending
+    private var isResolved = false
 
     init(
         stroke: StrokeCommand,
@@ -2165,11 +2201,39 @@ private final class StrokePreviewTransaction: @unchecked Sendable {
         }
     }
 
+    func markSnapshotCaptureSubmitted() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isResolved, snapshotCaptureState == .pending else { return }
+        snapshotCaptureState = .submitted
+    }
+
+    func markSnapshotCaptureCompleted() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isResolved, snapshotCaptureState == .submitted else { return }
+        snapshotCaptureState = .committed
+    }
+
+    func resolveSnapshotCapture() -> StrokePreviewSnapshotState? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isResolved else { return nil }
+        isResolved = true
+        return snapshotCaptureState
+    }
+
     var failureDescription: String? {
         lock.lock()
         defer { lock.unlock() }
         return failure
     }
+}
+
+private enum StrokePreviewSnapshotState: Equatable {
+    case pending
+    case submitted
+    case committed
 }
 
 private struct CompositeParameters {

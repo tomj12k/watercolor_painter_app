@@ -332,6 +332,62 @@ import WatercolorCore
         #expect(try renderer.studioChecksum() == before)
     }
 
+    @Test func firstPreviewWorkAdmissionFailurePreservesPaintThroughModelCancellation() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.studioTestProject()
+        let painted = StrokeCommand.studioTestStroke(
+            layerID: project.layers[0].id,
+            x: 128,
+            y: 128
+        )
+        project.commands = [.stroke(painted)]
+        let previewSubmissions = CommandBufferLabelCounter(label: "Watercolor stroke preview")
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugWorkPolicy: RendererWorkPolicy(
+                maximumCommandThreads: 9_000,
+                maximumProjectThreads: 1_000_000
+            ),
+            debugCommandBufferError: { commandBuffer in
+                previewSubmissions.record(commandBuffer.label)
+                return commandBuffer.error
+            }
+        )
+        let model = StudioModel(project: project, renderer: renderer)
+        let checksumBefore = try renderer.studioChecksum()
+        var hostile = StrokeCommand.studioTestStroke(
+            layerID: project.layers[0].id,
+            x: 24,
+            y: 128
+        )
+        hostile.points.append(StrokePoint(
+            x: 232,
+            y: 128,
+            pressure: 1,
+            tiltX: 0,
+            tiltY: 0,
+            time: 1
+        ))
+
+        model.beginStrokePreview(hostile)
+        await model.waitForStrokePreviewIdle()
+
+        #expect(!model.isStrokePreviewActive)
+        #expect(model.error?.message.contains("simulation threads") == true)
+        #expect(previewSubmissions.count == 0)
+        try renderer.cancelStrokePreview()
+        #expect(try renderer.studioChecksum() == checksumBefore)
+
+        model.completeStroke(.studioTestStroke(
+            layerID: project.layers[0].id,
+            x: 128,
+            y: 128
+        ))
+        #expect(model.project.commands.count == 2)
+        #expect(model.error == nil)
+    }
+
     @Test func canvasWetnessReflectsCompletedStrokesAndProjectReplay() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
