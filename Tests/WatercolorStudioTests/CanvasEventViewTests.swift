@@ -8,6 +8,50 @@ import WatercolorCore
 @testable import WatercolorStudio
 
 @Suite struct CanvasStrokeBuilderTests {
+    @Test func appendReturnsOnlyNewInterpolatedPoints() {
+        var brush = BrushSettings.default
+        brush.size = 100
+        var builder = CanvasStrokeBuilder(canvasSize: .init(width: 512, height: 512))
+        builder.begin(
+            layerID: UUID(uuidString: "3131E50F-DCB4-4AB2-8582-0103F650D030")!,
+            tool: .brush,
+            brush: brush,
+            point: StrokePoint(x: 20, y: 40, pressure: 0.25, tiltX: 0, tiltY: 0, time: 0)
+        )
+
+        let result = builder.append(
+            StrokePoint(x: 56, y: 40, pressure: 0.75, tiltX: 0.4, tiltY: -0.2, time: 2)
+        )
+
+        #expect(result.points == [
+            StrokePoint(x: 38, y: 40, pressure: 0.5, tiltX: 0.2, tiltY: -0.1, time: 1),
+            StrokePoint(x: 56, y: 40, pressure: 0.75, tiltX: 0.4, tiltY: -0.2, time: 2)
+        ])
+        #expect(builder.currentStroke?.points.count == 3)
+    }
+
+    @Test func finishReturnsOnlyPointsAddedByThePointerUpEvent() throws {
+        var brush = BrushSettings.default
+        brush.size = 100
+        var builder = CanvasStrokeBuilder(canvasSize: .init(width: 512, height: 512))
+        builder.begin(
+            layerID: UUID(),
+            tool: .brush,
+            brush: brush,
+            point: StrokePoint(x: 20, y: 40, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
+        )
+
+        let result = builder.finish(at: StrokePoint(
+            x: 47, y: 40, pressure: 1, tiltX: 0, tiltY: 0, time: 3
+        ))
+
+        #expect(result.points == [
+            StrokePoint(x: 38, y: 40, pressure: 1, tiltX: 0, tiltY: 0, time: 2),
+            StrokePoint(x: 47, y: 40, pressure: 1, tiltX: 0, tiltY: 0, time: 3)
+        ])
+        #expect(try #require(result.stroke).points.count == 3)
+    }
+
     @Test func completedStrokeSnapshotsSettingsAndClampsEveryInput() {
         let layerID = UUID(uuidString: "75C15CB5-C88E-4F83-B590-578F87DAD64A")!
         var brush = BrushSettings.default
@@ -266,6 +310,54 @@ import WatercolorCore
 }
 
 @Suite @MainActor struct CanvasEventViewTests {
+    @Test func dragSendsExactlyTheNewInterpolatedPoints() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [PaintLayer(name: "Layer")]
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var submittedBatches: [[StrokePoint]] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, id, points, token in
+                    submittedBatches.append(points)
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
+                },
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
+                }
+            )
+        )
+        model.brush.size = 100
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown,
+            timestamp: 0,
+            eventNumber: 0,
+            location: CGPoint(x: 64, y: 64)
+        )))
+        view.mouseDragged(with: try #require(canvasMouseEvent(
+            .leftMouseDragged,
+            timestamp: 2,
+            eventNumber: 1,
+            location: CGPoint(x: 100, y: 64)
+        )))
+        await model.waitForStrokePreviewIdle()
+
+        #expect(submittedBatches == [[
+            StrokePoint(x: 82, y: 192, pressure: 1, tiltX: 0, tiltY: 0, time: 1),
+            StrokePoint(x: 100, y: 192, pressure: 1, tiltX: 0, tiltY: 0, time: 2)
+        ]])
+        model.cancelStrokePreview()
+    }
+
     @Test func builderStrokeCompletesToItsSnapshottedLayerAfterSelectionChanges() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let firstLayer = PaintLayer(name: "First")
@@ -397,8 +489,8 @@ import WatercolorCore
             project: project,
             renderer: renderer,
             strokePreviewOperation: StrokePreviewRendererOperation(
-                update: { renderer, stroke, token in
-                    try await renderer.updateStrokePreview(stroke, token: token)
+                update: { renderer, id, points, token in
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
                 },
                 finish: { renderer, stroke, token in
                     try await renderer.finishStrokePreview(stroke, token: token)
@@ -450,9 +542,9 @@ import WatercolorCore
             project: project,
             renderer: renderer,
             strokePreviewOperation: StrokePreviewRendererOperation(
-                update: { renderer, stroke, token in
+                update: { renderer, id, points, token in
                     await updates.recordUpdate()
-                    try await renderer.updateStrokePreview(stroke, token: token)
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
                 },
                 finish: { renderer, stroke, token in
                     try await renderer.finishStrokePreview(stroke, token: token)
@@ -470,7 +562,7 @@ import WatercolorCore
         view.mouseDragged(with: duplicate)
         await model.waitForStrokePreviewIdle()
 
-        #expect(await updates.count == 1)
+        #expect(await updates.count == 0)
     }
 
     @Test func aggregatePointExhaustionCancelsThePreviewAndAllowsRecovery() async throws {

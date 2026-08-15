@@ -154,7 +154,10 @@ import WatercolorCore
             )
         }
 
-        model.beginStrokePreview(stroke)
+        var initial = stroke
+        initial.points = [stroke.points[0]]
+        model.beginStrokePreview(initial)
+        model.appendStrokePreview(id: stroke.id, points: Array(stroke.points[1...]))
         await model.waitForStrokePreviewIdle()
         #expect(model.isStrokePreviewActive)
         #expect(model.project.commands.isEmpty)
@@ -173,7 +176,7 @@ import WatercolorCore
             )
         }
         stroke.points.append(contentsOf: secondBatch)
-        model.updateStrokePreview(stroke)
+        model.appendStrokePreview(id: stroke.id, points: secondBatch)
         await model.waitForStrokePreviewIdle()
         #expect(model.project.commands.isEmpty)
         #expect(try renderer.debugPixel(x: 96, y: 64).alpha > 0.05)
@@ -205,14 +208,18 @@ import WatercolorCore
             return StrokePoint(x: x, y: y, pressure: pressure, tiltX: 0, tiltY: 0, time: time)
         }
 
-        var preview = completeStroke
-        preview.points = Array(completeStroke.points.prefix(1))
-        model.beginStrokePreview(preview)
+        var initial = completeStroke
+        initial.points = [completeStroke.points[0]]
+        model.beginStrokePreview(initial)
+        var submittedPointCount = 1
         for pointCount in [3, 9, 17] {
-            preview.points = Array(completeStroke.points.prefix(pointCount))
-            model.updateStrokePreview(preview)
+            model.appendStrokePreview(
+                id: completeStroke.id,
+                points: Array(completeStroke.points[submittedPointCount..<pointCount])
+            )
+            submittedPointCount = pointCount
         }
-        await model.commitStrokePreview(preview)
+        await model.commitStrokePreview(completeStroke)
 
         let replayed = try WatercolorRenderer(project: model.project, device: device)
         #expect(model.project.commands == [.stroke(completeStroke)])
@@ -271,7 +278,10 @@ import WatercolorCore
             )
         }
 
-        model.beginStrokePreview(preview)
+        var initial = preview
+        initial.points = [preview.points[0]]
+        model.beginStrokePreview(initial)
+        model.appendStrokePreview(id: preview.id, points: Array(preview.points[1...]))
         await model.waitForStrokePreviewIdle()
         let previewChecksum = try renderer.studioChecksum()
         let previewWetness = try renderer.debugWetness(x: 64, y: 64, layerID: wet.id)
@@ -308,21 +318,87 @@ import WatercolorCore
 
         model.beginStrokePreview(stroke)
         for index in 1..<24 {
-            stroke.points.append(StrokePoint(
+            let point = StrokePoint(
                 x: Double(24 + index * 6),
                 y: Double(72 + index % 3),
                 pressure: 1,
                 tiltX: 0,
                 tiltY: 0,
                 time: Double(index) / 120
-            ))
-            model.updateStrokePreview(stroke)
+            )
+            stroke.points.append(point)
+            model.appendStrokePreview(id: stroke.id, points: [point])
         }
         await model.commitStrokePreview(stroke)
 
         let replayed = try WatercolorRenderer(project: model.project, device: device)
         #expect(previewSubmissions.count <= 3)
         #expect(model.project.commands == [.stroke(stroke)])
+        #expect(try renderer.studioChecksum() == replayed.studioChecksum())
+    }
+
+    @Test func rapidUpdatesQueueOnlyUnsubmittedPointDeltas() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let suspension = ControlledPreviewSuspension()
+        var submittedBatches: [[StrokePoint]] = []
+        let operation = StrokePreviewRendererOperation(
+            update: { renderer, id, points, token in
+                submittedBatches.append(points)
+                _ = try await suspension.suspendOnce()
+                try await renderer.appendStrokePreview(id: id, points: points, token: token)
+            },
+            finish: { renderer, stroke, token in
+                try await renderer.finishStrokePreview(stroke, token: token)
+            }
+        )
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            strokePreviewOperation: operation
+        )
+        let initial = StrokeCommand.studioTestStroke(
+            id: UUID(uuidString: "92540642-34B4-463D-B103-9625A7F8FFB8")!,
+            layerID: project.layers[0].id,
+            x: 32,
+            y: 96
+        )
+        let firstBatch = (1...3).map { index in
+            StrokePoint(
+                x: Double(32 + index * 8), y: 96, pressure: 1,
+                tiltX: 0, tiltY: 0, time: Double(index)
+            )
+        }
+        let secondBatch = (4...6).map { index in
+            StrokePoint(
+                x: Double(32 + index * 8), y: 96, pressure: 1,
+                tiltX: 0, tiltY: 0, time: Double(index)
+            )
+        }
+        let thirdBatch = (7...10).map { index in
+            StrokePoint(
+                x: Double(32 + index * 8), y: 96, pressure: 1,
+                tiltX: 0, tiltY: 0, time: Double(index)
+            )
+        }
+        var complete = initial
+        complete.points.append(contentsOf: firstBatch + secondBatch + thirdBatch)
+
+        #expect(model.beginStrokePreview(initial) == .accepted)
+        model.appendStrokePreview(id: initial.id, points: firstBatch)
+        await suspension.waitUntilSuspended()
+        model.appendStrokePreview(id: initial.id, points: secondBatch)
+        model.appendStrokePreview(id: initial.id, points: thirdBatch)
+
+        #expect(model.pendingStrokePreviewPointCountForTesting == 7)
+
+        await suspension.resume()
+        await model.commitStrokePreview(complete)
+
+        #expect(submittedBatches == [firstBatch, secondBatch + thirdBatch])
+        #expect(model.pendingStrokePreviewPointCountForTesting == 0)
+        let replayed = try WatercolorRenderer(project: model.project, device: device)
         #expect(try renderer.studioChecksum() == replayed.studioChecksum())
     }
 
@@ -349,9 +425,12 @@ import WatercolorCore
             )
         }
 
-        model.beginStrokePreview(stroke)
+        var initial = stroke
+        initial.points = [stroke.points[0]]
+        model.beginStrokePreview(initial)
+        model.appendStrokePreview(id: stroke.id, points: Array(stroke.points[1...]))
         await model.waitForStrokePreviewIdle()
-        stroke.points.append(contentsOf: (32..<40).map { index in
+        let appendedPoints = (32..<40).map { index in
             StrokePoint(
                 x: Double(100 + index * 8),
                 y: 400,
@@ -360,8 +439,9 @@ import WatercolorCore
                 tiltY: 0,
                 time: Double(index) / 120
             )
-        })
-        model.updateStrokePreview(stroke)
+        }
+        stroke.points.append(contentsOf: appendedPoints)
+        model.appendStrokePreview(id: stroke.id, points: appendedPoints)
         await model.waitForStrokePreviewIdle()
 
         #expect(renderer.debugLastStrokeDispatch.stampBatchCount == 1)
@@ -387,7 +467,10 @@ import WatercolorCore
                 time: Double(index) / 60
             )
         }
-        model.beginStrokePreview(stroke)
+        var initial = stroke
+        initial.points = [stroke.points[0]]
+        model.beginStrokePreview(initial)
+        model.appendStrokePreview(id: stroke.id, points: Array(stroke.points[1...]))
         await model.waitForStrokePreviewIdle()
         #expect(try renderer.debugPixel(x: 64, y: 64).alpha > 0.05)
 
@@ -432,7 +515,10 @@ import WatercolorCore
             )
         }
 
-        model.beginStrokePreview(stroke)
+        var initial = stroke
+        initial.points = [stroke.points[0]]
+        model.beginStrokePreview(initial)
+        model.appendStrokePreview(id: stroke.id, points: Array(stroke.points[1...]))
         await model.commitStrokePreview(stroke)
 
         #expect(!model.isStrokePreviewActive)
@@ -454,8 +540,8 @@ import WatercolorCore
             renderer: renderer,
             onDocumentUpdate: { documentUpdates.append($0) },
             strokePreviewOperation: StrokePreviewRendererOperation(
-                update: { renderer, stroke, token in
-                    try await renderer.updateStrokePreview(stroke, token: token)
+                update: { renderer, id, points, token in
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
                 },
                 finish: { renderer, stroke, token in
                     try await renderer.finishStrokePreview(stroke, token: token)
@@ -498,8 +584,8 @@ import WatercolorCore
             renderer: renderer,
             onDocumentUpdate: { documentUpdates.append($0) },
             strokePreviewOperation: StrokePreviewRendererOperation(
-                update: { renderer, stroke, token in
-                    try await renderer.updateStrokePreview(stroke, token: token)
+                update: { renderer, id, points, token in
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
                 },
                 finish: { renderer, stroke, token in
                     try await renderer.finishStrokePreview(stroke, token: token)
@@ -554,9 +640,9 @@ import WatercolorCore
         let update = ControlledPreviewSuspension()
         let secondUpdateCompleted = ControlledPreviewSignal()
         let operation = StrokePreviewRendererOperation(
-            update: { renderer, stroke, token in
+            update: { renderer, id, points, token in
                 let wasSuspended = try await update.suspendOnce()
-                try await renderer.updateStrokePreview(stroke, token: token)
+                try await renderer.appendStrokePreview(id: id, points: points, token: token)
                 if !wasSuspended {
                     await secondUpdateCompleted.signal()
                 }
@@ -571,33 +657,49 @@ import WatercolorCore
             strokePreviewOperation: operation
         )
         let reusedID = UUID(uuidString: "13400374-15FD-45EE-958D-3B9BB767281A")!
-        let first = StrokeCommand.studioTestStroke(
+        var first = StrokeCommand.studioTestStroke(
             id: reusedID,
             layerID: project.layers[0].id,
             x: 64,
             y: 64
         )
-        let second = StrokeCommand.studioTestStroke(
+        var second = StrokeCommand.studioTestStroke(
             id: reusedID,
             layerID: project.layers[0].id,
             x: 192,
             y: 192
         )
 
-        #expect(model.beginStrokePreview(first) == .accepted)
+        let firstPoint = StrokePoint(
+            x: 72, y: 64, pressure: 1, tiltX: 0, tiltY: 0, time: 1
+        )
+        first.points.append(firstPoint)
+        var firstInitial = first
+        firstInitial.points = [first.points[0]]
+        #expect(model.beginStrokePreview(firstInitial) == .accepted)
+        model.appendStrokePreview(id: first.id, points: [firstPoint])
         let firstCommit = Task { @MainActor in
             await model.commitStrokePreview(first)
         }
         await update.waitUntilSuspended()
         model.cancelStrokePreview()
-        #expect(model.beginStrokePreview(second) == .accepted)
+        let secondPoint = StrokePoint(
+            x: 200, y: 192, pressure: 1, tiltX: 0, tiltY: 0, time: 1
+        )
+        second.points.append(secondPoint)
+        var secondInitial = second
+        secondInitial.points = [second.points[0]]
+        #expect(model.beginStrokePreview(secondInitial) == .accepted)
+        model.appendStrokePreview(id: second.id, points: [secondPoint])
         await secondUpdateCompleted.wait()
+        #expect(model.pendingStrokePreviewPointCountForTesting == 0)
 
         await update.resume()
         await firstCommit.value
 
         #expect(model.isStrokePreviewActive)
         #expect(model.error == nil)
+        #expect(model.pendingStrokePreviewPointCountForTesting == 0)
         model.cancelStrokePreview()
     }
 
@@ -627,8 +729,8 @@ import WatercolorCore
             renderer: renderer,
             onDocumentUpdate: { documentUpdates.append($0) },
             strokePreviewOperation: StrokePreviewRendererOperation(
-                update: { renderer, stroke, token in
-                    try await renderer.updateStrokePreview(stroke, token: token)
+                update: { renderer, id, points, token in
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
                 },
                 finish: { renderer, stroke, token in
                     try await renderer.finishStrokePreview(stroke, token: token)
@@ -699,7 +801,10 @@ import WatercolorCore
             )
         }
 
-        #expect(model.beginStrokePreview(stroke) == .accepted)
+        var initial = stroke
+        initial.points = [stroke.points[0]]
+        #expect(model.beginStrokePreview(initial) == .accepted)
+        model.appendStrokePreview(id: stroke.id, points: Array(stroke.points[1...]))
         await model.waitForStrokePreviewIdle()
         shouldFailCancellation = true
 
@@ -749,7 +854,10 @@ import WatercolorCore
             )
         }
 
-        #expect(model.beginStrokePreview(stroke) == .accepted)
+        var initial = stroke
+        initial.points = [stroke.points[0]]
+        #expect(model.beginStrokePreview(initial) == .accepted)
+        model.appendStrokePreview(id: stroke.id, points: Array(stroke.points[1...]))
         await model.waitForStrokePreviewIdle()
         shouldFailFinish = true
 
@@ -770,8 +878,8 @@ import WatercolorCore
             project: project,
             renderer: renderer,
             strokePreviewOperation: StrokePreviewRendererOperation(
-                update: { renderer, stroke, token in
-                    try await renderer.updateStrokePreview(stroke, token: token)
+                update: { renderer, id, points, token in
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
                 },
                 finish: { renderer, stroke, token in
                     try await renderer.finishStrokePreview(stroke, token: token)
@@ -839,7 +947,10 @@ import WatercolorCore
             )
         }
 
-        model.beginStrokePreview(hostile)
+        var initial = hostile
+        initial.points = [hostile.points[0]]
+        model.beginStrokePreview(initial)
+        model.appendStrokePreview(id: hostile.id, points: Array(hostile.points[1...]))
         await model.waitForStrokePreviewIdle()
 
         #expect(!model.isStrokePreviewActive)

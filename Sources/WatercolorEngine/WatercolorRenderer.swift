@@ -383,45 +383,94 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         return token
     }
 
-    public func updateStrokePreview(
-        _ stroke: StrokeCommand,
+    public func appendStrokePreview(
+        id: UUID,
+        points: [StrokePoint],
         token: RendererStrokePreviewToken
     ) async throws {
         guard let transaction = strokePreview,
               transaction.token == token,
-              transaction.strokeID == stroke.id,
-              transaction.layerID == stroke.layerID,
-              stroke.points.count >= transaction.latestPointCount
+              transaction.strokeID == id
         else {
             throw RendererError.invalidStrokePreview
         }
-        do {
-            try project.validateForRendering(stroke)
-        } catch let error as ProjectValidationError {
-            throw RendererError.invalidProject(error)
+        guard !points.isEmpty else { return }
+
+        let (pointCount, didOverflow) = transaction.absolutePointCount.addingReportingOverflow(
+            points.count
+        )
+        guard !didOverflow, pointCount <= PaintingProject.maximumStrokePointCount else {
+            throw RendererError.invalidProject(
+                .invalidStrokePointCount(id, didOverflow ? .max : pointCount)
+            )
+        }
+        if let validationError = strokePreviewAppendValidationError(
+            id: id,
+            points: points,
+            startingAt: transaction.absolutePointCount,
+            previousTime: transaction.completeStroke.points.last?.time
+        ) {
+            throw RendererError.invalidProject(validationError)
         }
 
-        let canonicalPointCount = stroke.points.count
-            - stroke.points.count % Self.stampBatchSize
-        guard transaction.renderedPointCount < canonicalPointCount else {
-            transaction.latestPointCount = stroke.points.count
-            return
-        }
+        transaction.completeStroke.points.append(contentsOf: points)
+        transaction.absolutePointCount = pointCount
+        transaction.remainder.append(contentsOf: points)
+        let canonicalPointCount = transaction.remainder.count
+            - transaction.remainder.count % Self.stampBatchSize
+        guard canonicalPointCount > 0 else { return }
+
+        let canonicalPoints = Array(transaction.remainder.prefix(canonicalPointCount))
+        transaction.remainder.removeFirst(canonicalPointCount)
         let capturesCommittedState = transaction.renderedPointCount == 0
         if capturesCommittedState {
             activeSimulationRegions = transaction.committedSimulationRegions
         }
+        var appendedStroke = transaction.strokeTemplate
+        appendedStroke.points = canonicalPoints
         try await renderPreview(
-            stroke: stroke,
-            canonicalPointCount: canonicalPointCount,
+            stroke: appendedStroke,
+            pointIndexOffset: transaction.renderedPointCount,
+            initialPreviousPoint: transaction.lastRenderedPoint,
             capturesCommittedState: capturesCommittedState,
             transaction: transaction
         )
         guard strokePreview === transaction else {
             throw RendererError.invalidStrokePreview
         }
-        transaction.renderedPointCount = canonicalPointCount
-        transaction.latestPointCount = stroke.points.count
+        transaction.renderedPointCount += canonicalPointCount
+        transaction.lastRenderedPoint = canonicalPoints.last
+    }
+
+    private func strokePreviewAppendValidationError(
+        id: UUID,
+        points: [StrokePoint],
+        startingAt pointIndexOffset: Int,
+        previousTime initialPreviousTime: Double?
+    ) -> ProjectValidationError? {
+        var previousTime = initialPreviousTime ?? -.infinity
+        for (index, point) in points.enumerated() {
+            let absoluteIndex = pointIndexOffset + index
+            guard point.x.isFinite,
+                  point.y.isFinite,
+                  point.pressure.isFinite,
+                  point.tiltX.isFinite,
+                  point.tiltY.isFinite,
+                  point.time.isFinite,
+                  (0...Double(project.canvas.width)).contains(point.x),
+                  (0...Double(project.canvas.height)).contains(point.y),
+                  (0...1).contains(point.pressure),
+                  (-1...1).contains(point.tiltX),
+                  (-1...1).contains(point.tiltY)
+            else {
+                return .invalidStrokePoint(id, absoluteIndex)
+            }
+            guard point.time >= previousTime else {
+                return .nonMonotonicStrokeTime(id, absoluteIndex)
+            }
+            previousTime = point.time
+        }
+        return nil
     }
 
     public func finishStrokePreview(
@@ -432,7 +481,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
               transaction.token == token,
               transaction.strokeID == stroke.id,
               transaction.layerID == stroke.layerID,
-              transaction.latestPointCount == stroke.points.count
+              transaction.matchesFinalStroke(stroke)
         else {
             throw RendererError.invalidStrokePreview
         }
@@ -493,15 +542,17 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                 activeSimulationRegions = transaction.committedSimulationRegions
             }
 
-            var remainder = stroke
-            remainder.points = Array(stroke.points.dropFirst(transaction.renderedPointCount))
+            var remainder = transaction.strokeTemplate
+            remainder.points = transaction.remainder
+            if !remainder.points.isEmpty,
+               remainder.points.last != stroke.points.last {
+                remainder.points[remainder.points.count - 1] = stroke.points[stroke.points.count - 1]
+            }
             try encodeStrokeAndSimulation(
                 stroke: remainder,
                 slice: slice,
                 pointIndexOffset: transaction.renderedPointCount,
-                initialPreviousPoint: transaction.renderedPointCount > 0
-                    ? stroke.points[transaction.renderedPointCount - 1]
-                    : nil,
+                initialPreviousPoint: transaction.lastRenderedPoint,
                 workBudget: &workBudget,
                 with: encoder
             )
@@ -627,7 +678,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
 
     private func renderPreview(
         stroke: StrokeCommand,
-        canonicalPointCount: Int,
+        pointIndexOffset: Int,
+        initialPreviousPoint: StrokePoint?,
         capturesCommittedState: Bool,
         transaction: StrokePreviewTransaction
     ) async throws {
@@ -647,20 +699,15 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.allocation("a live stroke preview encoder")
         }
         encoder.label = "Live watercolor stroke preview"
-        let pointIndexOffset = transaction.renderedPointCount
-        var appendedStroke = stroke
-        appendedStroke.points = Array(
-            stroke.points[pointIndexOffset..<canonicalPointCount]
-        )
         let previewsNonSelectedSlices = activeSimulationRegions.keys.contains {
             $0 != transaction.layerSlice
         }
         do {
             try encodeStrokeAndSimulation(
-                stroke: appendedStroke,
+                stroke: stroke,
                 slice: slice,
                 pointIndexOffset: pointIndexOffset,
-                initialPreviousPoint: pointIndexOffset > 0 ? stroke.points[pointIndexOffset - 1] : nil,
+                initialPreviousPoint: initialPreviousPoint,
                 workBudget: &workBudget,
                 with: encoder
             )
@@ -2280,8 +2327,12 @@ private final class StrokePreviewTransaction: @unchecked Sendable {
     let layerID: UUID
     let layerSlice: Int
     let committedSimulationRegions: [Int: [ActiveSimulationRegion]]
+    let strokeTemplate: StrokeCommand
+    var completeStroke: StrokeCommand
+    var remainder: [StrokePoint]
     var renderedPointCount = 0
-    var latestPointCount: Int
+    var absolutePointCount: Int
+    var lastRenderedPoint: StrokePoint?
 
     private let lock = NSLock()
     private var failure: String?
@@ -2300,7 +2351,35 @@ private final class StrokePreviewTransaction: @unchecked Sendable {
         layerID = stroke.layerID
         self.layerSlice = layerSlice
         self.committedSimulationRegions = committedSimulationRegions
-        latestPointCount = stroke.points.count
+        var strokeTemplate = stroke
+        strokeTemplate.points = []
+        self.strokeTemplate = strokeTemplate
+        completeStroke = stroke
+        remainder = stroke.points
+        absolutePointCount = stroke.points.count
+        lastRenderedPoint = nil
+    }
+
+    func matchesFinalStroke(_ stroke: StrokeCommand) -> Bool {
+        guard stroke.id == strokeID,
+              stroke.layerID == layerID,
+              stroke.tool == strokeTemplate.tool,
+              stroke.brush == strokeTemplate.brush,
+              stroke.points.count == absolutePointCount,
+              completeStroke.points.count == absolutePointCount
+        else { return false }
+
+        guard absolutePointCount > 0 else { return false }
+        if absolutePointCount > 1 {
+            for index in 0..<(absolutePointCount - 1)
+            where completeStroke.points[index] != stroke.points[index] {
+                return false
+            }
+        }
+        let storedLast = completeStroke.points[absolutePointCount - 1]
+        let finalLast = stroke.points[absolutePointCount - 1]
+        return storedLast == finalLast
+            || (storedLast.x == finalLast.x && storedLast.y == finalLast.y)
     }
 
     func record(_ error: Error?) {
