@@ -196,11 +196,11 @@ import WatercolorCore
             project: project,
             renderer: renderer,
             strokePreviewOperation: StrokePreviewRendererOperation(
-                update: { renderer, stroke, generation in
-                    try await renderer.updateStrokePreview(stroke, generation: generation)
+                update: { renderer, stroke, token in
+                    try await renderer.updateStrokePreview(stroke, token: token)
                 },
-                finish: { renderer, stroke, generation in
-                    try await renderer.finishStrokePreview(stroke, generation: generation)
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
                     await finish.suspend()
                 }
             )

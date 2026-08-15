@@ -59,6 +59,14 @@ extension RendererError: LocalizedError {
     }
 }
 
+public struct RendererStrokePreviewToken: Hashable, Sendable {
+    fileprivate let id: UUID
+
+    fileprivate init() {
+        id = UUID()
+    }
+}
+
 @MainActor
 public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private static let maximumLayerCapacity = PaintingProject.maximumLayerCount
@@ -123,7 +131,6 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private var lastCommandBuffer: MTLCommandBuffer?
     private let commandBufferErrorProvider: CommandBufferErrorProvider
     private var strokePreview: StrokePreviewTransaction?
-    private var strokePreviewGeneration: UInt64
     private let previewTextureAllocationCount: Int
     private var activeSimulationRegions: [Int: [ActiveSimulationRegion]]
     private var displayZoom: CGFloat = 1
@@ -277,7 +284,6 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         )
         commandBufferErrorProvider = CommandBufferErrorProvider(commandBufferError)
         strokePreview = nil
-        strokePreviewGeneration = 0
         activeSimulationRegions = [:]
 
         let textures = try Self.makeTextures(
@@ -351,15 +357,9 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         project.commands.append(.stroke(stroke))
     }
 
-    public func beginStrokePreview(_ stroke: StrokeCommand) throws {
-        strokePreviewGeneration += 1
-        try beginStrokePreview(stroke, generation: strokePreviewGeneration)
-    }
-
-    package func beginStrokePreview(
-        _ stroke: StrokeCommand,
-        generation: UInt64
-    ) throws {
+    public func beginStrokePreview(
+        _ stroke: StrokeCommand
+    ) throws -> RendererStrokePreviewToken {
         guard strokePreview == nil else {
             throw RendererError.invalidStrokePreview
         }
@@ -373,28 +373,22 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         else {
             throw RendererError.unknownLayer(stroke.layerID)
         }
-        let transaction = StrokePreviewTransaction(
+        let token = RendererStrokePreviewToken()
+        strokePreview = StrokePreviewTransaction(
             stroke: stroke,
-            generation: generation,
+            token: token,
             layerSlice: layerSlice,
             committedSimulationRegions: activeSimulationRegions
         )
-        strokePreview = transaction
+        return token
     }
 
-    public func updateStrokePreview(_ stroke: StrokeCommand) async throws {
-        guard let generation = strokePreview?.generation else {
-            throw RendererError.invalidStrokePreview
-        }
-        try await updateStrokePreview(stroke, generation: generation)
-    }
-
-    package func updateStrokePreview(
+    public func updateStrokePreview(
         _ stroke: StrokeCommand,
-        generation: UInt64
+        token: RendererStrokePreviewToken
     ) async throws {
         guard let transaction = strokePreview,
-              transaction.generation == generation,
+              transaction.token == token,
               transaction.strokeID == stroke.id,
               transaction.layerID == stroke.layerID,
               stroke.points.count >= transaction.latestPointCount
@@ -430,19 +424,12 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         transaction.latestPointCount = stroke.points.count
     }
 
-    public func finishStrokePreview(_ stroke: StrokeCommand) async throws {
-        guard let generation = strokePreview?.generation else {
-            throw RendererError.invalidStrokePreview
-        }
-        try await finishStrokePreview(stroke, generation: generation)
-    }
-
-    package func finishStrokePreview(
+    public func finishStrokePreview(
         _ stroke: StrokeCommand,
-        generation: UInt64
+        token: RendererStrokePreviewToken
     ) async throws {
         guard let transaction = strokePreview,
-              transaction.generation == generation,
+              transaction.token == token,
               transaction.strokeID == stroke.id,
               transaction.layerID == stroke.layerID,
               transaction.latestPointCount == stroke.points.count
@@ -454,7 +441,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         } catch {
             let finishError = error
             do {
-                try cancelStrokePreview(generation: generation)
+                try cancelStrokePreview(token)
             } catch {
                 throw RendererError.strokePreviewRestoration(error.localizedDescription)
             }
@@ -557,14 +544,9 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         _ = transaction.resolveSnapshotCapture()
     }
 
-    public func cancelStrokePreview() throws {
+    public func cancelStrokePreview(_ token: RendererStrokePreviewToken) throws {
         guard let transaction = strokePreview else { return }
-        try cancelStrokePreview(transaction)
-    }
-
-    package func cancelStrokePreview(generation: UInt64) throws {
-        guard let transaction = strokePreview else { return }
-        guard transaction.generation == generation else {
+        guard transaction.token == token else {
             throw RendererError.invalidStrokePreview
         }
         try cancelStrokePreview(transaction)
@@ -2294,7 +2276,7 @@ private final class CommandBufferErrorProvider: @unchecked Sendable {
 
 private final class StrokePreviewTransaction: @unchecked Sendable {
     let strokeID: UUID
-    let generation: UInt64
+    let token: RendererStrokePreviewToken
     let layerID: UUID
     let layerSlice: Int
     let committedSimulationRegions: [Int: [ActiveSimulationRegion]]
@@ -2309,12 +2291,12 @@ private final class StrokePreviewTransaction: @unchecked Sendable {
 
     init(
         stroke: StrokeCommand,
-        generation: UInt64,
+        token: RendererStrokePreviewToken,
         layerSlice: Int,
         committedSimulationRegions: [Int: [ActiveSimulationRegion]]
     ) {
         strokeID = stroke.id
-        self.generation = generation
+        self.token = token
         layerID = stroke.layerID
         self.layerSlice = layerSlice
         self.committedSimulationRegions = committedSimulationRegions

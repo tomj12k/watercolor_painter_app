@@ -14,6 +14,7 @@ struct LayersInspector: View {
                 LazyVStack(spacing: 6) {
                     ForEach(Array(model.project.layers.reversed())) { layer in
                         LayerRow(model: model, layerID: layer.id)
+                            .disabled(!model.canModifyProject)
                             .draggable(layer.id.uuidString)
                             .dropDestination(for: String.self) { identifiers, _ in
                                 guard let identifier = identifiers.first,
@@ -59,7 +60,7 @@ struct LayersInspector: View {
                 .disabled(!model.canMergeSelectedLayerDown)
 
             layerAction("Clear layer", systemImage: "xmark.rectangle", action: model.clearSelectedLayer)
-                .disabled(!model.capabilities.canPaint)
+                .disabled(!model.canModifyProject || !model.capabilities.canPaint)
         }
         .frame(maxWidth: .infinity)
     }

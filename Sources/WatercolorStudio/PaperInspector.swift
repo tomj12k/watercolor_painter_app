@@ -14,6 +14,7 @@ struct PaperInspector: View {
                 }
             }
             .pickerStyle(.radioGroup)
+            .disabled(!model.canModifyProject)
             .help("Choose the paper fiber used by the watercolor simulation")
         }
         .font(.system(size: 12))

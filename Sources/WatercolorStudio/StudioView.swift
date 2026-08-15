@@ -185,7 +185,7 @@ public struct StudioView: View {
             Button(action: model.drySelectedLayer) {
                 Label("Dry layer", systemImage: "wind")
             }
-            .disabled(!model.capabilities.canPaint)
+            .disabled(!model.canModifyProject || !model.capabilities.canPaint)
             .help("Dry selected layer")
 
             Button {

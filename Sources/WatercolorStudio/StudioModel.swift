@@ -50,18 +50,26 @@ extension StudioRendererRecoveryError: LocalizedError {
 
 @MainActor
 struct StrokePreviewRendererOperation {
-    typealias Update = @MainActor (WatercolorRenderer, StrokeCommand, UInt64) async throws -> Void
-    typealias Finish = @MainActor (WatercolorRenderer, StrokeCommand, UInt64) async throws -> Void
+    typealias Update = @MainActor (
+        WatercolorRenderer,
+        StrokeCommand,
+        RendererStrokePreviewToken
+    ) async throws -> Void
+    typealias Finish = @MainActor (
+        WatercolorRenderer,
+        StrokeCommand,
+        RendererStrokePreviewToken
+    ) async throws -> Void
 
     let update: Update
     let finish: Finish
 
     static let live = Self(
-        update: { renderer, stroke, generation in
-            try await renderer.updateStrokePreview(stroke, generation: generation)
+        update: { renderer, stroke, token in
+            try await renderer.updateStrokePreview(stroke, token: token)
         },
-        finish: { renderer, stroke, generation in
-            try await renderer.finishStrokePreview(stroke, generation: generation)
+        finish: { renderer, stroke, token in
+            try await renderer.finishStrokePreview(stroke, token: token)
         }
     )
 }
@@ -149,7 +157,7 @@ public final class StudioModel: ObservableObject {
     #endif
 
     public var canAddLayer: Bool {
-        project.layers.count < PaintingProject.maximumLayerCount
+        canModifyProject && project.layers.count < PaintingProject.maximumLayerCount
     }
 
     public var canDuplicateSelectedLayer: Bool {
@@ -157,15 +165,17 @@ public final class StudioModel: ObservableObject {
     }
 
     public var canDeleteSelectedLayer: Bool {
-        project.layers.count > 1 && selectedLayerIndex != nil
+        canModifyProject && project.layers.count > 1 && selectedLayerIndex != nil
     }
 
     public var canMoveSelectedLayerUp: Bool {
+        guard canModifyProject else { return false }
         guard let selectedLayerIndex else { return false }
         return selectedLayerIndex < project.layers.count - 1
     }
 
     public var canMoveSelectedLayerDown: Bool {
+        guard canModifyProject else { return false }
         guard let selectedLayerIndex else { return false }
         return selectedLayerIndex > 0
     }
@@ -183,7 +193,6 @@ public final class StudioModel: ObservableObject {
     private var currentPNGExportFailureID: UUID?
     private weak var attachedCanvas: MTKView?
     private var strokePreviewState: StudioStrokePreviewState
-    private var strokePreviewGeneration: UInt64
     private var pendingStrokePreview: StrokeCommand?
     private var strokePreviewDrainTask: Task<Void, Never>?
     private var strokePreviewDrainToken: StudioStrokePreviewToken?
@@ -192,6 +201,10 @@ public final class StudioModel: ObservableObject {
 
     public var isStrokePreviewActive: Bool {
         strokePreviewState.token != nil
+    }
+
+    public var canModifyProject: Bool {
+        strokePreviewState.token == nil
     }
 
     var isStrokePreviewFinalizing: Bool {
@@ -238,7 +251,6 @@ public final class StudioModel: ObservableObject {
         latestPNGExportID = nil
         currentPNGExportFailureID = nil
         strokePreviewState = .idle
-        strokePreviewGeneration = 0
         pendingStrokePreview = nil
         strokePreviewDrainTask = nil
         strokePreviewDrainToken = nil
@@ -256,12 +268,18 @@ public final class StudioModel: ObservableObject {
               canAppendStroke(stroke),
               project.layers.contains(where: { $0.id == stroke.layerID })
         else { return .unavailable }
-        let token = nextStrokePreviewToken(for: stroke.id)
+        let previewRenderer = renderer
         do {
-            try renderer.beginStrokePreview(stroke, generation: token.generation)
+            let rendererToken = try previewRenderer.beginStrokePreview(stroke)
+            let token = nextStrokePreviewToken(
+                for: stroke.id,
+                renderer: previewRenderer,
+                rendererToken: rendererToken
+            )
             strokePreviewState = .active(token)
             pendingStrokePreview = stroke
             startStrokePreviewDrainIfNeeded()
+            refreshCapabilities()
             error = nil
             return .accepted
         } catch {
@@ -272,7 +290,8 @@ public final class StudioModel: ObservableObject {
 
     func updateStrokePreview(_ stroke: StrokeCommand) {
         guard case let .active(token) = strokePreviewState,
-              token.strokeID == stroke.id
+              token.strokeID == stroke.id,
+              renderer === token.renderer
         else { return }
         pendingStrokePreview = stroke
         startStrokePreviewDrainIfNeeded()
@@ -280,38 +299,39 @@ public final class StudioModel: ObservableObject {
 
     func commitStrokePreview(_ stroke: StrokeCommand) async {
         guard case let .active(token) = strokePreviewState,
-              token.strokeID == stroke.id
+              token.strokeID == stroke.id,
+              renderer === token.renderer
         else { return }
         strokePreviewState = .finalizing(token)
         refreshCapabilities()
         pendingStrokePreview = stroke
         startStrokePreviewDrainIfNeeded()
         await waitForStrokePreviewIdle(token: token)
-        guard isFinalizingStrokePreview(token) else { return }
+        guard isFinalizingStrokePreview(token), renderer === token.renderer else { return }
         guard canAppendStroke(stroke) else {
             cancelStrokePreviewAfterAdmissionFailure(token: token)
             if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
             return
         }
         do {
-            try await strokePreviewOperation.finish(renderer, stroke, token.generation)
-            guard isFinalizingStrokePreview(token) else { return }
-            try renderer.recordRenderedStroke(stroke)
-            canvasWetness = renderer.canvasWetness
+            try await strokePreviewOperation.finish(token.renderer, stroke, token.rendererToken)
+            guard isFinalizingStrokePreview(token), renderer === token.renderer else { return }
+            try token.renderer.recordRenderedStroke(stroke)
+            canvasWetness = token.renderer.canvasWetness
             editor.append(.stroke(stroke))
             strokePreviewState = .idle
             pendingStrokePreview = nil
             publishEditorProject()
             error = nil
         } catch {
-            guard isFinalizingStrokePreview(token) else { return }
+            guard isFinalizingStrokePreview(token), renderer === token.renderer else { return }
             let failure = StudioFailure(message: error.localizedDescription)
             invalidateStrokePreview(token)
             if case RendererError.strokePreviewRestoration = error {
                 enterRendererRecovery(error)
             } else {
                 do {
-                    try renderer.replay(project: project)
+                    try token.renderer.replay(project: project)
                     self.error = failure
                 } catch {
                     enterRendererRecovery(error)
@@ -327,9 +347,9 @@ public final class StudioModel: ObservableObject {
         let wasFinalizing = isFinalizingStrokePreview(token)
         invalidateStrokePreview(token)
         do {
-            try renderer.cancelStrokePreview(generation: token.generation)
+            try token.renderer.cancelStrokePreview(token.rendererToken)
             if wasFinalizing {
-                try renderer.replay(project: project)
+                try token.renderer.replay(project: project)
             }
             error = nil
         } catch {
@@ -359,16 +379,21 @@ public final class StudioModel: ObservableObject {
     private func drainStrokePreviewUpdates(token: StudioStrokePreviewToken) async {
         while !Task.isCancelled,
               isCurrentStrokePreview(token),
+              renderer === token.renderer,
               let stroke = pendingStrokePreview,
               stroke.id == token.strokeID {
             pendingStrokePreview = nil
             do {
-                try await strokePreviewOperation.update(renderer, stroke, token.generation)
-                guard isCurrentStrokePreview(token) else { break }
+                try await strokePreviewOperation.update(
+                    token.renderer,
+                    stroke,
+                    token.rendererToken
+                )
+                guard isCurrentStrokePreview(token), renderer === token.renderer else { break }
                 error = nil
                 if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
             } catch {
-                guard isCurrentStrokePreview(token) else { break }
+                guard isCurrentStrokePreview(token), renderer === token.renderer else { break }
                 failStrokePreview(error, token: token)
                 break
             }
@@ -387,7 +412,7 @@ public final class StudioModel: ObservableObject {
                   let task = strokePreviewDrainTask
             else { return }
             await task.value
-            guard isCurrentStrokePreview(token) else { return }
+            guard isCurrentStrokePreview(token), renderer === token.renderer else { return }
         }
     }
 
@@ -398,7 +423,7 @@ public final class StudioModel: ObservableObject {
         guard isCurrentStrokePreview(token) else { return }
         invalidateStrokePreview(token)
         do {
-            try renderer.cancelStrokePreview(generation: token.generation)
+            try token.renderer.cancelStrokePreview(token.rendererToken)
             error = StudioFailure(message: previewError.localizedDescription)
         } catch {
             enterRendererRecovery(error)
@@ -407,7 +432,7 @@ public final class StudioModel: ObservableObject {
     }
 
     func completeStroke(_ stroke: StrokeCommand) {
-        guard canAppendStroke(stroke) else { return }
+        guard canModifyProject, canAppendStroke(stroke) else { return }
         guard project.layers.contains(where: { $0.id == stroke.layerID }) else {
             error = StudioFailure(
                 message: StudioCoordinationError.strokeLayerUnavailable(stroke.layerID).localizedDescription
@@ -482,7 +507,7 @@ public final class StudioModel: ObservableObject {
         let admissionFailure = error
         invalidateStrokePreview(token)
         do {
-            try renderer.cancelStrokePreview(generation: token.generation)
+            try token.renderer.cancelStrokePreview(token.rendererToken)
             error = admissionFailure
         } catch {
             enterRendererRecovery(error)
@@ -490,17 +515,20 @@ public final class StudioModel: ObservableObject {
         refreshCapabilities()
     }
 
-    private func nextStrokePreviewToken(for strokeID: UUID) -> StudioStrokePreviewToken {
-        strokePreviewGeneration += 1
+    private func nextStrokePreviewToken(
+        for strokeID: UUID,
+        renderer: WatercolorRenderer,
+        rendererToken: RendererStrokePreviewToken
+    ) -> StudioStrokePreviewToken {
         return StudioStrokePreviewToken(
             strokeID: strokeID,
-            generation: strokePreviewGeneration
+            renderer: renderer,
+            rendererToken: rendererToken
         )
     }
 
     private func invalidateStrokePreview(_ token: StudioStrokePreviewToken) {
         guard isCurrentStrokePreview(token) else { return }
-        strokePreviewGeneration += 1
         strokePreviewState = .idle
         pendingStrokePreview = nil
         strokePreviewDrainTask?.cancel()
@@ -626,7 +654,8 @@ public final class StudioModel: ObservableObject {
     }
 
     public func previewLayerOpacity(id: UUID, opacity: Double) {
-        guard opacity.isFinite,
+        guard canModifyProject,
+              opacity.isFinite,
               project.layers.contains(where: { $0.id == id })
         else { return }
         let clampedOpacity = min(max(opacity, 0), 1)
@@ -646,7 +675,9 @@ public final class StudioModel: ObservableObject {
     }
 
     public func commitLayerOpacity(id: UUID) {
-        guard let opacity = layerOpacityPreviews[id] else { return }
+        guard canModifyProject,
+              let opacity = layerOpacityPreviews[id]
+        else { return }
         let selectedLayerID = selectedLayerID
         let didCommit = performMetadataEdit(
             { editor in try editor.setLayerOpacity(id: id, opacity: opacity) },
@@ -654,10 +685,15 @@ public final class StudioModel: ObservableObject {
                 project.layers.first(where: { $0.id == selectedLayerID })?.id
             }
         )
-        if !didCommit {
-            try? renderer.clearLayerOpacityPreview(id: id)
-        } else if renderer.project.layers.first(where: { $0.id == id })?.opacity == opacity {
-            try? renderer.clearLayerOpacityPreview(id: id)
+        let shouldClearPreview = !didCommit
+            || renderer.project.layers.first(where: { $0.id == id })?.opacity == opacity
+        if shouldClearPreview {
+            do {
+                try renderer.clearLayerOpacityPreview(id: id)
+            } catch {
+                enterRendererRecovery(error)
+                refreshCapabilities()
+            }
         }
         layerOpacityPreviews.removeValue(forKey: id)
     }
@@ -810,6 +846,7 @@ public final class StudioModel: ObservableObject {
 
     @discardableResult
     func replaceProjectFromDocument(_ replacement: PaintingProject) -> Bool {
+        guard canModifyProject else { return false }
         guard replacement != project else { return true }
 
         do {
@@ -856,6 +893,7 @@ public final class StudioModel: ObservableObject {
     }
 
     private func performHistoryMove(_ move: (inout ProjectEditor) -> Void) {
+        guard canModifyProject else { return }
         var updatedEditor = editor
         move(&updatedEditor)
         let updatedProject = updatedEditor.project
@@ -887,6 +925,7 @@ public final class StudioModel: ObservableObject {
         _ edit: (inout ProjectEditor) throws -> Void,
         selecting selection: (PaintingProject) -> UUID?
     ) -> Bool {
+        guard canModifyProject else { return false }
         let previousProject = project
         var updatedEditor = editor
 
@@ -920,6 +959,7 @@ public final class StudioModel: ObservableObject {
         _ edit: (inout ProjectEditor) throws -> Void,
         selecting selection: (PaintingProject) -> UUID?
     ) -> Bool {
+        guard canModifyProject else { return false }
         let previousProject = project
         var updatedEditor = editor
 
@@ -1055,8 +1095,8 @@ public final class StudioModel: ObservableObject {
             canPaint: rendererRecoveryError == nil
                 && !isStrokePreviewFinalizing
                 && project.layers.contains(where: { $0.id == selectedLayerID }),
-            canUndo: editor.canUndo,
-            canRedo: editor.canRedo
+            canUndo: canModifyProject && editor.canUndo,
+            canRedo: canModifyProject && editor.canRedo
         )
     }
 
@@ -1064,7 +1104,14 @@ public final class StudioModel: ObservableObject {
 
 private struct StudioStrokePreviewToken: Equatable {
     let strokeID: UUID
-    let generation: UInt64
+    let renderer: WatercolorRenderer
+    let rendererToken: RendererStrokePreviewToken
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.strokeID == rhs.strokeID
+            && lhs.renderer === rhs.renderer
+            && lhs.rendererToken == rhs.rendererToken
+    }
 }
 
 private enum StudioStrokePreviewState {

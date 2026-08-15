@@ -100,7 +100,10 @@ struct StudioAppCommands: Commands {
 
             Button("Dry selected layer") { model?.drySelectedLayer() }
                 .keyboardShortcut("d", modifiers: [.command, .shift])
-                .disabled(!(model?.capabilities.canPaint ?? false))
+                .disabled(
+                    !(model?.canModifyProject ?? false)
+                        || !(model?.capabilities.canPaint ?? false)
+                )
 
             Divider()
 

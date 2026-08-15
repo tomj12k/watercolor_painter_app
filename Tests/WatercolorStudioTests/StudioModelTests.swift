@@ -454,11 +454,11 @@ import WatercolorCore
             renderer: renderer,
             onDocumentUpdate: { documentUpdates.append($0) },
             strokePreviewOperation: StrokePreviewRendererOperation(
-                update: { renderer, stroke, generation in
-                    try await renderer.updateStrokePreview(stroke, generation: generation)
+                update: { renderer, stroke, token in
+                    try await renderer.updateStrokePreview(stroke, token: token)
                 },
-                finish: { renderer, stroke, generation in
-                    try await renderer.finishStrokePreview(stroke, generation: generation)
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
                     _ = try await finish.suspendOnce()
                 }
             )
@@ -487,6 +487,66 @@ import WatercolorCore
         #expect(try renderer.studioChecksum() == checksumBefore)
     }
 
+    @Test func rendererChangingEditsAreRejectedWhilePreviewOwnsRenderer() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let finish = ControlledPreviewSuspension()
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) },
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, stroke, token in
+                    try await renderer.updateStrokePreview(stroke, token: token)
+                },
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
+                    _ = try await finish.suspendOnce()
+                }
+            )
+        )
+        let existing = StrokeCommand.studioTestStroke(
+            layerID: project.layers[0].id,
+            x: 64,
+            y: 64
+        )
+        let preview = StrokeCommand.studioTestStroke(
+            layerID: project.layers[0].id,
+            x: 192,
+            y: 192
+        )
+        model.completeStroke(existing)
+        let committedProject = model.project
+        let owningRendererIdentity = model.rendererIdentity
+
+        #expect(model.beginStrokePreview(preview) == .accepted)
+        #expect(!model.capabilities.canUndo)
+        #expect(!model.canAddLayer)
+        let commit = Task { @MainActor in
+            await model.commitStrokePreview(preview)
+        }
+        await finish.waitUntilSuspended()
+
+        model.undo()
+        model.addLayer()
+
+        #expect(model.project == committedProject)
+        #expect(model.rendererIdentity == owningRendererIdentity)
+        #expect(documentUpdates == [committedProject])
+
+        await finish.resume()
+        await commit.value
+
+        let reopened = try WatercolorRenderer(project: model.project, device: device)
+        #expect(model.project.commands == [.stroke(existing), .stroke(preview)])
+        #expect(model.rendererProject == model.project)
+        #expect(model.rendererIdentity == owningRendererIdentity)
+        #expect(documentUpdates == [committedProject, model.project])
+        #expect(try renderer.studioChecksum() == reopened.studioChecksum())
+    }
+
     @Test func staleUpdateFailureCannotCancelAReusedStrokeIDGeneration() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
@@ -494,15 +554,15 @@ import WatercolorCore
         let update = ControlledPreviewSuspension()
         let secondUpdateCompleted = ControlledPreviewSignal()
         let operation = StrokePreviewRendererOperation(
-            update: { renderer, stroke, generation in
+            update: { renderer, stroke, token in
                 let wasSuspended = try await update.suspendOnce()
-                try await renderer.updateStrokePreview(stroke, generation: generation)
+                try await renderer.updateStrokePreview(stroke, token: token)
                 if !wasSuspended {
                     await secondUpdateCompleted.signal()
                 }
             },
-            finish: { renderer, stroke, generation in
-                try await renderer.finishStrokePreview(stroke, generation: generation)
+            finish: { renderer, stroke, token in
+                try await renderer.finishStrokePreview(stroke, token: token)
             }
         )
         let model = StudioModel(
@@ -567,11 +627,11 @@ import WatercolorCore
             renderer: renderer,
             onDocumentUpdate: { documentUpdates.append($0) },
             strokePreviewOperation: StrokePreviewRendererOperation(
-                update: { renderer, stroke, generation in
-                    try await renderer.updateStrokePreview(stroke, generation: generation)
+                update: { renderer, stroke, token in
+                    try await renderer.updateStrokePreview(stroke, token: token)
                 },
-                finish: { renderer, stroke, generation in
-                    try await renderer.finishStrokePreview(stroke, generation: generation)
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
                     _ = try await finish.suspendOnce()
                 }
             )
@@ -710,11 +770,11 @@ import WatercolorCore
             project: project,
             renderer: renderer,
             strokePreviewOperation: StrokePreviewRendererOperation(
-                update: { renderer, stroke, generation in
-                    try await renderer.updateStrokePreview(stroke, generation: generation)
+                update: { renderer, stroke, token in
+                    try await renderer.updateStrokePreview(stroke, token: token)
                 },
-                finish: { renderer, stroke, generation in
-                    try await renderer.finishStrokePreview(stroke, generation: generation)
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
                     _ = try await finish.suspendOnce()
                 }
             )
@@ -785,7 +845,6 @@ import WatercolorCore
         #expect(!model.isStrokePreviewActive)
         #expect(model.error?.message.contains("simulation threads") == true)
         #expect(previewSubmissions.count == 0)
-        try renderer.cancelStrokePreview()
         #expect(try renderer.studioChecksum() == checksumBefore)
 
         model.completeStroke(.studioTestStroke(
@@ -1585,6 +1644,48 @@ import WatercolorCore
 
         model.selectedLayerID = UUID()
         #expect(!model.canDuplicateSelectedLayer)
+    }
+
+    @Test func previewOwnershipDisablesHistoryAndEveryLayerAction() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+
+        model.completeStroke(.studioTestStroke(layerID: project.layers[0].id))
+        model.addLayer()
+        model.addLayer()
+        model.addLayer()
+        model.undo()
+        model.selectedLayerID = model.project.layers[1].id
+
+        #expect(model.capabilities.canUndo)
+        #expect(model.capabilities.canRedo)
+        #expect(model.canAddLayer)
+        #expect(model.canDuplicateSelectedLayer)
+        #expect(model.canDeleteSelectedLayer)
+        #expect(model.canMoveSelectedLayerUp)
+        #expect(model.canMoveSelectedLayerDown)
+        #expect(model.canMergeSelectedLayerDown)
+
+        let preview = StrokeCommand.studioTestStroke(layerID: model.selectedLayerID)
+        #expect(model.beginStrokePreview(preview) == .accepted)
+
+        #expect(!model.canModifyProject)
+        #expect(!model.capabilities.canUndo)
+        #expect(!model.capabilities.canRedo)
+        #expect(!model.canAddLayer)
+        #expect(!model.canDuplicateSelectedLayer)
+        #expect(!model.canDeleteSelectedLayer)
+        #expect(!model.canMoveSelectedLayerUp)
+        #expect(!model.canMoveSelectedLayerDown)
+        #expect(!model.canMergeSelectedLayerDown)
+
+        model.cancelStrokePreview()
+
+        #expect(model.canModifyProject)
+        #expect(model.capabilities.canUndo)
+        #expect(model.capabilities.canRedo)
     }
 
     @Test func duplicationRemainsAvailableAfterManyHistoricalDuplicateDeleteCycles() throws {
