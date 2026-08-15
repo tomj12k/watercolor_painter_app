@@ -272,21 +272,25 @@ import WatercolorCore
             pngExportWorker: worker
         )
 
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
+            blockingGate.failSafeRelease()
+        }
         let export = Task { @MainActor in
             await model.exportPNG(to: URL(fileURLWithPath: "/tmp/blocked-export.png"))
         }
-        let encoderStarted = await Task.detached {
+        await Task.detached {
             blockingGate.waitUntilBlocked()
         }.value
-        #expect(encoderStarted)
 
         let mainActorRanWhileBlocked = await Task { @MainActor in
-            blockingGate.isBlocked
+            let isBlocked = blockingGate.isBlocked
+            blockingGate.release()
+            return isBlocked
         }.value
 
         #expect(mainActorRanWhileBlocked)
-        blockingGate.release()
         await export.value
+        #expect(blockingGate.wasReleasedByMainActor)
     }
 
     @Test func olderExportSuccessDoesNotClearALaterActionFailure() async throws {
@@ -401,20 +405,34 @@ import WatercolorCore
 }
 
 private final class BlockingExportGate: @unchecked Sendable {
+    private enum ReleaseReason {
+        case mainActor
+        case failSafe
+    }
+
     private let lock = NSLock()
     private let started = DispatchSemaphore(value: 0)
     private let releaseGate = DispatchSemaphore(value: 0)
     private var blocked = false
+    private var failSafeRequested = false
+    private var releaseReason: ReleaseReason?
 
     func block() {
-        lock.withLock { blocked = true }
+        let shouldWait = lock.withLock {
+            blocked = true
+            guard failSafeRequested else { return true }
+            releaseReason = .failSafe
+            return false
+        }
         started.signal()
-        _ = releaseGate.wait(timeout: .now() + 2)
+        if shouldWait {
+            releaseGate.wait()
+        }
         lock.withLock { blocked = false }
     }
 
-    func waitUntilBlocked() -> Bool {
-        started.wait(timeout: .now() + 2) == .success
+    func waitUntilBlocked() {
+        started.wait()
     }
 
     var isBlocked: Bool {
@@ -422,7 +440,37 @@ private final class BlockingExportGate: @unchecked Sendable {
     }
 
     func release() {
-        releaseGate.signal()
+        release(reason: .mainActor)
+    }
+
+    func failSafeRelease() {
+        let shouldSignal = lock.withLock {
+            guard releaseReason == nil else { return false }
+            guard blocked else {
+                failSafeRequested = true
+                return false
+            }
+            releaseReason = .failSafe
+            return true
+        }
+        if shouldSignal {
+            releaseGate.signal()
+        }
+    }
+
+    var wasReleasedByMainActor: Bool {
+        lock.withLock { releaseReason == .mainActor }
+    }
+
+    private func release(reason: ReleaseReason) {
+        let shouldSignal = lock.withLock {
+            guard blocked, releaseReason == nil else { return false }
+            releaseReason = reason
+            return true
+        }
+        if shouldSignal {
+            releaseGate.signal()
+        }
     }
 }
 

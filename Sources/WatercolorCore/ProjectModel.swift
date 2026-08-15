@@ -408,13 +408,26 @@ public struct PaintingProject: Codable, Equatable, Sendable {
     }
 
     public func validate() throws {
-        try validate(requireMinimumCanvasDimension: true)
+        try validate(
+            requireMinimumCanvasDimension: true,
+            maximumTotalStrokePointCount: Self.maximumTotalStrokePointCount
+        )
+    }
+
+    func validate(maximumTotalStrokePointCount: Int) throws {
+        try validate(
+            requireMinimumCanvasDimension: true,
+            maximumTotalStrokePointCount: maximumTotalStrokePointCount
+        )
     }
 
     /// Renderer entry points also accept smaller canvases for thumbnails and tests, while
     /// preserving every upper bound and nested-data safety invariant used by documents.
     public func validateForRendering() throws {
-        try validate(requireMinimumCanvasDimension: false)
+        try validate(
+            requireMinimumCanvasDimension: false,
+            maximumTotalStrokePointCount: Self.maximumTotalStrokePointCount
+        )
     }
 
     public func validateForRendering(_ stroke: StrokeCommand) throws {
@@ -424,7 +437,10 @@ public struct PaintingProject: Codable, Equatable, Sendable {
         try validate(stroke)
     }
 
-    private func validate(requireMinimumCanvasDimension: Bool) throws {
+    private func validate(
+        requireMinimumCanvasDimension: Bool,
+        maximumTotalStrokePointCount: Int
+    ) throws {
         guard schemaVersion == Self.currentSchemaVersion else {
             throw ProjectValidationError.unsupportedSchema(schemaVersion)
         }
@@ -484,7 +500,7 @@ public struct PaintingProject: Codable, Equatable, Sendable {
                     throw ProjectValidationError.invalidCommandRelationship(stroke.id)
                 }
                 let (updatedTotal, didOverflow) = totalStrokePointCount.addingReportingOverflow(stroke.points.count)
-                guard !didOverflow, updatedTotal <= Self.maximumTotalStrokePointCount else {
+                guard !didOverflow, updatedTotal <= maximumTotalStrokePointCount else {
                     throw ProjectValidationError.totalStrokePointLimitExceeded(
                         didOverflow ? Int.max : updatedTotal
                     )

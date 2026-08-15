@@ -243,6 +243,36 @@ import WatercolorCore
         )
     }
 
+    @Test func activeMultilayerPreviewIsChargedBeforeCandidateAllocation() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let first = PaintLayer(name: "First")
+        let second = PaintLayer(name: "Second")
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [first, second]
+        )
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugResourcePolicy: RendererResourcePolicy(maximumWorkingSetBytes: 9_900_000)
+        )
+        try renderer.beginStrokePreview(.testDot(layerID: first.id))
+        var candidateProject = project
+        candidateProject.layers.append(PaintLayer(name: "Third"))
+
+        #expect(
+            throws: RendererError.resourceBudgetExceeded(
+                required: 10_224_008,
+                available: 9_900_000
+            )
+        ) {
+            _ = try renderer.makeCandidate(project: candidateProject)
+        }
+
+        try renderer.cancelStrokePreview()
+    }
+
     @Test func replayIsDeterministic() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         var project = PaintingProject.testCanvas(64, paper: .rough)

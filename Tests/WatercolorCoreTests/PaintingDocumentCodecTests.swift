@@ -5,7 +5,7 @@ import Testing
 @Suite(.serialized) struct PaintingDocumentCodecTests {
     @Test func codecRejectsEncodedDocumentsAboveTheByteLimit() {
         let project = PaintingProject.pointLimitFixture(
-            pointCount: 2_000_000,
+            pointCount: 128,
             point: StrokePoint(
                 x: 123.456_789_012_345_67,
                 y: 234.567_890_123_456_78,
@@ -15,12 +15,16 @@ import Testing
                 time: 123_456_789_012_345.67
             )
         )
+        let limits = PaintingDocumentCodec.AdmissionLimits(
+            maximumDocumentBytes: 4 * 1024,
+            maximumTotalStrokePointCount: 128
+        )
 
         do {
-            _ = try PaintingDocumentCodec.encode(project)
+            _ = try PaintingDocumentCodec.encode(project, limits: limits)
             Issue.record("Expected encoding above the byte limit to fail")
         } catch let DocumentCodecError.validationFailed(.documentByteLimitExceeded(byteCount)) {
-            #expect(byteCount > PaintingDocumentCodec.maximumDocumentBytes)
+            #expect(byteCount > limits.maximumDocumentBytes)
         } catch {
             Issue.record("Expected documentByteLimitExceeded, got \(error)")
         }
@@ -28,43 +32,44 @@ import Testing
 
     @Test func codecRoundTripsAProjectAtTheAggregatePointLimit() throws {
         let project = PaintingProject.pointLimitFixture(
-            pointCount: 2_000_000,
+            pointCount: 128,
             point: StrokePoint(x: 1, y: 1, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
         )
+        let limits = PaintingDocumentCodec.AdmissionLimits(
+            maximumDocumentBytes: 64 * 1024,
+            maximumTotalStrokePointCount: 128
+        )
 
-        let data = try PaintingDocumentCodec.encode(project)
+        let data = try PaintingDocumentCodec.encode(project, limits: limits)
 
-        #expect(data.count <= PaintingDocumentCodec.maximumDocumentBytes)
-        #expect(try PaintingDocumentCodec.decode(data) == project)
+        #expect(data.count <= limits.maximumDocumentBytes)
+        #expect(try PaintingDocumentCodec.decode(data, limits: limits) == project)
     }
 
     @Test func codecRejectsDataAboveTheDocumentByteLimitBeforeDecoding() {
-        let data = Data(repeating: 0, count: PaintingDocumentCodec.maximumDocumentBytes + 1)
+        let limits = PaintingDocumentCodec.AdmissionLimits(
+            maximumDocumentBytes: 4 * 1024,
+            maximumTotalStrokePointCount: 128
+        )
+        let data = Data(repeating: 0, count: limits.maximumDocumentBytes + 1)
 
         #expect(throws: DocumentCodecError.validationFailed(.documentByteLimitExceeded(data.count))) {
-            _ = try PaintingDocumentCodec.decode(data)
+            _ = try PaintingDocumentCodec.decode(data, limits: limits)
         }
     }
 
     @Test func codecRejectsProjectsWhoseAggregateStrokePointsExceedTheLimit() {
-        var project = PaintingProject.newDefault()
-        let points = Array(
-            repeating: StrokePoint(x: 1, y: 1, pressure: 1, tiltX: 0, tiltY: 0, time: 0),
-            count: PaintingProject.maximumStrokePointCount
+        let project = PaintingProject.pointLimitFixture(
+            pointCount: 129,
+            point: StrokePoint(x: 1, y: 1, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
         )
-        let strokeCount = 31
-        project.commands = (0..<strokeCount).map { _ in
-            .stroke(StrokeCommand(
-                layerID: project.layers[0].id,
-                tool: .brush,
-                brush: .default,
-                points: points
-            ))
-        }
-        let totalPointCount = 2_031_616
+        let limits = PaintingDocumentCodec.AdmissionLimits(
+            maximumDocumentBytes: 64 * 1024,
+            maximumTotalStrokePointCount: 128
+        )
 
-        #expect(throws: DocumentCodecError.validationFailed(.totalStrokePointLimitExceeded(totalPointCount))) {
-            _ = try PaintingDocumentCodec.encode(project)
+        #expect(throws: DocumentCodecError.validationFailed(.totalStrokePointLimitExceeded(129))) {
+            _ = try PaintingDocumentCodec.encode(project, limits: limits)
         }
     }
 

@@ -22,20 +22,38 @@ extension DocumentCodecError: LocalizedError {
 public enum PaintingDocumentCodec {
     public static let maximumDocumentBytes = 256 * 1024 * 1024
 
+    struct AdmissionLimits: Sendable {
+        let maximumDocumentBytes: Int
+        let maximumTotalStrokePointCount: Int
+
+        static let production = Self(
+            maximumDocumentBytes: PaintingDocumentCodec.maximumDocumentBytes,
+            maximumTotalStrokePointCount: PaintingProject.maximumTotalStrokePointCount
+        )
+    }
+
     public static func encode(_ project: PaintingProject) throws -> Data {
-        try validate(project)
+        try encode(project, limits: .production)
+    }
+
+    static func encode(_ project: PaintingProject, limits: AdmissionLimits) throws -> Data {
+        try validate(project, limits: limits)
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(project)
-        guard data.count <= maximumDocumentBytes else {
+        guard data.count <= limits.maximumDocumentBytes else {
             throw DocumentCodecError.validationFailed(.documentByteLimitExceeded(data.count))
         }
         return data
     }
 
     public static func decode(_ data: Data) throws -> PaintingProject {
-        guard data.count <= maximumDocumentBytes else {
+        try decode(data, limits: .production)
+    }
+
+    static func decode(_ data: Data, limits: AdmissionLimits) throws -> PaintingProject {
+        guard data.count <= limits.maximumDocumentBytes else {
             throw DocumentCodecError.validationFailed(.documentByteLimitExceeded(data.count))
         }
 
@@ -60,20 +78,22 @@ public enum PaintingDocumentCodec {
         if header.schemaVersion == 1 {
             var validationProject = project
             validationProject.schemaVersion = PaintingProject.currentSchemaVersion
-            try validate(validationProject)
+            try validate(validationProject, limits: limits)
             project = migrateVersionOneProject(project)
         }
-        try validate(project)
+        try validate(project, limits: limits)
         return project
     }
 
-    private static func validate(_ project: PaintingProject) throws {
+    private static func validate(_ project: PaintingProject, limits: AdmissionLimits) throws {
         guard project.schemaVersion <= PaintingProject.currentSchemaVersion else {
             throw DocumentCodecError.unsupportedSchema(project.schemaVersion)
         }
 
         do {
-            try project.validate()
+            try project.validate(
+                maximumTotalStrokePointCount: limits.maximumTotalStrokePointCount
+            )
         } catch let error as ProjectValidationError {
             throw DocumentCodecError.validationFailed(error)
         }
