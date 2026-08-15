@@ -367,7 +367,7 @@ public enum ProjectValidationError: Error, Equatable, Sendable {
 }
 
 public struct PaintingProject: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 1
+    public static let currentSchemaVersion = 2
     public static let minimumCanvasDimension = 256
     public static let maximumCanvasDimension = 4096
     public static let maximumLayerCount = 12

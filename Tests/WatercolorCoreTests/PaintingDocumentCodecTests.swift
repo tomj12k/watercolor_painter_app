@@ -20,6 +20,53 @@ import Testing
         #expect(try PaintingDocumentCodec.decode(data) == project)
     }
 
+    @Test func codecMigratesVersionOneSRGBMidtonesToVersionTwoLinearColorExactlyOnce() throws {
+        let layer = PaintLayer(
+            id: UUID(uuidString: "751CB1CA-E34A-4633-8CC9-0C999F0BE4C8")!,
+            name: "Legacy layer"
+        )
+        var brush = BrushSettings.default
+        brush.color = PaintColor(red: 0.5, green: 0.25, blue: 0.75, alpha: 1)
+        let legacy = PaintingProject(
+            schemaVersion: 1,
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [layer],
+            commands: [.stroke(.fixture(layerID: layer.id, brush: brush))]
+        )
+
+        let migrated = try PaintingDocumentCodec.decode(JSONEncoder().encode(legacy))
+        let migratedStroke = try #require(migrated.commands.first?.stroke)
+        #expect(migrated.schemaVersion == 2)
+        #expect(abs(migratedStroke.brush.color.red - 0.214_041_140_482_232_55) < 1e-12)
+        #expect(abs(migratedStroke.brush.color.green - 0.050_876_088_171_556_79) < 1e-12)
+        #expect(abs(migratedStroke.brush.color.blue - 0.522_521_553_968_392_1) < 1e-12)
+
+        let reencoded = try PaintingDocumentCodec.encode(migrated)
+        let redecoded = try PaintingDocumentCodec.decode(reencoded)
+        #expect(redecoded == migrated)
+        #expect(try JSONDecoder().decode(SchemaVersionFixture.self, from: reencoded).schemaVersion == 2)
+    }
+
+    @Test func codecPreservesVersionTwoLinearMidtonesWithoutRemigration() throws {
+        let layer = PaintLayer(name: "Linear layer")
+        var brush = BrushSettings.default
+        brush.color = PaintColor(red: 0.5, green: 0.25, blue: 0.75, alpha: 1)
+        let current = PaintingProject(
+            schemaVersion: 2,
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [layer],
+            commands: [.stroke(.fixture(layerID: layer.id, brush: brush))]
+        )
+
+        let decoded = try PaintingDocumentCodec.decode(JSONEncoder().encode(current))
+        let decodedStroke = try #require(decoded.commands.first?.stroke)
+
+        #expect(decoded.schemaVersion == 2)
+        #expect(decodedStroke.brush.color == brush.color)
+    }
+
     @Test func codecRoundTripsEveryPaintingCommandCaseIncludingDuplicate() throws {
         let source = PaintLayer(
             id: UUID(uuidString: "A6A874FB-35CD-45D6-9897-5174EA57447D")!,
@@ -230,6 +277,17 @@ import Testing
         #expect(throws: DocumentCodecError.validationFailed(.invalidCommandRelationship(project.commands[0].id))) {
             _ = try PaintingDocumentCodec.encode(project)
         }
+    }
+}
+
+private struct SchemaVersionFixture: Decodable {
+    let schemaVersion: Int
+}
+
+private extension PaintingCommand {
+    var stroke: StrokeCommand? {
+        guard case let .stroke(stroke) = self else { return nil }
+        return stroke
     }
 }
 

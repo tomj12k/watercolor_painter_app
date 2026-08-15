@@ -41,11 +41,17 @@ public enum PaintingDocumentCodec {
             throw DocumentCodecError.unsupportedSchema(header.schemaVersion)
         }
 
-        let project: PaintingProject
+        var project: PaintingProject
         do {
             project = try decoder.decode(PaintingProject.self, from: data)
         } catch {
             throw DocumentCodecError.malformedData
+        }
+        if header.schemaVersion == 1 {
+            var validationProject = project
+            validationProject.schemaVersion = PaintingProject.currentSchemaVersion
+            try validate(validationProject)
+            project = migrateVersionOneProject(project)
         }
         try validate(project)
         return project
@@ -61,6 +67,23 @@ public enum PaintingDocumentCodec {
         } catch let error as ProjectValidationError {
             throw DocumentCodecError.validationFailed(error)
         }
+    }
+
+    private static func migrateVersionOneProject(_ legacyProject: PaintingProject) -> PaintingProject {
+        var migrated = legacyProject
+        migrated.schemaVersion = PaintingProject.currentSchemaVersion
+        migrated.commands = legacyProject.commands.map { command in
+            guard case var .stroke(stroke) = command else { return command }
+            let legacyColor = stroke.brush.color
+            stroke.brush.color = .fromSRGB(
+                red: legacyColor.red,
+                green: legacyColor.green,
+                blue: legacyColor.blue,
+                alpha: legacyColor.alpha
+            )
+            return .stroke(stroke)
+        }
+        return migrated
     }
 }
 

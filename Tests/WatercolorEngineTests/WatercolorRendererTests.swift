@@ -762,6 +762,47 @@ import WatercolorCore
         #expect(abs(exported.green - exported.blue) < 0.03)
     }
 
+    @Test func migratedVersionOneMidtoneReencodesAndReplaysLikeEquivalentLinearProject() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let layer = PaintLayer(
+            id: UUID(uuidString: "4B60F4F3-9F6D-41B2-A99D-84CB27100D07")!,
+            name: "Legacy midtone"
+        )
+        var legacyBrush = BrushSettings.default
+        legacyBrush.color = PaintColor(red: 0.5, green: 0.25, blue: 0.75)
+        let strokeID = UUID(uuidString: "C9063B47-E233-4FAF-B18D-AB71DE3EB5DB")!
+        let legacyStroke = StrokeCommand.testDot(
+            id: strokeID,
+            layerID: layer.id,
+            color: legacyBrush.color
+        )
+        let legacy = PaintingProject(
+            schemaVersion: 1,
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [layer],
+            commands: [.stroke(legacyStroke)]
+        )
+
+        let migrated = try PaintingDocumentCodec.decode(JSONEncoder().encode(legacy))
+        let reencoded = try PaintingDocumentCodec.encode(migrated)
+        let reopened = try PaintingDocumentCodec.decode(reencoded)
+        var expectedStroke = legacyStroke
+        expectedStroke.brush.color = .fromSRGB(red: 0.5, green: 0.25, blue: 0.75)
+        let expected = PaintingProject(
+            schemaVersion: 2,
+            canvas: legacy.canvas,
+            paper: legacy.paper,
+            layers: legacy.layers,
+            commands: [.stroke(expectedStroke)]
+        )
+        let migratedRenderer = try WatercolorRenderer(project: reopened, device: device)
+        let expectedRenderer = try WatercolorRenderer(project: expected, device: device)
+
+        #expect(reopened == expected)
+        #expect(try migratedRenderer.compositeChecksum() == expectedRenderer.compositeChecksum())
+    }
+
     @Test func replayDuplicatesPigmentAndWetnessThenLetsLayersDiverge() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let source = PaintLayer(
