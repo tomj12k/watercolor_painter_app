@@ -100,6 +100,40 @@ import WatercolorCore
         #expect(first == second)
     }
 
+    @Test func discardedStrokeStillAdvancesSurvivingWetLayer() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let base = PaintingProject.testCanvas(64)
+        let layerID = base.layers[0].id
+        var survivingStroke = StrokeCommand.testDot(
+            id: UUID(uuidString: "6DF572F1-2C3C-4121-8A77-6A59A154E61F")!,
+            layerID: layerID,
+            color: PaintColor(red: 0.1, green: 0.4, blue: 0.8)
+        )
+        survivingStroke.brush.water = 0.95
+
+        var explicitAdvance = base
+        explicitAdvance.commands = [
+            .stroke(survivingStroke),
+            .dryLayer(DryLayerCommand(layerID: layerID, steps: 2))
+        ]
+        let renderer = try WatercolorRenderer(project: explicitAdvance, device: device)
+        let expectedPigment = try renderer.debugPixel(x: 32, y: 32, layerID: layerID)
+        let expectedWetness = try renderer.debugWetness(x: 32, y: 32, layerID: layerID)
+
+        var discardedStroke = base
+        discardedStroke.commands = [
+            .stroke(survivingStroke),
+            .stroke(.testDot(
+                id: UUID(uuidString: "E1B79612-52A7-4BEF-8E32-224B10B78E4D")!,
+                layerID: UUID(uuidString: "8393575B-86A6-459F-9097-9C9D28663C7D")!
+            ))
+        ]
+        try renderer.replay(project: discardedStroke)
+
+        #expect(try renderer.debugPixel(x: 32, y: 32, layerID: layerID) == expectedPigment)
+        #expect(try renderer.debugWetness(x: 32, y: 32, layerID: layerID) == expectedWetness)
+    }
+
     @Test func unknownLayerProducesUsefulError() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)

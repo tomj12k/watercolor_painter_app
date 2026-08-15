@@ -174,6 +174,12 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                     targetSlice: Self.allLayers,
                     with: encoder
                 )
+            case .simulateDiscardedStroke:
+                encodeSimulation(
+                    steps: Self.simulationStepsPerStroke,
+                    targetSlice: Self.allLayers,
+                    with: encoder
+                )
             case let .clear(slice):
                 encodeClear(targetSlice: UInt32(slice), texturesAt: frontTextureIndex, with: encoder)
             case let .merge(source, destination):
@@ -298,7 +304,10 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         for command in project.commands {
             switch command {
             case let .stroke(stroke):
-                guard relevantLayerIDs.contains(stroke.layerID) else { continue }
+                guard relevantLayerIDs.contains(stroke.layerID) else {
+                    actions.append(.simulateDiscardedStroke)
+                    continue
+                }
                 let slice = try acquireReplaySlice(
                     for: stroke.layerID,
                     layerSlices: &layerSlices,
@@ -745,6 +754,7 @@ private struct ReplayPlan {
 
 private enum ReplayAction {
     case stroke(StrokeCommand, Int)
+    case simulateDiscardedStroke
     case clear(Int)
     case merge(Int, Int)
     case dry(Int, Int)
