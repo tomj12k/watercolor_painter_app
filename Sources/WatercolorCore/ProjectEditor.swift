@@ -1,0 +1,148 @@
+import Foundation
+
+public enum ProjectEditingError: Error, Equatable, Sendable {
+    case layerNotFound(UUID)
+    case layerLimitExceeded(Int)
+    case invalidLayerIndex(Int)
+    case cannotMergeBottomLayer(UUID)
+}
+
+public struct ProjectEditor: Sendable {
+    public private(set) var project: PaintingProject
+
+    private var undoHistory: [HistoryEntry] = []
+    private var redoHistory: [HistoryEntry] = []
+
+    public init(project: PaintingProject) {
+        self.project = project
+    }
+
+    public var canUndo: Bool {
+        !undoHistory.isEmpty
+    }
+
+    public var canRedo: Bool {
+        !redoHistory.isEmpty
+    }
+
+    public mutating func removeLayer(id: UUID) throws {
+        let index = try layerIndex(for: id)
+
+        guard project.layers.count > 1 else {
+            return
+        }
+
+        let before = project
+        project.layers.remove(at: index)
+        recordChange(before: before)
+    }
+
+    public mutating func addLayer(named name: String) throws {
+        try ensureLayerCapacity()
+
+        let before = project
+        project.layers.append(PaintLayer(name: name))
+        recordChange(before: before)
+    }
+
+    public mutating func duplicateLayer(id: UUID) throws {
+        let index = try layerIndex(for: id)
+        try ensureLayerCapacity()
+
+        let before = project
+        let source = project.layers[index]
+        project.layers.insert(
+            PaintLayer(name: source.name, isVisible: source.isVisible, opacity: source.opacity),
+            at: index + 1
+        )
+        recordChange(before: before)
+    }
+
+    public mutating func moveLayer(id: UUID, to destinationIndex: Int) throws {
+        let sourceIndex = try layerIndex(for: id)
+        guard project.layers.indices.contains(destinationIndex) else {
+            throw ProjectEditingError.invalidLayerIndex(destinationIndex)
+        }
+
+        guard sourceIndex != destinationIndex else {
+            return
+        }
+
+        let before = project
+        let layer = project.layers.remove(at: sourceIndex)
+        project.layers.insert(layer, at: destinationIndex)
+        recordChange(before: before)
+    }
+
+    public mutating func mergeDown(id: UUID) throws {
+        let sourceIndex = try layerIndex(for: id)
+        guard sourceIndex > 0 else {
+            throw ProjectEditingError.cannotMergeBottomLayer(id)
+        }
+
+        let before = project
+        let sourceLayer = project.layers[sourceIndex]
+        let destinationLayer = project.layers[sourceIndex - 1]
+        let command = PaintingCommand.mergeDown(
+            MergeDownCommand(
+                sourceLayerID: sourceLayer.id,
+                destinationLayerID: destinationLayer.id
+            )
+        )
+        project.layers.remove(at: sourceIndex)
+        project.commands.append(command)
+        recordChange(before: before, command: command)
+    }
+
+    public mutating func append(_ command: PaintingCommand) {
+        let before = project
+        project.commands.append(command)
+        recordChange(before: before, command: command)
+    }
+
+    @discardableResult
+    public mutating func undo() -> PaintingCommand? {
+        guard let entry = undoHistory.popLast() else {
+            return nil
+        }
+
+        project = entry.before
+        redoHistory.append(entry)
+        return entry.command
+    }
+
+    @discardableResult
+    public mutating func redo() -> PaintingCommand? {
+        guard let entry = redoHistory.popLast() else {
+            return nil
+        }
+
+        project = entry.after
+        undoHistory.append(entry)
+        return entry.command
+    }
+
+    private mutating func recordChange(before: PaintingProject, command: PaintingCommand? = nil) {
+        undoHistory.append(HistoryEntry(before: before, after: project, command: command))
+        redoHistory.removeAll()
+    }
+
+    private func layerIndex(for id: UUID) throws -> Int {
+        guard let index = project.layers.firstIndex(where: { $0.id == id }) else {
+            throw ProjectEditingError.layerNotFound(id)
+        }
+        return index
+    }
+
+    private func ensureLayerCapacity() throws {
+        guard project.layers.count < PaintingProject.maximumLayerCount else {
+            throw ProjectEditingError.layerLimitExceeded(project.layers.count)
+        }
+    }
+}
+
+private struct HistoryEntry: Sendable {
+    let before: PaintingProject
+    let after: PaintingProject
+    let command: PaintingCommand?
+}
