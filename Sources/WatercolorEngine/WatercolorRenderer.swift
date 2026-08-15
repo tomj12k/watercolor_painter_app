@@ -10,6 +10,7 @@ public enum RendererError: Error, Equatable, Sendable {
     case allocation(String)
     case invalidProject(ProjectValidationError)
     case unknownLayer(UUID)
+    case invalidStrokePreview
     case invalidMetadataChange
     case readback(String)
 }
@@ -27,6 +28,8 @@ extension RendererError: LocalizedError {
             "The watercolor project is unsafe to render: \(String(describing: error))."
         case let .unknownLayer(identifier):
             "The watercolor renderer does not contain layer \(identifier.uuidString)."
+        case .invalidStrokePreview:
+            "The live stroke preview is no longer active."
         case .invalidMetadataChange:
             "This painting change requires a structural renderer replay."
         case let .readback(message):
@@ -72,7 +75,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private var layerSlices: [UUID: Int] = [:]
     private var layerOpacityPreviews: [UUID: Double] = [:]
     private var lastCommandBuffer: MTLCommandBuffer?
-    private let commandBufferError: (MTLCommandBuffer) -> Error?
+    private let commandBufferErrorProvider: CommandBufferErrorProvider
+    private var strokePreview: StrokePreviewTransaction?
     private var displayZoom: CGFloat = 1
     private var displayPan: CGSize = .zero
     #if DEBUG
@@ -150,7 +154,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             device: requestedDevice,
             length: wetnessTileCount * MemoryLayout<UInt32>.stride
         )
-        self.commandBufferError = commandBufferError
+        commandBufferErrorProvider = CommandBufferErrorProvider(commandBufferError)
+        strokePreview = nil
 
         let textures = try Self.makeTextures(
             device: requestedDevice,
@@ -183,7 +188,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             project: project,
             device: device,
             pipelineResources: pipelineResources,
-            commandBufferError: commandBufferError
+            commandBufferError: commandBufferErrorProvider.operation
         )
     }
 
@@ -200,6 +205,88 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.unknownLayer(stroke.layerID)
         }
         project.commands.append(.stroke(stroke))
+    }
+
+    public func beginStrokePreview(_ stroke: StrokeCommand) throws {
+        guard strokePreview == nil else {
+            throw RendererError.invalidStrokePreview
+        }
+        let transaction = StrokePreviewTransaction(stroke: stroke)
+        strokePreview = transaction
+        do {
+            try updateStrokePreview(stroke)
+        } catch {
+            strokePreview = nil
+            throw error
+        }
+    }
+
+    public func updateStrokePreview(_ stroke: StrokeCommand) throws {
+        guard let transaction = strokePreview,
+              transaction.strokeID == stroke.id,
+              transaction.layerID == stroke.layerID,
+              stroke.points.count >= transaction.renderedPointCount
+        else {
+            throw RendererError.invalidStrokePreview
+        }
+        do {
+            try project.validateForRendering(stroke)
+        } catch let error as ProjectValidationError {
+            throw RendererError.invalidProject(error)
+        }
+
+        let pointOffset = transaction.renderedPointCount
+        guard pointOffset < stroke.points.count else { return }
+        var segment = stroke
+        segment.points = Array(stroke.points[pointOffset...])
+        try renderPreview(stroke: segment, pointIndexOffset: pointOffset, transaction: transaction)
+        transaction.renderedPointCount = stroke.points.count
+    }
+
+    public func finishStrokePreview(_ stroke: StrokeCommand) async throws {
+        guard let transaction = strokePreview,
+              transaction.strokeID == stroke.id,
+              transaction.layerID == stroke.layerID,
+              transaction.renderedPointCount == stroke.points.count
+        else {
+            throw RendererError.invalidStrokePreview
+        }
+        do {
+            try project.validateForRendering(stroke)
+        } catch let error as ProjectValidationError {
+            throw RendererError.invalidProject(error)
+        }
+
+        let commandBuffer = try makeCommandBuffer(label: "Commit watercolor stroke preview")
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw RendererError.allocation("a stroke preview completion encoder")
+        }
+        prepareCanvasWetnessMeasurement()
+        encodeCanvasWetnessMeasurement(with: encoder)
+        encoder.endEncoding()
+        let provider = commandBufferErrorProvider
+        lastCommandBuffer = commandBuffer
+        await withCheckedContinuation { continuation in
+            commandBuffer.addCompletedHandler { completed in
+                transaction.record(provider.error(for: completed))
+                continuation.resume()
+            }
+            commandBuffer.commit()
+        }
+        if lastCommandBuffer === commandBuffer {
+            lastCommandBuffer = nil
+        }
+        strokePreview = nil
+        if let failure = transaction.failureDescription {
+            throw RendererError.allocation("GPU execution: \(failure)")
+        }
+        readCanvasWetnessMeasurement()
+    }
+
+    public func cancelStrokePreview() throws {
+        guard strokePreview != nil else { return }
+        strokePreview = nil
+        try replay(project: project)
     }
 
     private func render(stroke: StrokeCommand, waitUntilCompleted: Bool) throws {
@@ -231,6 +318,33 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         if waitUntilCompleted {
             readCanvasWetnessMeasurement()
         }
+    }
+
+    private func renderPreview(
+        stroke: StrokeCommand,
+        pointIndexOffset: Int,
+        transaction: StrokePreviewTransaction
+    ) throws {
+        guard project.layers.contains(where: { $0.id == stroke.layerID }),
+              let slice = layerSlices[stroke.layerID]
+        else {
+            throw RendererError.unknownLayer(stroke.layerID)
+        }
+
+        let commandBuffer = try makeCommandBuffer(label: "Watercolor stroke preview")
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw RendererError.allocation("a live stroke preview encoder")
+        }
+        encoder.label = "Live watercolor stroke preview"
+        encode(stroke: stroke, slice: slice, pointIndexOffset: pointIndexOffset, with: encoder)
+        encodeSimulation(steps: Self.simulationStepsPerStroke, targetSlice: Self.allLayers, with: encoder)
+        encodeComposite(with: encoder)
+        encoder.endEncoding()
+        let provider = commandBufferErrorProvider
+        commandBuffer.addCompletedHandler { completed in
+            transaction.record(provider.error(for: completed))
+        }
+        try submit(commandBuffer, wait: false)
     }
 
     public func replay(project newProject: PaintingProject) throws {
@@ -674,7 +788,12 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    private func encode(stroke: StrokeCommand, slice: Int, with encoder: MTLComputeCommandEncoder) {
+    private func encode(
+        stroke: StrokeCommand,
+        slice: Int,
+        pointIndexOffset: Int = 0,
+        with encoder: MTLComputeCommandEncoder
+    ) {
         guard !stroke.points.isEmpty else { return }
         encoder.setComputePipelineState(stampPipeline)
         encoder.setTexture(pigmentTextures[frontTextureIndex], index: 0)
@@ -722,7 +841,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                     Self.index(of: stroke.brush.style),
                     Self.index(of: project.paper),
                     UInt32(slice),
-                    baseSeed ^ (UInt32(truncatingIfNeeded: index) &* 0x9e3779b9)
+                    baseSeed ^ (UInt32(truncatingIfNeeded: index + pointIndexOffset) &* 0x9e3779b9)
                 ),
                 stampRect: SIMD4(UInt32(minX), UInt32(minY), UInt32(maxX - minX), UInt32(maxY - minY))
             )
@@ -929,7 +1048,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         if wait {
             commandBuffer.waitUntilCompleted()
             lastCommandBuffer = nil
-            if let error = commandBufferError(commandBuffer) {
+            if let error = commandBufferErrorProvider.error(for: commandBuffer) {
                 throw RendererError.allocation("GPU execution: \(error.localizedDescription)")
             }
         }
@@ -939,7 +1058,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         guard let commandBuffer = lastCommandBuffer else { return }
         commandBuffer.waitUntilCompleted()
         lastCommandBuffer = nil
-        if let error = commandBufferError(commandBuffer) {
+        if let error = commandBufferErrorProvider.error(for: commandBuffer) {
             if readback {
                 throw RendererError.readback(error.localizedDescription)
             }
@@ -1229,6 +1348,47 @@ private struct StampParameters {
 private struct SimulationParameters {
     var rates: SIMD4<Float>
     var selection: SIMD4<UInt32>
+}
+
+private final class CommandBufferErrorProvider: @unchecked Sendable {
+    let operation: (MTLCommandBuffer) -> Error?
+
+    init(_ operation: @escaping (MTLCommandBuffer) -> Error?) {
+        self.operation = operation
+    }
+
+    func error(for commandBuffer: MTLCommandBuffer) -> Error? {
+        operation(commandBuffer)
+    }
+}
+
+private final class StrokePreviewTransaction: @unchecked Sendable {
+    let strokeID: UUID
+    let layerID: UUID
+    var renderedPointCount = 0
+
+    private let lock = NSLock()
+    private var failure: String?
+
+    init(stroke: StrokeCommand) {
+        strokeID = stroke.id
+        layerID = stroke.layerID
+    }
+
+    func record(_ error: Error?) {
+        guard let error else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        if failure == nil {
+            failure = error.localizedDescription
+        }
+    }
+
+    var failureDescription: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return failure
+    }
 }
 
 private struct CompositeParameters {

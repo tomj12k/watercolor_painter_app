@@ -132,6 +132,11 @@ public final class StudioModel: ObservableObject {
     private var latestPNGExportID: UUID?
     private var currentPNGExportFailureID: UUID?
     private weak var attachedCanvas: MTKView?
+    private var activeStrokePreviewID: UUID?
+
+    public var isStrokePreviewActive: Bool {
+        activeStrokePreviewID != nil
+    }
 
     public convenience init(
         project: PaintingProject,
@@ -162,9 +167,69 @@ public final class StudioModel: ObservableObject {
         self.pngExportWorker = pngExportWorker
         latestPNGExportID = nil
         currentPNGExportFailureID = nil
+        activeStrokePreviewID = nil
         canvasDelegate = CanvasRendererDelegate(renderer: renderer)
         self.onDocumentUpdate = onDocumentUpdate
         refreshCapabilities()
+    }
+
+    func beginStrokePreview(_ stroke: StrokeCommand) {
+        guard activeStrokePreviewID == nil,
+              project.layers.contains(where: { $0.id == stroke.layerID })
+        else { return }
+        do {
+            try renderer.beginStrokePreview(stroke)
+            activeStrokePreviewID = stroke.id
+            error = nil
+            if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
+        } catch {
+            self.error = StudioFailure(message: error.localizedDescription)
+        }
+    }
+
+    func updateStrokePreview(_ stroke: StrokeCommand) {
+        guard activeStrokePreviewID == stroke.id else { return }
+        do {
+            try renderer.updateStrokePreview(stroke)
+            error = nil
+            if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
+        } catch {
+            let failure = StudioFailure(message: error.localizedDescription)
+            activeStrokePreviewID = nil
+            try? renderer.cancelStrokePreview()
+            self.error = failure
+        }
+    }
+
+    func commitStrokePreview(_ stroke: StrokeCommand) async {
+        guard activeStrokePreviewID == stroke.id else { return }
+        do {
+            try await renderer.finishStrokePreview(stroke)
+            try renderer.recordRenderedStroke(stroke)
+            canvasWetness = renderer.canvasWetness
+            editor.append(.stroke(stroke))
+            activeStrokePreviewID = nil
+            publishEditorProject()
+            error = nil
+        } catch {
+            let failure = StudioFailure(message: error.localizedDescription)
+            activeStrokePreviewID = nil
+            try? renderer.replay(project: project)
+            self.error = failure
+        }
+        if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
+    }
+
+    func cancelStrokePreview() {
+        guard activeStrokePreviewID != nil else { return }
+        activeStrokePreviewID = nil
+        do {
+            try renderer.cancelStrokePreview()
+            error = nil
+        } catch {
+            self.error = StudioFailure(message: error.localizedDescription)
+        }
+        if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
     }
 
     func completeStroke(_ stroke: StrokeCommand) {

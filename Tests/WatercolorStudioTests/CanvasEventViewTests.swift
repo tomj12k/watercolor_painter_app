@@ -94,7 +94,7 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 128, y: 128, layerID: secondLayer.id).alpha == 0)
     }
 
-    @Test func replacingTheStudioModelReattachesOnceAndTransfersDisplayAndInputOwnership() throws {
+    @Test func replacingTheStudioModelReattachesOnceAndTransfersDisplayAndInputOwnership() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let oldLayer = PaintLayer(name: "Old")
         let newLayer = PaintLayer(name: "New")
@@ -141,11 +141,19 @@ import WatercolorCore
         let up = try #require(canvasMouseEvent(.leftMouseUp, timestamp: 2, eventNumber: 3))
         view.mouseDown(with: down)
         view.mouseUp(with: up)
+        await waitForStrokePreviewToFinish(in: newModel)
 
         #expect(oldModel.project.commands.isEmpty)
         #expect(newModel.project.commands.count == 1)
         #expect(try oldRenderer.debugPixel(x: 128, y: 128, layerID: oldLayer.id).alpha == 0)
         #expect(try newRenderer.debugPixel(x: 128, y: 128, layerID: newLayer.id).alpha > 0.05)
+    }
+}
+
+@MainActor
+private func waitForStrokePreviewToFinish(in model: StudioModel) async {
+    for _ in 0..<1_000 where model.isStrokePreviewActive {
+        await Task.yield()
     }
 }
 

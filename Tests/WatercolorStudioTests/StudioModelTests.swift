@@ -45,6 +45,88 @@ import WatercolorCore
         #expect(model.error == nil)
     }
 
+    @Test func liveStrokePreviewRendersDuringDragAndCommitsExactlyOneCommand() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var updates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { updates.append($0) }
+        )
+        var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id, x: 64, y: 64)
+
+        model.beginStrokePreview(stroke)
+        #expect(model.isStrokePreviewActive)
+        #expect(model.project.commands.isEmpty)
+        #expect(try renderer.debugPixel(x: 64, y: 64).alpha > 0.05)
+
+        stroke.points.append(StrokePoint(x: 96, y: 64, pressure: 1, tiltX: 0, tiltY: 0, time: 1))
+        model.updateStrokePreview(stroke)
+        #expect(model.project.commands.isEmpty)
+        #expect(try renderer.debugPixel(x: 96, y: 64).alpha > 0.05)
+
+        await model.commitStrokePreview(stroke)
+
+        #expect(!model.isStrokePreviewActive)
+        #expect(model.project.commands == [.stroke(stroke)])
+        #expect(model.rendererProject.commands == [.stroke(stroke)])
+        #expect(updates == [model.project])
+    }
+
+    @Test func cancellingLiveStrokePreviewRestoresTheCommittedRaster() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        let before = try renderer.studioChecksum()
+
+        model.beginStrokePreview(.studioTestStroke(layerID: project.layers[0].id, x: 64, y: 64))
+        #expect(try renderer.debugPixel(x: 64, y: 64).alpha > 0.05)
+
+        model.cancelStrokePreview()
+
+        #expect(!model.isStrokePreviewActive)
+        #expect(model.project.commands.isEmpty)
+        #expect(try renderer.studioChecksum() == before)
+    }
+
+    @Test func failedLiveStrokePreviewNeverCommitsAndRollsBack() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let injectedError = NSError(
+            domain: "StudioModelTests",
+            code: 42,
+            userInfo: [NSLocalizedDescriptionKey: "live preview failed"]
+        )
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugCommandBufferError: { commandBuffer in
+                commandBuffer.label == "Watercolor stroke preview" ? injectedError : commandBuffer.error
+            }
+        )
+        var updates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { updates.append($0) }
+        )
+        let before = try renderer.studioChecksum()
+        let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id, x: 64, y: 64)
+
+        model.beginStrokePreview(stroke)
+        await model.commitStrokePreview(stroke)
+
+        #expect(!model.isStrokePreviewActive)
+        #expect(model.project.commands.isEmpty)
+        #expect(model.rendererProject.commands.isEmpty)
+        #expect(updates.isEmpty)
+        #expect(model.error?.message.contains("live preview failed") == true)
+        #expect(try renderer.studioChecksum() == before)
+    }
+
     @Test func canvasWetnessReflectsCompletedStrokesAndProjectReplay() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()

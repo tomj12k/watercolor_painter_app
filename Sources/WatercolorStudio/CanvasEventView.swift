@@ -11,6 +11,8 @@ struct CanvasStrokeBuilder {
         self.canvasSize = canvasSize
     }
 
+    var currentStroke: StrokeCommand? { stroke }
+
     mutating func begin(
         layerID: UUID,
         tool: PaintTool,
@@ -89,6 +91,7 @@ public final class CanvasEventView: MTKView {
             return
         }
 
+        self.model.cancelStrokePreview()
         strokeBuilder = nil
         panAnchor = nil
         spaceKeyDown = false
@@ -214,21 +217,31 @@ public final class CanvasEventView: MTKView {
             point: strokePoint(from: event)
         )
         strokeBuilder = builder
+        if let stroke = builder.currentStroke {
+            model.beginStrokePreview(stroke)
+        }
     }
 
     private func appendStrokePoint(from event: NSEvent) {
         strokeBuilder?.append(strokePoint(from: event))
+        if let stroke = strokeBuilder?.currentStroke {
+            model.updateStrokePreview(stroke)
+        }
     }
 
     private func completeStroke() {
         guard var builder = strokeBuilder else { return }
         strokeBuilder = nil
         guard let stroke = builder.finish() else { return }
-        model.completeStroke(stroke)
-        requestCanvasDraw()
+        let model = model
+        Task { @MainActor [weak self] in
+            await model.commitStrokePreview(stroke)
+            self?.requestCanvasDraw()
+        }
     }
 
     private func beginPan(with event: NSEvent) {
+        model.cancelStrokePreview()
         strokeBuilder = nil
         panAnchor = convert(event.locationInWindow, from: nil)
     }
