@@ -7,7 +7,8 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "WatercolorCore", targets: ["WatercolorCore"]),
-        .library(name: "WatercolorEngine", targets: ["WatercolorEngine"])
+        .library(name: "WatercolorEngine", targets: ["WatercolorEngine"]),
+        .executable(name: "WatercolorStudio", targets: ["WatercolorStudio"])
     ],
     targets: [
         .target(name: "WatercolorCore"),
@@ -20,10 +21,18 @@ let package = Package(
                 .linkedFramework("MetalKit")
             ]
         ),
+        .executableTarget(
+            name: "WatercolorStudio",
+            dependencies: ["WatercolorCore", "WatercolorEngine"]
+        ),
         .testTarget(name: "WatercolorCoreTests", dependencies: ["WatercolorCore"]),
         .testTarget(
             name: "WatercolorEngineTests",
             dependencies: ["WatercolorCore", "WatercolorEngine"]
+        ),
+        .testTarget(
+            name: "WatercolorStudioTests",
+            dependencies: ["WatercolorCore", "WatercolorEngine", "WatercolorStudio"]
         )
     ]
 )
