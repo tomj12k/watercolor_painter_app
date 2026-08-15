@@ -15,9 +15,16 @@ public struct PaintingDocument: FileDocument {
     public static let readableContentTypes: [UTType] = [.watercolorPainting]
 
     public var project: PaintingProject
+    var needsInitialConfiguration: Bool
 
-    public init(project: PaintingProject = .newDefault()) {
+    public init() {
+        project = .newDefault()
+        needsInitialConfiguration = true
+    }
+
+    public init(project: PaintingProject) {
         self.project = project
+        needsInitialConfiguration = false
     }
 
     public init(configuration: ReadConfiguration) throws {
@@ -25,6 +32,7 @@ public struct PaintingDocument: FileDocument {
             throw DocumentCodecError.malformedData
         }
         project = try PaintingDocumentCodec.decode(data)
+        needsInitialConfiguration = false
     }
 
     public func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {

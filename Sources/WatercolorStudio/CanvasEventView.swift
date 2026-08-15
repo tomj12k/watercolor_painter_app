@@ -85,6 +85,32 @@ public final class CanvasEventView: MTKView {
 
     public override var acceptsFirstResponder: Bool { true }
 
+    var hasTransientInputStateForTesting: Bool {
+        spaceKeyDown || panAnchor != nil || strokeBuilder != nil
+    }
+
+    public override func resignFirstResponder() -> Bool {
+        resetTransientInputState()
+        return super.resignFirstResponder()
+    }
+
+    public override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSWindow.didResignKeyNotification,
+            object: nil
+        )
+        if let window {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(windowDidResignKey),
+                name: NSWindow.didResignKeyNotification,
+                object: window
+            )
+        }
+    }
+
     func synchronize(with model: StudioModel) {
         guard self.model !== model else {
             requestCanvasDraw()
@@ -257,6 +283,17 @@ public final class CanvasEventView: MTKView {
 
     private func endPan() {
         panAnchor = nil
+    }
+
+    @objc private func windowDidResignKey() {
+        resetTransientInputState()
+    }
+
+    private func resetTransientInputState() {
+        model.cancelStrokePreview()
+        strokeBuilder = nil
+        panAnchor = nil
+        spaceKeyDown = false
     }
 
     private func strokePoint(from event: NSEvent) -> StrokePoint {

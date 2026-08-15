@@ -18,10 +18,12 @@ struct WatercolorStudioApp: App {
 struct StudioDocumentView: View {
     @Binding private var document: PaintingDocument
     @StateObject private var host: StudioDocumentHost
+    @State private var showsNewCanvasConfiguration: Bool
 
     init(document: Binding<PaintingDocument>) {
         _document = document
         _host = StateObject(wrappedValue: StudioDocumentHost(document: document))
+        _showsNewCanvasConfiguration = State(initialValue: document.wrappedValue.needsInitialConfiguration)
     }
 
     var body: some View {
@@ -53,6 +55,19 @@ struct StudioDocumentView: View {
                 dismissButton: .default(Text("Dismiss")) { host.dismissFailure() }
             )
         }
+        .sheet(isPresented: $showsNewCanvasConfiguration) {
+            NewCanvasConfigurationView(
+                create: { configuration in
+                    if host.configureNewDocument(configuration) {
+                        showsNewCanvasConfiguration = false
+                    }
+                },
+                useDefault: {
+                    document.needsInitialConfiguration = false
+                    showsNewCanvasConfiguration = false
+                }
+            )
+        }
     }
 
     private var failureBinding: Binding<StudioFailure?> {
@@ -75,6 +90,7 @@ final class StudioDocumentHost: ObservableObject {
     let model: StudioModel?
     @Published private(set) var failure: StudioFailure?
     private var failureSubscription: AnyCancellable?
+    private let document: Binding<PaintingDocument>
 
     init(
         document: Binding<PaintingDocument>,
@@ -82,6 +98,7 @@ final class StudioDocumentHost: ObservableObject {
             try StudioModel(project: project, onDocumentUpdate: onDocumentUpdate)
         }
     ) {
+        self.document = document
         failureSubscription = nil
         do {
             let createdModel = try modelFactory(
@@ -105,6 +122,28 @@ final class StudioDocumentHost: ObservableObject {
     func receiveDocumentProject(_ project: PaintingProject) {
         guard model?.project != project else { return }
         model?.replaceProjectFromDocument(project)
+    }
+
+    @discardableResult
+    func configureNewDocument(_ configuration: NewCanvasConfiguration) -> Bool {
+        do {
+            let project = try configuration.makeProject()
+            guard let model, model.replaceProjectFromDocument(project) else {
+                if failure == nil {
+                    failure = StudioFailure(message: "The new canvas could not be allocated.")
+                }
+                return false
+            }
+            var configuredDocument = document.wrappedValue
+            configuredDocument.project = project
+            configuredDocument.needsInitialConfiguration = false
+            document.wrappedValue = configuredDocument
+            failure = nil
+            return true
+        } catch {
+            failure = StudioFailure(message: error.localizedDescription)
+            return false
+        }
     }
 
     func dismissFailure() {

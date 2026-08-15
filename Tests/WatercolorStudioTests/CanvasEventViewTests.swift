@@ -148,6 +148,40 @@ import WatercolorCore
         #expect(try oldRenderer.debugPixel(x: 128, y: 128, layerID: oldLayer.id).alpha == 0)
         #expect(try newRenderer.debugPixel(x: 128, y: 128, layerID: newLayer.id).alpha > 0.05)
     }
+
+    @Test func losingFocusClearsSpacePanAndCancelsTransientStrokeState() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [PaintLayer(name: "Layer")]
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+        let space = try #require(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: " ",
+            charactersIgnoringModifiers: " ",
+            isARepeat: false,
+            keyCode: 49
+        ))
+        view.keyDown(with: space)
+        view.mouseDown(with: try #require(canvasMouseEvent(.leftMouseDown, timestamp: 0, eventNumber: 0)))
+        #expect(view.hasTransientInputStateForTesting)
+
+        _ = view.resignFirstResponder()
+
+        #expect(!view.hasTransientInputStateForTesting)
+        #expect(!model.isStrokePreviewActive)
+    }
 }
 
 @MainActor

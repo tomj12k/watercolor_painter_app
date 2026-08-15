@@ -83,6 +83,7 @@ public final class StudioModel: ObservableObject {
     @Published public private(set) var capabilities: StudioCapabilities
     @Published public private(set) var canvasWetness: Double
     @Published public private(set) var layerOpacityPreviews: [UUID: Double]
+    @Published public private(set) var recentColors: [PaintColor]
 
     public var onDocumentUpdate: ((PaintingProject) -> Void)?
 
@@ -169,6 +170,7 @@ public final class StudioModel: ObservableObject {
         capabilities = StudioCapabilities(canPaint: true, canUndo: false, canRedo: false)
         canvasWetness = renderer.canvasWetness
         layerOpacityPreviews = [:]
+        recentColors = []
         self.renderer = renderer
         self.pngExportWorker = pngExportWorker
         latestPNGExportID = nil
@@ -315,6 +317,17 @@ public final class StudioModel: ObservableObject {
         )
     }
 
+    public func moveLayer(id: UUID, toLayerID: UUID) {
+        guard id != toLayerID,
+              project.layers.contains(where: { $0.id == id }),
+              let destinationIndex = project.layers.firstIndex(where: { $0.id == toLayerID })
+        else { return }
+        performMetadataEdit(
+            { editor in try editor.moveLayer(id: id, to: destinationIndex) },
+            selecting: { _ in id }
+        )
+    }
+
     public func renameLayer(id: UUID, to name: String) {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return }
@@ -426,6 +439,25 @@ public final class StudioModel: ObservableObject {
 
     public func selectStyle(_ style: WatercolorStyle) {
         brush = brush.applying(style)
+    }
+
+    public func selectPickerColor(_ color: PaintColor) {
+        guard color.red.isFinite, color.green.isFinite, color.blue.isFinite, color.alpha.isFinite else {
+            return
+        }
+        brush.color = color
+        recentColors.removeAll { existing in
+            [
+                abs(existing.red - color.red),
+                abs(existing.green - color.green),
+                abs(existing.blue - color.blue),
+                abs(existing.alpha - color.alpha)
+            ].max()! < 1.0 / 255.0
+        }
+        recentColors.insert(color, at: 0)
+        if recentColors.count > 6 {
+            recentColors.removeLast(recentColors.count - 6)
+        }
     }
 
     @discardableResult

@@ -1014,6 +1014,42 @@ import WatercolorCore
         model.undo()
         #expect(model.rendererCheckpointCountForTesting <= 2)
     }
+
+    @Test func directLayerReorderingMovesTheDraggedLayerAndKeepsItSelected() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let layers = [PaintLayer(name: "Bottom"), PaintLayer(name: "Middle"), PaintLayer(name: "Top")]
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: layers
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+
+        model.moveLayer(id: layers[2].id, toLayerID: layers[0].id)
+
+        #expect(model.project.layers.map(\.id) == [layers[2].id, layers[0].id, layers[1].id])
+        #expect(model.selectedLayerID == layers[2].id)
+        #expect(model.capabilities.canUndo)
+    }
+
+    @Test func pickerColorsPopulateAMostRecentDeduplicatedBoundedList() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        let colors = (0..<7).map { index in
+            PaintColor.fromSRGB(red: Double(index) / 8, green: 0.25, blue: 0.5)
+        }
+
+        colors.forEach(model.selectPickerColor)
+        model.selectPickerColor(colors[3])
+
+        #expect(model.recentColors.count == 6)
+        #expect(model.recentColors.first == colors[3])
+        #expect(model.recentColors.filter { $0 == colors[3] }.count == 1)
+        #expect(model.brush.color == colors[3])
+    }
 }
 
 @MainActor

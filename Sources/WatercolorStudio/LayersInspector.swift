@@ -14,6 +14,14 @@ struct LayersInspector: View {
                 LazyVStack(spacing: 6) {
                     ForEach(Array(model.project.layers.reversed())) { layer in
                         LayerRow(model: model, layerID: layer.id)
+                            .draggable(layer.id.uuidString)
+                            .dropDestination(for: String.self) { identifiers, _ in
+                                guard let identifier = identifiers.first,
+                                      let sourceID = UUID(uuidString: identifier)
+                                else { return false }
+                                model.moveLayer(id: sourceID, toLayerID: layer.id)
+                                return sourceID != layer.id
+                            }
                     }
                 }
                 .padding(.horizontal, 10)

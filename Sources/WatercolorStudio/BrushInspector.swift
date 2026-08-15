@@ -60,6 +60,31 @@ struct BrushInspector: View {
                 }
             }
 
+            if !model.recentColors.isEmpty {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Recent")
+                        .font(.system(size: 10))
+                        .foregroundStyle(StudioPalette.graphite)
+                    HStack(spacing: 7) {
+                        ForEach(Array(model.recentColors.enumerated()), id: \.offset) { _, color in
+                            Button {
+                                model.brush.color = color
+                            } label: {
+                                Circle()
+                                    .fill(Self.swiftUIColor(for: color))
+                                    .frame(width: 19, height: 19)
+                                    .overlay {
+                                        Circle().stroke(StudioPalette.graphite.opacity(0.55), lineWidth: 1)
+                                    }
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Use recent pigment")
+                            .accessibilityLabel("Use recent pigment")
+                        }
+                    }
+                }
+            }
+
             Divider()
                 .overlay(StudioPalette.graphite.opacity(0.24))
 
@@ -142,18 +167,23 @@ struct BrushInspector: View {
             },
             set: { color in
                 guard let converted = NSColor(color).usingColorSpace(.sRGB) else { return }
-                model.brush.color = PaintColor.fromSRGB(
+                model.selectPickerColor(PaintColor.fromSRGB(
                     red: Double(converted.redComponent),
                     green: Double(converted.greenComponent),
                     blue: Double(converted.blueComponent),
                     alpha: Double(converted.alphaComponent)
-                )
+                ))
             }
         )
     }
 
     private static func percent(_ value: Double) -> String {
         "\(Int((value * 100).rounded()))%"
+    }
+
+    private static func swiftUIColor(for color: PaintColor) -> Color {
+        let color = color.convertedToSRGB()
+        return Color(red: color.red, green: color.green, blue: color.blue, opacity: color.alpha)
     }
 
     private static let swatches: [(name: String, color: PaintColor, swiftUIColor: Color)] = [

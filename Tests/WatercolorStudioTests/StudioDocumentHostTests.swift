@@ -1,6 +1,8 @@
+import Metal
 import SwiftUI
 import Testing
 import WatercolorCore
+@testable import WatercolorEngine
 @testable import WatercolorStudio
 
 @Suite @MainActor struct StudioDocumentHostTests {
@@ -75,6 +77,45 @@ import WatercolorCore
         host.dismissFailure()
         #expect(host.failure == nil)
         #expect(model.error == nil)
+    }
+
+    @Test func newCanvasAllocationFailureKeepsTheExistingDocumentAndConfigurationOpen() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioHostTestProject(layerName: "Initial")
+        let document = StudioDocumentBox(PaintingDocument(project: project))
+        let binding = Binding(
+            get: { document.value },
+            set: { document.value = $0 }
+        )
+        let expected = NSError(
+            domain: "StudioDocumentHostTests",
+            code: 23,
+            userInfo: [NSLocalizedDescriptionKey: "canvas texture allocation failed"]
+        )
+        var shouldFail = false
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugCommandBufferError: { commandBuffer in
+                shouldFail && commandBuffer.label == "Watercolor replay" ? expected : commandBuffer.error
+            }
+        )
+        let host = StudioDocumentHost(
+            document: binding,
+            modelFactory: { project, update in
+                StudioModel(project: project, renderer: renderer, onDocumentUpdate: update)
+            }
+        )
+        shouldFail = true
+
+        let configured = host.configureNewDocument(
+            NewCanvasConfiguration(width: 256, height: 256, paper: .rough)
+        )
+
+        #expect(!configured)
+        #expect(document.value.project == project)
+        #expect(host.model?.project == project)
+        #expect(host.failure?.message.contains("canvas texture allocation failed") == true)
     }
 }
 
