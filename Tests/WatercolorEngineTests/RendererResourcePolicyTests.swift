@@ -42,13 +42,13 @@ import Testing
         #expect(estimate.liveBytes == 1_988)
         // One reusable rgba16Float pigment slice and one r16Float wetness slice.
         #expect(estimate.previewBytes == 320)
-        // 32 pixels × 68 texture bytes + 32 × 3 × 4 reduction bytes + 192 metadata + 4 final maximum.
-        #expect(estimate.candidateBytes == 2_756)
-        #expect(estimate.totalBytes == 5_064)
+        // Candidate renderer bytes (2,756) plus its own reusable 320-byte preview pair.
+        #expect(estimate.candidateBytes == 3_076)
+        #expect(estimate.totalBytes == 5_384)
     }
 
     @Test func estimateAtTheBudgetBoundaryIsAdmitted() throws {
-        let policy = RendererResourcePolicy(maximumWorkingSetBytes: 5_064)
+        let policy = RendererResourcePolicy(maximumWorkingSetBytes: 5_384)
 
         let estimate = try policy.admit(
             width: 8,
@@ -57,13 +57,13 @@ import Testing
             structuralCandidateCapacity: 3
         )
 
-        #expect(estimate.totalBytes == 5_064)
+        #expect(estimate.totalBytes == 5_384)
     }
 
     @Test func estimateAboveTheBudgetReportsRequiredAndAvailableBytes() {
-        let policy = RendererResourcePolicy(maximumWorkingSetBytes: 5_063)
+        let policy = RendererResourcePolicy(maximumWorkingSetBytes: 5_383)
 
-        #expect(throws: RendererError.resourceBudgetExceeded(required: 5_064, available: 5_063)) {
+        #expect(throws: RendererError.resourceBudgetExceeded(required: 5_384, available: 5_383)) {
             try policy.admit(
                 width: 8,
                 height: 4,

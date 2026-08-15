@@ -52,10 +52,11 @@ struct RendererResourcePolicy: Sendable {
         let pixelCount = try multiply(width, height)
         let liveBytes = try rendererBytes(pixelCount: pixelCount, layerCapacity: layerCapacity)
         let previewBytes = try multiply(pixelCount, 10)
-        let candidateBytes = try rendererBytes(
+        let candidateRendererBytes = try rendererBytes(
             pixelCount: pixelCount,
             layerCapacity: structuralCandidateCapacity
         )
+        let candidateBytes = try add(candidateRendererBytes, previewBytes)
         let liveAndPreviewBytes = try add(liveBytes, previewBytes)
         let totalBytes = try add(liveAndPreviewBytes, candidateBytes)
 

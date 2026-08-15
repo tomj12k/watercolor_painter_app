@@ -120,7 +120,7 @@ import WatercolorCore
         model.beginStrokePreview(preview)
         await model.waitForStrokePreviewIdle()
         #expect(model.isStrokePreviewActive)
-        #expect(try renderer.debugPixel(x: 64, y: 64).alpha > 0.05)
+        #expect(try renderer.studioChecksum() == checksumBefore)
 
         await model.commitStrokePreview(finalStroke)
 
@@ -143,6 +143,16 @@ import WatercolorCore
             onDocumentUpdate: { updates.append($0) }
         )
         var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id, x: 64, y: 64)
+        stroke.points = (0..<8).map { index in
+            StrokePoint(
+                x: Double(64 + index * 2),
+                y: 64,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 60
+            )
+        }
 
         model.beginStrokePreview(stroke)
         await model.waitForStrokePreviewIdle()
@@ -150,7 +160,19 @@ import WatercolorCore
         #expect(model.project.commands.isEmpty)
         #expect(try renderer.debugPixel(x: 64, y: 64).alpha > 0.05)
 
-        stroke.points.append(StrokePoint(x: 96, y: 64, pressure: 1, tiltX: 0, tiltY: 0, time: 1))
+        let secondBatch: [StrokePoint] = (8..<16).map { index in
+            let x = Double(index * 4 + 48)
+            let time = Double(index) / 60
+            return StrokePoint(
+                x: x,
+                y: 64,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: time
+            )
+        }
+        stroke.points.append(contentsOf: secondBatch)
         model.updateStrokePreview(stroke)
         await model.waitForStrokePreviewIdle()
         #expect(model.project.commands.isEmpty)
@@ -223,6 +245,46 @@ import WatercolorCore
         #expect(try renderer.studioChecksum() == replayed.studioChecksum())
     }
 
+    @Test func wetNonSelectedLayerDoesNotSnapAtPreviewCommit() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let wet = PaintLayer(name: "Wet")
+        let selected = PaintLayer(name: "Selected")
+        var project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .rough,
+            layers: [wet, selected]
+        )
+        project.commands = [.stroke(.studioTestStroke(layerID: wet.id, x: 64, y: 64))]
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        model.selectedLayerID = selected.id
+        let wetnessBefore = try renderer.debugWetness(x: 64, y: 64, layerID: wet.id)
+        var preview = StrokeCommand.studioTestStroke(layerID: selected.id, x: 112, y: 160)
+        preview.points = (0..<8).map { index in
+            StrokePoint(
+                x: Double(112 + index * 8),
+                y: 160,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 60
+            )
+        }
+
+        model.beginStrokePreview(preview)
+        await model.waitForStrokePreviewIdle()
+        let previewChecksum = try renderer.studioChecksum()
+        let previewWetness = try renderer.debugWetness(x: 64, y: 64, layerID: wet.id)
+
+        #expect(previewWetness < wetnessBefore)
+        await model.commitStrokePreview(preview)
+        let replayed = try WatercolorRenderer(project: model.project, device: device)
+
+        #expect(try renderer.studioChecksum() == previewChecksum)
+        #expect(try renderer.debugWetness(x: 64, y: 64, layerID: wet.id) == previewWetness)
+        #expect(try renderer.studioChecksum() == replayed.studioChecksum())
+    }
+
     @Test func rapidMouseStyleUpdatesCoalesceGPUPreviewWork() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         var project = PaintingProject.studioTestProject()
@@ -289,19 +351,21 @@ import WatercolorCore
 
         model.beginStrokePreview(stroke)
         await model.waitForStrokePreviewIdle()
-        stroke.points.append(StrokePoint(
-            x: 356,
-            y: 400,
-            pressure: 1,
-            tiltX: 0,
-            tiltY: 0,
-            time: 32.0 / 120
-        ))
+        stroke.points.append(contentsOf: (32..<40).map { index in
+            StrokePoint(
+                x: Double(100 + index * 8),
+                y: 400,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 120
+            )
+        })
         model.updateStrokePreview(stroke)
         await model.waitForStrokePreviewIdle()
 
         #expect(renderer.debugLastStrokeDispatch.stampBatchCount == 1)
-        #expect(renderer.debugLastStrokeDispatch.simulationStepCount == 2)
+        #expect(renderer.debugLastStrokeDispatch.simulationStepCount == 16)
         model.cancelStrokePreview()
     }
 
@@ -312,7 +376,18 @@ import WatercolorCore
         let model = StudioModel(project: project, renderer: renderer)
         let before = try renderer.studioChecksum()
 
-        model.beginStrokePreview(.studioTestStroke(layerID: project.layers[0].id, x: 64, y: 64))
+        var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id, x: 64, y: 64)
+        stroke.points = (0..<8).map { index in
+            StrokePoint(
+                x: Double(64 + index * 2),
+                y: 64,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 60
+            )
+        }
+        model.beginStrokePreview(stroke)
         await model.waitForStrokePreviewIdle()
         #expect(try renderer.debugPixel(x: 64, y: 64).alpha > 0.05)
 
@@ -345,7 +420,17 @@ import WatercolorCore
             onDocumentUpdate: { updates.append($0) }
         )
         let before = try renderer.studioChecksum()
-        let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id, x: 64, y: 64)
+        var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id, x: 64, y: 64)
+        stroke.points = (0..<8).map { index in
+            StrokePoint(
+                x: Double(64 + index * 2),
+                y: 64,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 60
+            )
+        }
 
         model.beginStrokePreview(stroke)
         await model.commitStrokePreview(stroke)
@@ -387,14 +472,16 @@ import WatercolorCore
             x: 24,
             y: 128
         )
-        hostile.points.append(StrokePoint(
-            x: 232,
-            y: 128,
-            pressure: 1,
-            tiltX: 0,
-            tiltY: 0,
-            time: 1
-        ))
+        hostile.points = (0..<8).map { index in
+            StrokePoint(
+                x: 24 + Double(index) * 208 / 7,
+                y: 128,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 60
+            )
+        }
 
         model.beginStrokePreview(hostile)
         await model.waitForStrokePreviewIdle()
