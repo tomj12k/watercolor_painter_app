@@ -47,16 +47,51 @@ public struct ProjectEditor: Sendable {
         recordChange(before: before)
     }
 
-    public mutating func duplicateLayer(id: UUID) throws {
+    public mutating func duplicateLayer(id: UUID, named name: String? = nil) throws {
         let index = try layerIndex(for: id)
         try ensureLayerCapacity()
 
         let before = project
         let source = project.layers[index]
         project.layers.insert(
-            PaintLayer(name: source.name, isVisible: source.isVisible, opacity: source.opacity),
+            PaintLayer(name: name ?? source.name, isVisible: source.isVisible, opacity: source.opacity),
             at: index + 1
         )
+        recordChange(before: before)
+    }
+
+    public mutating func renameLayer(id: UUID, to name: String) throws {
+        let index = try layerIndex(for: id)
+        guard project.layers[index].name != name else { return }
+
+        let before = project
+        project.layers[index].name = name
+        recordChange(before: before)
+    }
+
+    public mutating func setLayerVisibility(id: UUID, isVisible: Bool) throws {
+        let index = try layerIndex(for: id)
+        guard project.layers[index].isVisible != isVisible else { return }
+
+        let before = project
+        project.layers[index].isVisible = isVisible
+        recordChange(before: before)
+    }
+
+    public mutating func setLayerOpacity(id: UUID, opacity: Double) throws {
+        let index = try layerIndex(for: id)
+        guard project.layers[index].opacity != opacity else { return }
+
+        let before = project
+        project.layers[index].opacity = opacity
+        recordChange(before: before)
+    }
+
+    public mutating func setPaper(_ paper: PaperTexture) {
+        guard project.paper != paper else { return }
+
+        let before = project
+        project.paper = paper
         recordChange(before: before)
     }
 

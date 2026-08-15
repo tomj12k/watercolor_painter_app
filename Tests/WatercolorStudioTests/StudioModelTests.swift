@@ -211,6 +211,435 @@ import WatercolorCore
         #expect(model.error?.message.contains(missingLayerID.uuidString) == true)
         #expect(!model.capabilities.canUndo)
     }
+
+    @Test func addingALayerSelectsItAndPublishesTheReplayedProject() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+
+        model.addLayer()
+
+        #expect(model.project.layers.map(\.name) == ["Layer 1", "Layer 2"])
+        #expect(model.selectedLayerID == model.project.layers[1].id)
+        #expect(renderer.project == model.project)
+        #expect(documentUpdates == [model.project])
+        #expect(model.error == nil)
+        #expect(model.capabilities.canUndo)
+    }
+
+    @Test func duplicatingTheSelectedLayerSelectsTheCopy() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.studioTestProject()
+        project.layers[0].isVisible = false
+        project.layers[0].opacity = 0.45
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+
+        model.duplicateSelectedLayer()
+
+        #expect(model.project.layers.count == 2)
+        #expect(model.project.layers[1].name == "Layer 1 copy")
+        #expect(model.project.layers[1].isVisible == false)
+        #expect(model.project.layers[1].opacity == 0.45)
+        #expect(model.project.layers[1].id != project.layers[0].id)
+        #expect(model.selectedLayerID == model.project.layers[1].id)
+        #expect(renderer.project == model.project)
+        #expect(documentUpdates == [model.project])
+        #expect(model.capabilities.canUndo)
+    }
+
+    @Test func deletingTheSelectedLayerKeepsSelectionValid() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.studioTestProject()
+        let middle = PaintLayer(name: "Middle")
+        let top = PaintLayer(name: "Top")
+        project.layers.append(contentsOf: [middle, top])
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+        model.selectedLayerID = middle.id
+
+        model.deleteSelectedLayer()
+
+        #expect(model.project.layers.map(\.id) == [project.layers[0].id, top.id])
+        #expect(model.selectedLayerID == top.id)
+        #expect(model.capabilities.canPaint)
+        #expect(renderer.project == model.project)
+        #expect(documentUpdates == [model.project])
+        #expect(model.capabilities.canUndo)
+    }
+
+    @Test func movingTheSelectedLayerUpChangesItsStackPosition() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.studioTestProject()
+        let middle = PaintLayer(name: "Middle")
+        let top = PaintLayer(name: "Top")
+        project.layers.append(contentsOf: [middle, top])
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+
+        model.moveSelectedLayerUp()
+
+        #expect(model.project.layers.map(\.id) == [middle.id, project.layers[0].id, top.id])
+        #expect(model.selectedLayerID == project.layers[0].id)
+        #expect(renderer.project == model.project)
+        #expect(documentUpdates == [model.project])
+        #expect(model.capabilities.canUndo)
+    }
+
+    @Test func movingTheSelectedLayerDownChangesItsStackPosition() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.studioTestProject()
+        let middle = PaintLayer(name: "Middle")
+        let top = PaintLayer(name: "Top")
+        project.layers.append(contentsOf: [middle, top])
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        model.selectedLayerID = top.id
+
+        model.moveSelectedLayerDown()
+
+        #expect(model.project.layers.map(\.id) == [project.layers[0].id, top.id, middle.id])
+        #expect(model.selectedLayerID == top.id)
+        #expect(renderer.project == model.project)
+    }
+
+    @Test func renamingALayerPublishesATrimmedNonemptyName() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+
+        model.renameLayer(id: project.layers[0].id, to: "  Sky wash  ")
+
+        #expect(model.project.layers[0].name == "Sky wash")
+        #expect(model.selectedLayerID == project.layers[0].id)
+        #expect(renderer.project == model.project)
+        #expect(documentUpdates == [model.project])
+    }
+
+    @Test func changingLayerVisibilityPublishesTheReplayedCompositeMetadata() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+
+        model.setLayerVisibility(id: project.layers[0].id, isVisible: false)
+
+        #expect(model.project.layers[0].isVisible == false)
+        #expect(renderer.project == model.project)
+        #expect(documentUpdates == [model.project])
+    }
+
+    @Test func changingLayerOpacityClampsItToTheRenderersSupportedRange() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+
+        model.setLayerOpacity(id: project.layers[0].id, opacity: 1.5)
+        #expect(model.project.layers[0].opacity == 1)
+        #expect(renderer.project.layers[0].opacity == 1)
+
+        model.setLayerOpacity(id: project.layers[0].id, opacity: -0.25)
+        #expect(model.project.layers[0].opacity == 0)
+        #expect(renderer.project.layers[0].opacity == 0)
+    }
+
+    @Test func changingLayerOpacityIgnoresANonfiniteValue() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+
+        model.setLayerOpacity(id: project.layers[0].id, opacity: .nan)
+
+        #expect(model.project == project)
+        #expect(renderer.project == project)
+        #expect(documentUpdates.isEmpty)
+    }
+
+    @Test func mergingTheSelectedLayerDownSelectsTheDestinationLayer() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.studioTestProject()
+        let top = PaintLayer(name: "Top")
+        project.layers.append(top)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+        model.selectedLayerID = top.id
+
+        model.mergeSelectedLayerDown()
+
+        #expect(model.project.layers.map(\.id) == [project.layers[0].id])
+        #expect(model.selectedLayerID == project.layers[0].id)
+        #expect(model.project.commands.count == 1)
+        if case let .mergeDown(command) = model.project.commands[0] {
+            #expect(command.sourceLayerID == top.id)
+            #expect(command.destinationLayerID == project.layers[0].id)
+        } else {
+            Issue.record("Expected a merge-down command")
+        }
+        #expect(renderer.project == model.project)
+        #expect(documentUpdates == [model.project])
+    }
+
+    @Test func clearingTheSelectedLayerRecordsAndReplaysTheCommand() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+
+        model.clearSelectedLayer()
+
+        #expect(model.project.commands.count == 1)
+        if case let .clearLayer(command) = model.project.commands[0] {
+            #expect(command.layerID == project.layers[0].id)
+        } else {
+            Issue.record("Expected a clear-layer command")
+        }
+        #expect(model.selectedLayerID == project.layers[0].id)
+        #expect(renderer.project == model.project)
+        #expect(documentUpdates == [model.project])
+    }
+
+    @Test func selectingPaperPublishesAndReplaysTheProject() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+
+        model.selectPaper(.rough)
+
+        #expect(model.project.paper == .rough)
+        #expect(model.selectedLayerID == project.layers[0].id)
+        #expect(renderer.project == model.project)
+        #expect(documentUpdates == [model.project])
+    }
+
+    @Test func selectingTheCurrentPaperDoesNotPublishANoOpEdit() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+
+        model.selectPaper(project.paper)
+
+        #expect(model.project == project)
+        #expect(documentUpdates.isEmpty)
+        #expect(!model.capabilities.canUndo)
+    }
+
+    @Test func brushSizeAdjustmentsStayWithinThePaintableRange() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+
+        model.adjustBrushSize(by: -100)
+        #expect(model.brush.size == 1)
+
+        model.adjustBrushSize(by: 1_000)
+        #expect(model.brush.size == 300)
+    }
+
+    @Test func selectingAStyleAppliesItsWatercolorParameters() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        model.brush.color = PaintColor(red: 0.1, green: 0.2, blue: 0.3)
+        model.brush.shape = .fan
+
+        model.selectStyle(.wetOnWet)
+
+        #expect(model.brush.style == .wetOnWet)
+        #expect(model.brush.opacity == 0.3)
+        #expect(model.brush.flow == 0.5)
+        #expect(model.brush.water == 0.9)
+        #expect(model.brush.edgeBloom == 0.8)
+        #expect(model.brush.shape == .fan)
+        #expect(model.brush.color == PaintColor(red: 0.1, green: 0.2, blue: 0.3))
+    }
+
+    @Test func toolShortcutsSelectEveryPaintingTool() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        let cases: [(String, PaintTool)] = [
+            ("B", .brush),
+            ("e", .eraser),
+            ("W", .water),
+            ("s", .smudge),
+            ("M", .smear),
+            ("d", .dry)
+        ]
+
+        for (shortcut, expectedTool) in cases {
+            #expect(model.selectTool(forShortcut: shortcut))
+            #expect(model.selectedTool == expectedTool)
+        }
+
+        #expect(!model.selectTool(forShortcut: "x"))
+        #expect(model.selectedTool == .dry)
+    }
+
+    @Test func fittingTheCanvasRestoresTheAspectFitViewport() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        model.zoom = 4.25
+        model.pan = CGSize(width: 120, height: -45)
+
+        model.fitCanvas()
+
+        #expect(model.zoom == 1)
+        #expect(model.pan == .zero)
+    }
+
+    @Test func deferredCommandsExposeTheirRequestWithoutMutatingTheProject() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+
+        model.requestUndo()
+        #expect(model.requestedAction == .undo)
+        model.requestRedo()
+        #expect(model.requestedAction == .redo)
+        model.requestDrySelectedLayer()
+        #expect(model.requestedAction == .dryLayer(project.layers[0].id))
+        model.requestPNGExport()
+        #expect(model.requestedAction == .exportPNG)
+        #expect(model.project == project)
+    }
+
+    @Test func layerActionAvailabilityReflectsSelectionAndLayerLimits() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+
+        #expect(model.canAddLayer)
+        #expect(model.canDuplicateSelectedLayer)
+        #expect(!model.canDeleteSelectedLayer)
+        #expect(!model.canMoveSelectedLayerUp)
+        #expect(!model.canMoveSelectedLayerDown)
+        #expect(!model.canMergeSelectedLayerDown)
+
+        model.selectedLayerID = UUID()
+        #expect(!model.canDuplicateSelectedLayer)
+    }
+
+    @Test func dismissingTheAlertClearsTheIdentifiableFailure() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        model.completeStroke(.studioTestStroke(layerID: UUID()))
+        #expect(model.error != nil)
+
+        model.dismissError()
+
+        #expect(model.error == nil)
+    }
+
+    @Test func failedStructuralReplayPreservesModelRendererSelectionAndDocument() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let injectedError = NSError(
+            domain: "StudioModelTests",
+            code: 8,
+            userInfo: [NSLocalizedDescriptionKey: "deterministic structural replay failure"]
+        )
+        var shouldFail = false
+        var failedBuffer: MTLCommandBuffer?
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugCommandBufferError: { commandBuffer in
+                if shouldFail, commandBuffer.label == "Watercolor replay", failedBuffer == nil {
+                    failedBuffer = commandBuffer
+                }
+                guard let failedBuffer, commandBuffer === failedBuffer else {
+                    return commandBuffer.error
+                }
+                return injectedError
+            }
+        )
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+        shouldFail = true
+
+        model.addLayer()
+
+        #expect(model.project == project)
+        #expect(renderer.project == project)
+        #expect(model.selectedLayerID == project.layers[0].id)
+        #expect(documentUpdates.isEmpty)
+        #expect(!model.capabilities.canUndo)
+        #expect(model.error?.message.contains("deterministic structural replay failure") == true)
+    }
 }
 
 @MainActor

@@ -27,8 +27,17 @@ public struct StudioFailure: Identifiable, Equatable, Sendable {
     }
 }
 
+public enum StudioActionRequest: Equatable, Sendable {
+    case undo
+    case redo
+    case dryLayer(UUID)
+    case exportPNG
+}
+
 @MainActor
 public final class StudioModel: ObservableObject {
+    public static let brushSizeRange = 1.0...300.0
+
     @Published public private(set) var project: PaintingProject
     @Published public var selectedLayerID: UUID {
         didSet { refreshCapabilities() }
@@ -39,8 +48,35 @@ public final class StudioModel: ObservableObject {
     @Published public var pan: CGSize
     @Published public private(set) var error: StudioFailure?
     @Published public private(set) var capabilities: StudioCapabilities
+    @Published public private(set) var requestedAction: StudioActionRequest?
 
     public var onDocumentUpdate: ((PaintingProject) -> Void)?
+
+    public var canAddLayer: Bool {
+        project.layers.count < PaintingProject.maximumLayerCount
+    }
+
+    public var canDuplicateSelectedLayer: Bool {
+        canAddLayer && selectedLayerIndex != nil
+    }
+
+    public var canDeleteSelectedLayer: Bool {
+        project.layers.count > 1 && selectedLayerIndex != nil
+    }
+
+    public var canMoveSelectedLayerUp: Bool {
+        guard let selectedLayerIndex else { return false }
+        return selectedLayerIndex < project.layers.count - 1
+    }
+
+    public var canMoveSelectedLayerDown: Bool {
+        guard let selectedLayerIndex else { return false }
+        return selectedLayerIndex > 0
+    }
+
+    public var canMergeSelectedLayerDown: Bool {
+        canMoveSelectedLayerDown
+    }
 
     private let renderer: WatercolorRenderer
     private let canvasDelegate: CanvasRendererDelegate
@@ -68,6 +104,7 @@ public final class StudioModel: ObservableObject {
         pan = .zero
         error = nil
         capabilities = StudioCapabilities(canPaint: true, canUndo: false, canRedo: false)
+        requestedAction = nil
         self.renderer = renderer
         canvasDelegate = CanvasRendererDelegate(renderer: renderer)
         self.onDocumentUpdate = onDocumentUpdate
@@ -94,6 +131,178 @@ public final class StudioModel: ObservableObject {
         }
     }
 
+    public func addLayer() {
+        guard canAddLayer else { return }
+        let name = nextLayerName()
+        performProjectEdit(
+            { editor in try editor.addLayer(named: name) },
+            selecting: { $0.layers.last?.id }
+        )
+    }
+
+    public func duplicateSelectedLayer() {
+        guard canDuplicateSelectedLayer, let selectedIndex = selectedLayerIndex else { return }
+        let name = "\(project.layers[selectedIndex].name) copy"
+        performProjectEdit(
+            { editor in
+                try editor.duplicateLayer(id: selectedLayerID, named: name)
+            },
+            selecting: { project in
+                let duplicateIndex = selectedIndex + 1
+                guard project.layers.indices.contains(duplicateIndex) else { return nil }
+                return project.layers[duplicateIndex].id
+            }
+        )
+    }
+
+    public func deleteSelectedLayer() {
+        guard canDeleteSelectedLayer, let selectedIndex = selectedLayerIndex else { return }
+        let layerID = selectedLayerID
+        performProjectEdit(
+            { editor in try editor.removeLayer(id: layerID) },
+            selecting: { project in
+                let replacementIndex = min(selectedIndex, project.layers.count - 1)
+                return project.layers[replacementIndex].id
+            }
+        )
+    }
+
+    public func moveSelectedLayerUp() {
+        guard let selectedLayerIndex, canMoveSelectedLayerUp else { return }
+        let layerID = selectedLayerID
+        performProjectEdit(
+            { editor in try editor.moveLayer(id: layerID, to: selectedLayerIndex + 1) },
+            selecting: { _ in layerID }
+        )
+    }
+
+    public func moveSelectedLayerDown() {
+        guard let selectedLayerIndex, canMoveSelectedLayerDown else { return }
+        let layerID = selectedLayerID
+        performProjectEdit(
+            { editor in try editor.moveLayer(id: layerID, to: selectedLayerIndex - 1) },
+            selecting: { _ in layerID }
+        )
+    }
+
+    public func renameLayer(id: UUID, to name: String) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return }
+        let selectedLayerID = selectedLayerID
+        performProjectEdit(
+            { editor in try editor.renameLayer(id: id, to: trimmedName) },
+            selecting: { project in
+                project.layers.first(where: { $0.id == selectedLayerID })?.id
+            }
+        )
+    }
+
+    public func setLayerVisibility(id: UUID, isVisible: Bool) {
+        let selectedLayerID = selectedLayerID
+        performProjectEdit(
+            { editor in try editor.setLayerVisibility(id: id, isVisible: isVisible) },
+            selecting: { project in
+                project.layers.first(where: { $0.id == selectedLayerID })?.id
+            }
+        )
+    }
+
+    public func setLayerOpacity(id: UUID, opacity: Double) {
+        guard opacity.isFinite else { return }
+        let clampedOpacity = min(max(opacity, 0), 1)
+        let selectedLayerID = selectedLayerID
+        performProjectEdit(
+            { editor in try editor.setLayerOpacity(id: id, opacity: clampedOpacity) },
+            selecting: { project in
+                project.layers.first(where: { $0.id == selectedLayerID })?.id
+            }
+        )
+    }
+
+    public func mergeSelectedLayerDown() {
+        guard let selectedLayerIndex, canMergeSelectedLayerDown else { return }
+        let sourceLayerID = selectedLayerID
+        let destinationLayerID = project.layers[selectedLayerIndex - 1].id
+        performProjectEdit(
+            { editor in try editor.mergeDown(id: sourceLayerID) },
+            selecting: { _ in destinationLayerID }
+        )
+    }
+
+    public func clearSelectedLayer() {
+        guard selectedLayerIndex != nil else { return }
+        let layerID = selectedLayerID
+        performProjectEdit(
+            { editor in editor.append(.clearLayer(LayerCommand(layerID: layerID))) },
+            selecting: { _ in layerID }
+        )
+    }
+
+    public func selectPaper(_ paper: PaperTexture) {
+        let selectedLayerID = selectedLayerID
+        performProjectEdit(
+            { editor in editor.setPaper(paper) },
+            selecting: { project in
+                project.layers.first(where: { $0.id == selectedLayerID })?.id
+            }
+        )
+    }
+
+    public func setBrushSize(_ size: Double) {
+        guard size.isFinite else { return }
+        brush.size = min(max(size, Self.brushSizeRange.lowerBound), Self.brushSizeRange.upperBound)
+    }
+
+    public func adjustBrushSize(by amount: Double) {
+        setBrushSize(brush.size + amount)
+    }
+
+    public func selectStyle(_ style: WatercolorStyle) {
+        brush = brush.applying(style)
+    }
+
+    @discardableResult
+    public func selectTool(forShortcut shortcut: String) -> Bool {
+        let tool: PaintTool
+        switch shortcut.lowercased() {
+        case "b": tool = .brush
+        case "e": tool = .eraser
+        case "w": tool = .water
+        case "s": tool = .smudge
+        case "m": tool = .smear
+        case "d": tool = .dry
+        default: return false
+        }
+        selectedTool = tool
+        return true
+    }
+
+    public func fitCanvas() {
+        zoom = 1
+        pan = .zero
+    }
+
+    public func requestUndo() {
+        requestedAction = .undo
+    }
+
+    public func requestRedo() {
+        requestedAction = .redo
+    }
+
+    public func requestDrySelectedLayer() {
+        guard selectedLayerIndex != nil else { return }
+        requestedAction = .dryLayer(selectedLayerID)
+    }
+
+    public func requestPNGExport() {
+        requestedAction = .exportPNG
+    }
+
+    public func dismissError() {
+        error = nil
+    }
+
     public func configureCanvas(_ view: MTKView) {
         view.device = renderer.renderedTexture.device
         view.colorPixelFormat = .bgra8Unorm
@@ -114,6 +323,44 @@ public final class StudioModel: ObservableObject {
         project = editor.project
         refreshCapabilities()
         onDocumentUpdate?(project)
+    }
+
+    private func performProjectEdit(
+        _ edit: (inout ProjectEditor) throws -> Void,
+        selecting selection: (PaintingProject) -> UUID?
+    ) {
+        let previousProject = project
+        var updatedEditor = editor
+
+        do {
+            try edit(&updatedEditor)
+            let updatedProject = updatedEditor.project
+            guard updatedProject != previousProject else { return }
+            try renderer.replay(project: updatedProject)
+            editor = updatedEditor
+            project = updatedProject
+            selectedLayerID = selection(updatedProject) ?? selectedLayerID
+            refreshCapabilities()
+            onDocumentUpdate?(project)
+            error = nil
+        } catch {
+            let failure = StudioFailure(message: error.localizedDescription)
+            try? renderer.replay(project: previousProject)
+            self.error = failure
+        }
+    }
+
+    private func nextLayerName() -> String {
+        let existingNames = Set(project.layers.map(\.name))
+        var number = project.layers.count + 1
+        while existingNames.contains("Layer \(number)") {
+            number += 1
+        }
+        return "Layer \(number)"
+    }
+
+    private var selectedLayerIndex: Int? {
+        project.layers.firstIndex(where: { $0.id == selectedLayerID })
     }
 
     private func refreshCapabilities() {
