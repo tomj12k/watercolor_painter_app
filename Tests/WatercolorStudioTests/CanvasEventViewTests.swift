@@ -75,6 +75,35 @@ import WatercolorCore
         #expect(coarseStroke.points.map(\.x) == fineStroke.points.map(\.x))
     }
 
+    @Test func equivalentCoarseAndFineCorneredEventsProduceTheSameGeometricStroke() throws {
+        var brush = BrushSettings.default
+        brush.size = 100
+        let start = StrokePoint(x: 0, y: 0, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
+
+        var coarse = CanvasStrokeBuilder(canvasSize: .init(width: 1600, height: 1200))
+        coarse.begin(layerID: UUID(), tool: .brush, brush: brush, point: start)
+        _ = coarse.append(.init(x: 36, y: 0, pressure: 1, tiltX: 0, tiltY: 0, time: 1))
+        _ = coarse.append(.init(x: 36, y: 36, pressure: 1, tiltX: 0, tiltY: 0, time: 2))
+
+        var fine = CanvasStrokeBuilder(canvasSize: .init(width: 1600, height: 1200))
+        fine.begin(layerID: UUID(), tool: .brush, brush: brush, point: start)
+        for x in 1...36 {
+            _ = fine.append(.init(x: Double(x), y: 0, pressure: 1, tiltX: 0, tiltY: 0, time: Double(x) / 36))
+        }
+        for y in 1...36 {
+            _ = fine.append(.init(x: 36, y: Double(y), pressure: 1, tiltX: 0, tiltY: 0, time: 1 + Double(y) / 36))
+        }
+
+        let coarseResult = coarse.finish()
+        let fineResult = fine.finish()
+        let coarseStroke = try #require(coarseResult)
+        let fineStroke = try #require(fineResult)
+        #expect(coarseStroke.points.count == fineStroke.points.count)
+        #expect(zip(coarseStroke.points, fineStroke.points).allSatisfy { coarsePoint, finePoint in
+            coarsePoint.x == finePoint.x && coarsePoint.y == finePoint.y
+        })
+    }
+
     @Test func pressureDoesNotChangeSamplingCount() throws {
         var brush = BrushSettings.default
         brush.size = 100
@@ -118,6 +147,52 @@ import WatercolorCore
         #expect(appendResult.isExhausted)
         let completion = builder.finish(at: nil)
         #expect(completion.isExhausted)
+    }
+
+    @Test func exactlyFullStrokeCompletesWithoutExhaustion() throws {
+        var brush = BrushSettings.default
+        brush.size = 100
+        var builder = CanvasStrokeBuilder(
+            canvasSize: .init(width: 1600, height: 1200),
+            maximumPointCount: 3
+        )
+        builder.begin(
+            layerID: UUID(), tool: .brush, brush: brush,
+            point: .init(x: 0, y: 100, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
+        )
+
+        let append = builder.append(
+            .init(x: 36, y: 100, pressure: 1, tiltX: 0, tiltY: 0, time: 2)
+        )
+        let completion = builder.finish(at: .init(
+            x: 36, y: 100, pressure: 1, tiltX: 0, tiltY: 0, time: 3
+        ))
+        let stroke = try #require(completion.stroke)
+
+        #expect(!append.isExhausted)
+        #expect(!completion.isExhausted)
+        #expect(stroke.points.map(\.x) == [0, 18, 36])
+    }
+
+    @Test func duplicatePointerUpAtFullCapacityUpdatesTheStoredFields() throws {
+        var builder = CanvasStrokeBuilder(
+            canvasSize: .init(width: 1600, height: 1200),
+            maximumPointCount: 1
+        )
+        builder.begin(
+            layerID: UUID(), tool: .brush, brush: .default,
+            point: .init(x: 20, y: 30, pressure: 0, tiltX: 0, tiltY: 0, time: 0)
+        )
+
+        let completion = builder.finish(at: .init(
+            x: 20, y: 30, pressure: 1, tiltX: 0.75, tiltY: -0.5, time: 2
+        ))
+        let stroke = try #require(completion.stroke)
+
+        #expect(!completion.isExhausted)
+        #expect(stroke.points == [
+            StrokePoint(x: 20, y: 30, pressure: 1, tiltX: 0.75, tiltY: -0.5, time: 2)
+        ])
     }
 
     @Test func duplicateMouseAndTabletSamplesDoNotCreateExtraPointsOrCommands() throws {
@@ -165,7 +240,28 @@ import WatercolorCore
 
         let completion = builder.finish(at: nil)
         let stroke = try #require(completion.stroke)
-        #expect(stroke.points.count == 1)
+        #expect(stroke.points == [
+            StrokePoint(x: 200, y: 300, pressure: 1, tiltX: 1, tiltY: -1, time: 1)
+        ])
+    }
+
+    @Test func zeroMotionInputBecomesTheAnchorForLaterGeometricSampling() throws {
+        var brush = BrushSettings.default
+        brush.size = 100
+        var builder = CanvasStrokeBuilder(canvasSize: .init(width: 1600, height: 1200))
+        builder.begin(
+            layerID: UUID(), tool: .brush, brush: brush,
+            point: .init(x: 0, y: 100, pressure: 0, tiltX: 0, tiltY: 0, time: 0)
+        )
+        _ = builder.append(.init(x: 0, y: 100, pressure: 1, tiltX: 0.5, tiltY: -0.5, time: 1))
+        _ = builder.append(.init(x: 18, y: 100, pressure: 1, tiltX: 0.5, tiltY: -0.5, time: 3))
+
+        let completion = builder.finish()
+        let stroke = try #require(completion)
+        #expect(stroke.points == [
+            StrokePoint(x: 0, y: 100, pressure: 0, tiltX: 0, tiltY: 0, time: 0),
+            StrokePoint(x: 18, y: 100, pressure: 1, tiltX: 0.5, tiltY: -0.5, time: 3)
+        ])
     }
 }
 
@@ -340,6 +436,96 @@ import WatercolorCore
         await commit.value
         #expect(model.project.commands == [.stroke(first)])
     }
+
+    @Test func zeroMotionEventsDoNotScheduleAdditionalPreviewUpdates() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [PaintLayer(name: "Layer")]
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let updates = CanvasPreviewUpdateCounter()
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, stroke, token in
+                    await updates.recordUpdate()
+                    try await renderer.updateStrokePreview(stroke, token: token)
+                },
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
+                }
+            )
+        )
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+        let down = try #require(canvasMouseEvent(.leftMouseDown, timestamp: 0, eventNumber: 0))
+        let duplicate = try #require(canvasMouseEvent(.leftMouseDragged, timestamp: 1, eventNumber: 1))
+
+        view.mouseDown(with: down)
+        await model.waitForStrokePreviewIdle()
+        view.mouseDragged(with: duplicate)
+        await model.waitForStrokePreviewIdle()
+
+        #expect(await updates.count == 1)
+    }
+
+    @Test func aggregatePointExhaustionCancelsThePreviewAndAllowsRecovery() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let layer = PaintLayer(name: "Layer")
+        let existingStroke = StrokeCommand(
+            layerID: layer.id,
+            tool: .brush,
+            brush: .default,
+            points: [StrokePoint(x: 16, y: 16, pressure: 1, tiltX: 0, tiltY: 0, time: 0)]
+        )
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [layer],
+            commands: [.stroke(existingStroke)]
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            maximumTotalStrokePointCount: 2
+        )
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+        let committedAlpha = try renderer.debugPixel(x: 16, y: 16, layerID: layer.id).alpha
+        #expect(model.maximumPointCountForNewStroke == 1)
+
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown, timestamp: 1, eventNumber: 1, location: .init(x: 64, y: 64)
+        )))
+        await model.waitForStrokePreviewIdle()
+        view.mouseDragged(with: try #require(canvasMouseEvent(
+            .leftMouseDragged, timestamp: 2, eventNumber: 2, location: .init(x: 200, y: 64)
+        )))
+
+        #expect(!model.isStrokePreviewActive)
+        #expect(!view.hasTransientInputStateForTesting)
+        #expect(model.project == project)
+        #expect(try renderer.debugPixel(x: 16, y: 16, layerID: layer.id).alpha == committedAlpha)
+
+        let recovery = try #require(canvasMouseEvent(
+            .leftMouseDown, timestamp: 3, eventNumber: 3, location: .init(x: 96, y: 96)
+        ))
+        let recoveryUp = try #require(canvasMouseEvent(
+            .leftMouseUp, timestamp: 4, eventNumber: 4, location: .init(x: 96, y: 96)
+        ))
+        view.mouseDown(with: recovery)
+        view.mouseUp(with: recoveryUp)
+        await waitForStrokePreviewToFinish(in: model)
+
+        #expect(model.project.commands.count == 2)
+        #expect(try renderer.debugPixel(x: 96, y: 160, layerID: layer.id).alpha > 0.05)
+    }
 }
 
 private actor CanvasPreviewSuspension {
@@ -369,6 +555,14 @@ private actor CanvasPreviewSuspension {
     }
 }
 
+private actor CanvasPreviewUpdateCounter {
+    private(set) var count = 0
+
+    func recordUpdate() {
+        count += 1
+    }
+}
+
 @MainActor
 private func waitForStrokePreviewToFinish(in model: StudioModel) async {
     for _ in 0..<1_000 where model.isStrokePreviewActive {
@@ -380,11 +574,12 @@ private func waitForStrokePreviewToFinish(in model: StudioModel) async {
 private func canvasMouseEvent(
     _ type: NSEvent.EventType,
     timestamp: TimeInterval,
-    eventNumber: Int
+    eventNumber: Int,
+    location: CGPoint = CGPoint(x: 128, y: 128)
 ) -> NSEvent? {
     NSEvent.mouseEvent(
         with: type,
-        location: CGPoint(x: 128, y: 128),
+        location: location,
         modifierFlags: [],
         timestamp: timestamp,
         windowNumber: 0,

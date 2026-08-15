@@ -198,6 +198,7 @@ public final class StudioModel: ObservableObject {
     private var strokePreviewDrainToken: StudioStrokePreviewToken?
     private var rendererCheckpoints: [RendererCheckpoint]
     private let rendererCheckpointByteBudget: Int
+    private let maximumTotalStrokePointCount: Int
 
     public var isStrokePreviewActive: Bool {
         strokePreviewState.token != nil
@@ -216,6 +217,10 @@ public final class StudioModel: ObservableObject {
         project.commands.count < PaintingProject.maximumCommandCount
     }
 
+    var maximumPointCountForNewStroke: Int {
+        min(PaintingProject.maximumStrokePointCount, remainingStrokePointCapacity)
+    }
+
     public convenience init(
         project: PaintingProject,
         onDocumentUpdate: ((PaintingProject) -> Void)? = nil
@@ -230,7 +235,8 @@ public final class StudioModel: ObservableObject {
         onDocumentUpdate: ((PaintingProject) -> Void)? = nil,
         pngExportWorker: StudioPNGExportWorker = .live,
         rendererCheckpointByteBudget: Int = StudioModel.defaultRendererCheckpointByteBudget,
-        strokePreviewOperation: StrokePreviewRendererOperation = .live
+        strokePreviewOperation: StrokePreviewRendererOperation = .live,
+        maximumTotalStrokePointCount: Int = PaintingProject.maximumTotalStrokePointCount
     ) {
         editor = ProjectEditor(project: project)
         self.project = project
@@ -256,6 +262,7 @@ public final class StudioModel: ObservableObject {
         strokePreviewDrainToken = nil
         rendererCheckpoints = []
         self.rendererCheckpointByteBudget = max(rendererCheckpointByteBudget, 0)
+        self.maximumTotalStrokePointCount = max(maximumTotalStrokePointCount, 0)
         canvasDelegate = CanvasRendererDelegate(renderer: renderer)
         self.onDocumentUpdate = onDocumentUpdate
         refreshCapabilities()
@@ -473,7 +480,7 @@ public final class StudioModel: ObservableObject {
         }
         guard prospectiveStrokePointCapacityError(for: stroke) == nil else {
             error = StudioFailure(
-                message: "The project has reached its point capacity of \(PaintingProject.maximumTotalStrokePointCount)."
+                message: "The project has reached its point capacity of \(maximumTotalStrokePointCount)."
             )
             return false
         }
@@ -494,10 +501,21 @@ public final class StudioModel: ObservableObject {
         }
 
         let (updatedTotal, didOverflow) = totalPointCount.addingReportingOverflow(stroke.points.count)
-        guard !didOverflow, updatedTotal <= PaintingProject.maximumTotalStrokePointCount else {
+        guard !didOverflow, updatedTotal <= maximumTotalStrokePointCount else {
             return .totalStrokePointLimitExceeded(didOverflow ? Int.max : updatedTotal)
         }
         return nil
+    }
+
+    private var remainingStrokePointCapacity: Int {
+        var totalPointCount = 0
+        for command in project.commands {
+            guard case let .stroke(stroke) = command else { continue }
+            let (updatedTotal, didOverflow) = totalPointCount.addingReportingOverflow(stroke.points.count)
+            guard !didOverflow else { return 0 }
+            totalPointCount = updatedTotal
+        }
+        return max(maximumTotalStrokePointCount - totalPointCount, 0)
     }
 
     private func cancelStrokePreviewAfterAdmissionFailure(

@@ -57,6 +57,10 @@ struct CanvasStrokeBuilder {
             return StrokeAppendResult(points: [], isExhausted: isExhausted)
         }
         let point = clamped(point)
+        if samePosition(previousInputPoint, point) {
+            latestInputPoint = point
+            return StrokeAppendResult(points: [], isExhausted: false)
+        }
         let spacing = samplingSpacing(for: stroke.brush)
         let remainingCapacity = maximumPointCount - stroke.points.count
         guard remainingCapacity > 0 else {
@@ -75,7 +79,7 @@ struct CanvasStrokeBuilder {
         latestInputPoint = point
         stroke.points.append(contentsOf: sampling.points)
         self.stroke = stroke
-        isExhausted = sampling.reachedPointLimit || stroke.points.count == maximumPointCount
+        isExhausted = sampling.reachedPointLimit
         return StrokeAppendResult(points: sampling.points, isExhausted: isExhausted)
     }
 
@@ -100,7 +104,9 @@ struct CanvasStrokeBuilder {
         guard let lastStoredPoint = stroke.points.last else {
             return StrokeFinishResult(stroke: nil, isExhausted: false)
         }
-        if !samePosition(lastStoredPoint, endpoint) {
+        if samePosition(lastStoredPoint, endpoint) {
+            stroke.points[stroke.points.count - 1] = endpoint
+        } else {
             guard stroke.points.count < maximumPointCount else {
                 return StrokeFinishResult(stroke: nil, isExhausted: true)
             }
@@ -315,7 +321,8 @@ public final class CanvasEventView: MTKView {
 
     private func beginStroke(with event: NSEvent) {
         var builder = CanvasStrokeBuilder(
-            canvasSize: CGSize(width: model.project.canvas.width, height: model.project.canvas.height)
+            canvasSize: CGSize(width: model.project.canvas.width, height: model.project.canvas.height),
+            maximumPointCount: max(model.maximumPointCountForNewStroke, 1)
         )
         builder.begin(
             layerID: model.selectedLayerID,
@@ -343,6 +350,7 @@ public final class CanvasEventView: MTKView {
             updateInputAvailability()
             return
         }
+        guard !appendResult.points.isEmpty else { return }
         if let stroke = builder.currentStroke {
             model.updateStrokePreview(stroke)
         }

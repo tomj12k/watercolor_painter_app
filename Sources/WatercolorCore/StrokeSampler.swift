@@ -95,13 +95,13 @@ public enum StrokeSampler {
         let remainingAfterFirst = distance - nextSampleDistance
         let maximumAdditionalSamples = maximumPointCount - 1
         let additionalSampleCount: Int
-        if remainingAfterFirst / spacing >= Double(maximumAdditionalSamples) {
+        let omittedRequiredPoint = remainingAfterFirst / spacing >= Double(maximumPointCount)
+        if omittedRequiredPoint {
             additionalSampleCount = maximumAdditionalSamples
         } else {
             additionalSampleCount = Int((remainingAfterFirst / spacing).rounded(.down))
         }
         let sampleCount = additionalSampleCount + 1
-        let reachedPointLimit = sampleCount == maximumPointCount
         var points: [StrokePoint] = []
         points.reserveCapacity(sampleCount)
         for index in 0..<sampleCount {
@@ -114,7 +114,7 @@ public enum StrokeSampler {
         return StrokeSamplingResult(
             points: points,
             distanceToNextSample: normalizedRemainder(nextDistance, spacing: spacing),
-            reachedPointLimit: reachedPointLimit
+            reachedPointLimit: omittedRequiredPoint
         )
     }
 

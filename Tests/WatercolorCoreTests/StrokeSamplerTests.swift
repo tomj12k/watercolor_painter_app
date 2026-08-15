@@ -91,4 +91,20 @@ import Testing
         #expect(result.points.map(\.x) == [18, 36])
         #expect(result.reachedPointLimit)
     }
+
+    @Test func samplerAcceptsAnExactlyFullBatchLimit() {
+        let start = StrokePoint(x: 0, y: 0, pressure: 0, tiltX: 0, tiltY: 0, time: 0)
+        let end = StrokePoint(x: 36, y: 0, pressure: 1, tiltX: 1, tiltY: 1, time: 2)
+
+        let result = StrokeSampler.sample(
+            from: start,
+            to: end,
+            spacing: 18,
+            distanceToNextSample: 18,
+            maximumPointCount: 2
+        )
+
+        #expect(result.points.map(\.x) == [18, 36])
+        #expect(!result.reachedPointLimit)
+    }
 }
