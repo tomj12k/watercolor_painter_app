@@ -48,7 +48,27 @@ import Testing
         #expect(editor.project.layers[1].isVisible == source.isVisible)
         #expect(editor.project.layers[1].opacity == source.opacity)
         #expect(editor.project.layers[1].id != source.id)
-        try undoAndRedo(&editor, restoring: original)
+        let command = try #require(editor.project.commands.last)
+        try undoAndRedo(&editor, restoring: original, expectedCommand: command)
+    }
+
+    @Test func duplicatingALayerRecordsItsSourceAndDestinationIdentifiers() throws {
+        let source = PaintLayer(
+            id: UUID(uuidString: "39038D20-894D-49BE-A8F9-DF1A33E30986")!,
+            name: "Clouds"
+        )
+        var editor = ProjectEditor(project: project(with: [source]))
+
+        try editor.duplicateLayer(id: source.id, named: "Clouds copy")
+
+        let destination = try #require(editor.project.layers.last)
+        let command = try #require(editor.project.commands.last)
+        guard case let .duplicateLayer(duplicate) = command else {
+            Issue.record("Expected a duplicate-layer command")
+            return
+        }
+        #expect(duplicate.sourceLayerID == source.id)
+        #expect(duplicate.destinationLayerID == destination.id)
     }
 
     @Test func removingALayerPreservesOrderAndCanBeReversed() throws {
@@ -173,11 +193,15 @@ private func project(with layers: [PaintLayer]) -> PaintingProject {
     )
 }
 
-private func undoAndRedo(_ editor: inout ProjectEditor, restoring original: PaintingProject) throws {
+private func undoAndRedo(
+    _ editor: inout ProjectEditor,
+    restoring original: PaintingProject,
+    expectedCommand: PaintingCommand? = nil
+) throws {
     let changed = editor.project
 
-    #expect(editor.undo() == nil)
+    #expect(editor.undo() == expectedCommand)
     #expect(editor.project == original)
-    #expect(editor.redo() == nil)
+    #expect(editor.redo() == expectedCommand)
     #expect(editor.project == changed)
 }

@@ -37,6 +37,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
 
     public private(set) var project: PaintingProject
     public private(set) var viewportSize: CGSize
+    public private(set) var canvasWetness: Double
 
     /// The canvas-sized, top-left-oriented texture consumed by the MTKView display pass.
     public var renderedTexture: MTLTexture { compositeTexture }
@@ -46,16 +47,20 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private let stampPipeline: MTLComputePipelineState
     private let simulationPipeline: MTLComputePipelineState
     private let clearPipeline: MTLComputePipelineState
+    private let copyLayerPipeline: MTLComputePipelineState
     private let mergePipeline: MTLComputePipelineState
     private let compositePipeline: MTLComputePipelineState
+    private let wetnessMaximumPipeline: MTLComputePipelineState
     private let displayPipeline: MTLRenderPipelineState
     private let layerMetadataBuffer: MTLBuffer
+    private let wetnessMaximumBuffer: MTLBuffer
 
     private var pigmentTextures: [MTLTexture]
     private var wetnessTextures: [MTLTexture]
     private var compositeTexture: MTLTexture
     private var frontTextureIndex = 0
     private var layerSlices: [UUID: Int] = [:]
+    private var layerOpacityPreviews: [UUID: Double] = [:]
     private var lastCommandBuffer: MTLCommandBuffer?
     private let commandBufferError: (MTLCommandBuffer) -> Error?
     private var displayZoom: CGFloat = 1
@@ -110,8 +115,14 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         stampPipeline = try Self.makeComputePipeline(named: "stampKernel", library: library, device: requestedDevice)
         simulationPipeline = try Self.makeComputePipeline(named: "simulationKernel", library: library, device: requestedDevice)
         clearPipeline = try Self.makeComputePipeline(named: "clearKernel", library: library, device: requestedDevice)
+        copyLayerPipeline = try Self.makeComputePipeline(named: "copyLayerKernel", library: library, device: requestedDevice)
         mergePipeline = try Self.makeComputePipeline(named: "mergeKernel", library: library, device: requestedDevice)
         compositePipeline = try Self.makeComputePipeline(named: "compositeKernel", library: library, device: requestedDevice)
+        wetnessMaximumPipeline = try Self.makeComputePipeline(
+            named: "wetnessMaximumKernel",
+            library: library,
+            device: requestedDevice
+        )
         displayPipeline = try Self.makeDisplayPipeline(library: library, device: requestedDevice)
 
         guard let layerMetadataBuffer = requestedDevice.makeBuffer(
@@ -121,6 +132,13 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.allocation("layer metadata")
         }
         self.layerMetadataBuffer = layerMetadataBuffer
+        guard let wetnessMaximumBuffer = requestedDevice.makeBuffer(
+            length: MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        ) else {
+            throw RendererError.allocation("a canvas wetness measurement")
+        }
+        self.wetnessMaximumBuffer = wetnessMaximumBuffer
         self.commandBufferError = commandBufferError
 
         let textures = try Self.makeTextures(
@@ -133,6 +151,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         compositeTexture = textures.composite
         self.project = project
         viewportSize = CGSize(width: project.canvas.width, height: project.canvas.height)
+        canvasWetness = 0
 
         super.init()
         try replay(project: project)
@@ -145,6 +164,14 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     public func configureDisplay(zoom: CGFloat, pan: CGSize) {
         displayZoom = zoom
         displayPan = pan
+    }
+
+    public func makeCandidate(project: PaintingProject) throws -> WatercolorRenderer {
+        try WatercolorRenderer(
+            project: project,
+            device: device,
+            commandBufferError: commandBufferError
+        )
     }
 
     public func render(stroke: StrokeCommand) throws {
@@ -172,6 +199,9 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         encodeComposite(with: encoder)
         encoder.endEncoding()
         try submit(commandBuffer, wait: waitUntilCompleted)
+        if waitUntilCompleted {
+            try updateCanvasWetness()
+        }
     }
 
     public func replay(project newProject: PaintingProject) throws {
@@ -202,6 +232,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         }
         project = newProject
         layerSlices = replayPlan.finalLayerSlices
+        layerOpacityPreviews.removeAll()
         frontTextureIndex = 0
         updateLayerMetadata()
 
@@ -225,6 +256,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                 )
             case let .clear(slice):
                 encodeClear(targetSlice: UInt32(slice), texturesAt: frontTextureIndex, with: encoder)
+            case let .duplicate(source, destination):
+                encodeCopy(source: source, destination: destination, with: encoder)
             case let .merge(source, destination):
                 encodeMerge(source: source, destination: destination, with: encoder)
             case let .dry(slice, steps):
@@ -235,6 +268,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         encodeComposite(with: encoder)
         encoder.endEncoding()
         try submit(commandBuffer, wait: true)
+        try updateCanvasWetness()
     }
 
     public func dry(layerID: UUID, steps: Int) throws {
@@ -251,7 +285,25 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         encodeSimulation(steps: max(0, steps), targetSlice: UInt32(slice), with: encoder)
         encodeComposite(with: encoder)
         encoder.endEncoding()
-        try submit(commandBuffer, wait: false)
+        try submit(commandBuffer, wait: true)
+        try updateCanvasWetness()
+    }
+
+    public func previewLayerOpacity(id: UUID, opacity: Double) throws {
+        guard project.layers.contains(where: { $0.id == id }) else {
+            throw RendererError.unknownLayer(id)
+        }
+        guard opacity.isFinite else { return }
+        layerOpacityPreviews[id] = min(max(opacity, 0), 1)
+        try recompositeLayerMetadata()
+    }
+
+    public func clearLayerOpacityPreview(id: UUID) throws {
+        guard project.layers.contains(where: { $0.id == id }) else {
+            throw RendererError.unknownLayer(id)
+        }
+        guard layerOpacityPreviews.removeValue(forKey: id) != nil else { return }
+        try recompositeLayerMetadata()
     }
 
     public func draw(in view: MTKView) {
@@ -347,9 +399,13 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
 
         var relevant = Set(currentIdentifiers)
         for command in project.commands.reversed() {
-            if case let .mergeDown(merge) = command,
-               relevant.contains(merge.destinationLayerID) {
+            switch command {
+            case let .duplicateLayer(duplicate) where relevant.contains(duplicate.destinationLayerID):
+                relevant.insert(duplicate.sourceLayerID)
+            case let .mergeDown(merge) where relevant.contains(merge.destinationLayerID):
                 relevant.insert(merge.sourceLayerID)
+            default:
+                break
             }
         }
         return relevant
@@ -382,6 +438,19 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                     freeSlices: &freeSlices
                 )
                 actions.append(.clear(slice))
+            case let .duplicateLayer(duplicate):
+                guard relevantLayerIDs.contains(duplicate.destinationLayerID) else { continue }
+                let source = try acquireReplaySlice(
+                    for: duplicate.sourceLayerID,
+                    layerSlices: &layerSlices,
+                    freeSlices: &freeSlices
+                )
+                let destination = try acquireReplaySlice(
+                    for: duplicate.destinationLayerID,
+                    layerSlices: &layerSlices,
+                    freeSlices: &freeSlices
+                )
+                actions.append(.duplicate(source, destination))
             case let .mergeDown(merge):
                 guard relevantLayerIDs.contains(merge.destinationLayerID) else { continue }
                 let source = try acquireReplaySlice(
@@ -446,7 +515,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             guard let slice = layerSlices[layer.id] else { continue }
             pointer[index] = SIMD4(
                 Float(slice),
-                Float(min(max(layer.opacity, 0), 1)),
+                Float(min(max(layerOpacityPreviews[layer.id] ?? layer.opacity, 0), 1)),
                 layer.isVisible ? 1 : 0,
                 0
             )
@@ -572,6 +641,19 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         encoder.memoryBarrier(scope: .textures)
     }
 
+    private func encodeCopy(source: Int, destination: Int, with encoder: MTLComputeCommandEncoder) {
+        encoder.setComputePipelineState(copyLayerPipeline)
+        encoder.setTexture(pigmentTextures[frontTextureIndex], index: 0)
+        encoder.setTexture(wetnessTextures[frontTextureIndex], index: 1)
+        var slices = SIMD2(UInt32(source), UInt32(destination))
+        encoder.setBytes(&slices, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 0)
+        encoder.dispatchThreads(
+            MTLSize(width: compositeTexture.width, height: compositeTexture.height, depth: 1),
+            threadsPerThreadgroup: threadgroupSize(for: copyLayerPipeline)
+        )
+        encoder.memoryBarrier(scope: .textures)
+    }
+
     private func encodeComposite(with encoder: MTLComputeCommandEncoder) {
         encoder.setComputePipelineState(compositePipeline)
         encoder.setTexture(pigmentTextures[frontTextureIndex], index: 0)
@@ -591,6 +673,43 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             threadsPerThreadgroup: threadgroupSize(for: compositePipeline)
         )
         encoder.memoryBarrier(scope: .textures)
+    }
+
+    private func recompositeLayerMetadata() throws {
+        updateLayerMetadata()
+        let commandBuffer = try makeCommandBuffer(label: "Preview layer metadata")
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw RendererError.allocation("a layer preview encoder")
+        }
+        encoder.label = "Layer metadata preview composite"
+        encodeComposite(with: encoder)
+        encoder.endEncoding()
+        try submit(commandBuffer, wait: true)
+    }
+
+    private func updateCanvasWetness() throws {
+        wetnessMaximumBuffer.contents().storeBytes(of: UInt32(0), as: UInt32.self)
+        let commandBuffer = try makeCommandBuffer(label: "Measure canvas wetness")
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw RendererError.allocation("a canvas wetness encoder")
+        }
+        encoder.label = "Canvas wetness maximum"
+        encoder.setComputePipelineState(wetnessMaximumPipeline)
+        encoder.setTexture(wetnessTextures[frontTextureIndex], index: 0)
+        encoder.setBuffer(wetnessMaximumBuffer, offset: 0, index: 0)
+        var activeSlices = project.layers.reduce(UInt32(0)) { mask, layer in
+            guard let slice = layerSlices[layer.id] else { return mask }
+            return mask | (UInt32(1) << UInt32(slice))
+        }
+        encoder.setBytes(&activeSlices, length: MemoryLayout<UInt32>.stride, index: 1)
+        encoder.dispatchThreads(
+            MTLSize(width: compositeTexture.width, height: compositeTexture.height, depth: Self.layerCapacity),
+            threadsPerThreadgroup: threadgroupSize(for: wetnessMaximumPipeline)
+        )
+        encoder.endEncoding()
+        try submit(commandBuffer, wait: true)
+        let maximum = wetnessMaximumBuffer.contents().load(as: UInt32.self)
+        canvasWetness = min(max(Double(maximum) / 1_000_000, 0), 1)
     }
 
     private func makeCommandBuffer(label: String) throws -> MTLCommandBuffer {
@@ -818,6 +937,7 @@ private enum ReplayAction {
     case stroke(StrokeCommand, Int)
     case simulateDiscardedStroke
     case clear(Int)
+    case duplicate(Int, Int)
     case merge(Int, Int)
     case dry(Int, Int)
 }
@@ -843,8 +963,10 @@ extension WatercolorRenderer {
                 stampPipeline,
                 simulationPipeline,
                 clearPipeline,
+                copyLayerPipeline,
                 mergePipeline,
                 compositePipeline,
+                wetnessMaximumPipeline,
                 displayPipeline
             ].map { ObjectIdentifier($0 as AnyObject) },
             pigmentArrayLength: pigmentTextures[0].arrayLength,

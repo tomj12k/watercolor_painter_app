@@ -115,6 +115,7 @@ private struct LayerRow: View {
                     TextField("Layer name", text: $draftName)
                         .textFieldStyle(.plain)
                         .focused($isEditingName)
+                        .focusedValue(\.studioTextEntryIsFocused, true)
                         .onTapGesture { model.selectedLayerID = layerID }
                         .onSubmit(commitName)
                         .accessibilityLabel("Layer name")
@@ -125,10 +126,17 @@ private struct LayerRow: View {
                         .font(.system(size: 10))
                         .foregroundStyle(StudioPalette.graphite)
 
-                    Slider(value: opacityBinding, in: 0...1, step: 0.01)
+                    Slider(
+                        value: opacityBinding,
+                        in: 0...1,
+                        step: 0.01,
+                        onEditingChanged: { isEditing in
+                            if !isEditing { model.commitLayerOpacity(id: layerID) }
+                        }
+                    )
                         .accessibilityLabel("\(layer.name) opacity")
 
-                    Text("\(Int((layer.opacity * 100).rounded()))%")
+                    Text("\(Int((model.displayedLayerOpacity(id: layerID) * 100).rounded()))%")
                         .font(.system(size: 10, weight: .medium, design: .monospaced))
                         .monospacedDigit()
                         .frame(width: 34, alignment: .trailing)
@@ -155,8 +163,8 @@ private struct LayerRow: View {
 
     private var opacityBinding: Binding<Double> {
         Binding(
-            get: { layer?.opacity ?? 1 },
-            set: { model.setLayerOpacity(id: layerID, opacity: $0) }
+            get: { model.displayedLayerOpacity(id: layerID) },
+            set: { model.previewLayerOpacity(id: layerID, opacity: $0) }
         )
     }
 

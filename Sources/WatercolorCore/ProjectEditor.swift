@@ -53,11 +53,20 @@ public struct ProjectEditor: Sendable {
 
         let before = project
         let source = project.layers[index]
-        project.layers.insert(
-            PaintLayer(name: name ?? source.name, isVisible: source.isVisible, opacity: source.opacity),
-            at: index + 1
+        let duplicate = PaintLayer(
+            name: name ?? source.name,
+            isVisible: source.isVisible,
+            opacity: source.opacity
         )
-        recordChange(before: before)
+        project.layers.insert(duplicate, at: index + 1)
+        let command = PaintingCommand.duplicateLayer(
+            DuplicateLayerCommand(
+                sourceLayerID: source.id,
+                destinationLayerID: duplicate.id
+            )
+        )
+        project.commands.append(command)
+        recordChange(before: before, command: command)
     }
 
     public mutating func renameLayer(id: UUID, to name: String) throws {

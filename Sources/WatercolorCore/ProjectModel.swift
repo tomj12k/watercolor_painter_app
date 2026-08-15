@@ -191,6 +191,18 @@ public struct MergeDownCommand: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
+public struct DuplicateLayerCommand: Codable, Equatable, Sendable, Identifiable {
+    public var id: UUID
+    public var sourceLayerID: UUID
+    public var destinationLayerID: UUID
+
+    public init(id: UUID = UUID(), sourceLayerID: UUID, destinationLayerID: UUID) {
+        self.id = id
+        self.sourceLayerID = sourceLayerID
+        self.destinationLayerID = destinationLayerID
+    }
+}
+
 public struct DryLayerCommand: Codable, Equatable, Sendable, Identifiable {
     public var id: UUID
     public var layerID: UUID
@@ -206,6 +218,7 @@ public struct DryLayerCommand: Codable, Equatable, Sendable, Identifiable {
 public enum PaintingCommand: Codable, Equatable, Sendable, Identifiable {
     case stroke(StrokeCommand)
     case clearLayer(LayerCommand)
+    case duplicateLayer(DuplicateLayerCommand)
     case mergeDown(MergeDownCommand)
     case dryLayer(DryLayerCommand)
 
@@ -213,6 +226,7 @@ public enum PaintingCommand: Codable, Equatable, Sendable, Identifiable {
         switch self {
         case let .stroke(command): command.id
         case let .clearLayer(command): command.id
+        case let .duplicateLayer(command): command.id
         case let .mergeDown(command): command.id
         case let .dryLayer(command): command.id
         }

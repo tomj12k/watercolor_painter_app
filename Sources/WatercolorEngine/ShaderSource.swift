@@ -278,6 +278,31 @@ enum ShaderSource {
         wetness.write(half4(0.0h), position, slices.x);
     }
 
+    kernel void copyLayerKernel(
+        texture2d_array<half, access::read_write> pigment [[texture(0)]],
+        texture2d_array<half, access::read_write> wetness [[texture(1)]],
+        constant uint2& slices [[buffer(0)]],
+        uint2 position [[thread_position_in_grid]]
+    ) {
+        if (position.x >= pigment.get_width() || position.y >= pigment.get_height()) return;
+        pigment.write(pigment.read(position, slices.x), position, slices.y);
+        wetness.write(wetness.read(position, slices.x), position, slices.y);
+    }
+
+    kernel void wetnessMaximumKernel(
+        texture2d_array<half, access::read> wetness [[texture(0)]],
+        device atomic_uint* maximum [[buffer(0)]],
+        constant uint& activeSlices [[buffer(1)]],
+        uint3 position [[thread_position_in_grid]]
+    ) {
+        if (position.x >= wetness.get_width() || position.y >= wetness.get_height() || position.z >= wetness.get_array_size()) {
+            return;
+        }
+        if ((activeSlices & (1u << position.z)) == 0u) return;
+        uint scaled = uint(clamp(float(wetness.read(position.xy, position.z).r), 0.0f, 1.0f) * 1000000.0f);
+        atomic_fetch_max_explicit(maximum, scaled, memory_order_relaxed);
+    }
+
     kernel void compositeKernel(
         texture2d_array<half, access::read> pigment [[texture(0)]],
         texture2d<float, access::write> output [[texture(1)]],

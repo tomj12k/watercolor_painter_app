@@ -45,6 +45,23 @@ import WatercolorCore
         #expect(model.error == nil)
     }
 
+    @Test func canvasWetnessReflectsCompletedStrokesAndProjectReplay() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        var waterStroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
+        waterStroke.tool = .water
+
+        #expect(model.canvasWetness == 0)
+
+        model.completeStroke(waterStroke)
+        #expect(model.canvasWetness > 0.1)
+
+        model.clearSelectedLayer()
+        #expect(model.canvasWetness == 0)
+    }
+
     @Test func selectingAnUnknownLayerDisablesNewPaintingButPreservesAnInFlightStroke() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
@@ -227,7 +244,8 @@ import WatercolorCore
 
         #expect(model.project.layers.map(\.name) == ["Layer 1", "Layer 2"])
         #expect(model.selectedLayerID == model.project.layers[1].id)
-        #expect(renderer.project == model.project)
+        #expect(model.rendererProject == model.project)
+        #expect(renderer.project == project)
         #expect(documentUpdates == [model.project])
         #expect(model.error == nil)
         #expect(model.capabilities.canUndo)
@@ -254,7 +272,7 @@ import WatercolorCore
         #expect(model.project.layers[1].opacity == 0.45)
         #expect(model.project.layers[1].id != project.layers[0].id)
         #expect(model.selectedLayerID == model.project.layers[1].id)
-        #expect(renderer.project == model.project)
+        #expect(model.rendererProject == model.project)
         #expect(documentUpdates == [model.project])
         #expect(model.capabilities.canUndo)
     }
@@ -279,7 +297,7 @@ import WatercolorCore
         #expect(model.project.layers.map(\.id) == [project.layers[0].id, top.id])
         #expect(model.selectedLayerID == top.id)
         #expect(model.capabilities.canPaint)
-        #expect(renderer.project == model.project)
+        #expect(model.rendererProject == model.project)
         #expect(documentUpdates == [model.project])
         #expect(model.capabilities.canUndo)
     }
@@ -302,7 +320,7 @@ import WatercolorCore
 
         #expect(model.project.layers.map(\.id) == [middle.id, project.layers[0].id, top.id])
         #expect(model.selectedLayerID == project.layers[0].id)
-        #expect(renderer.project == model.project)
+        #expect(model.rendererProject == model.project)
         #expect(documentUpdates == [model.project])
         #expect(model.capabilities.canUndo)
     }
@@ -321,7 +339,7 @@ import WatercolorCore
 
         #expect(model.project.layers.map(\.id) == [project.layers[0].id, top.id, middle.id])
         #expect(model.selectedLayerID == top.id)
-        #expect(renderer.project == model.project)
+        #expect(model.rendererProject == model.project)
     }
 
     @Test func renamingALayerPublishesATrimmedNonemptyName() throws {
@@ -339,7 +357,7 @@ import WatercolorCore
 
         #expect(model.project.layers[0].name == "Sky wash")
         #expect(model.selectedLayerID == project.layers[0].id)
-        #expect(renderer.project == model.project)
+        #expect(model.rendererProject == model.project)
         #expect(documentUpdates == [model.project])
     }
 
@@ -357,7 +375,7 @@ import WatercolorCore
         model.setLayerVisibility(id: project.layers[0].id, isVisible: false)
 
         #expect(model.project.layers[0].isVisible == false)
-        #expect(renderer.project == model.project)
+        #expect(model.rendererProject == model.project)
         #expect(documentUpdates == [model.project])
     }
 
@@ -369,11 +387,89 @@ import WatercolorCore
 
         model.setLayerOpacity(id: project.layers[0].id, opacity: 1.5)
         #expect(model.project.layers[0].opacity == 1)
-        #expect(renderer.project.layers[0].opacity == 1)
+        #expect(model.rendererProject.layers[0].opacity == 1)
 
         model.setLayerOpacity(id: project.layers[0].id, opacity: -0.25)
         #expect(model.project.layers[0].opacity == 0)
-        #expect(renderer.project.layers[0].opacity == 0)
+        #expect(model.rendererProject.layers[0].opacity == 0)
+    }
+
+    @Test func opacityGesturePreviewsManyValuesAndCommitsOneProjectEdit() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+        let layerID = project.layers[0].id
+
+        model.previewLayerOpacity(id: layerID, opacity: 0.8)
+        model.previewLayerOpacity(id: layerID, opacity: 0.5)
+        model.previewLayerOpacity(id: layerID, opacity: 0.2)
+
+        #expect(model.displayedLayerOpacity(id: layerID) == 0.2)
+        #expect(model.project == project)
+        #expect(renderer.project == project)
+        #expect(documentUpdates.isEmpty)
+        #expect(!model.capabilities.canUndo)
+
+        model.commitLayerOpacity(id: layerID)
+
+        #expect(model.displayedLayerOpacity(id: layerID) == 0.2)
+        #expect(model.project.layers[0].opacity == 0.2)
+        #expect(documentUpdates == [model.project])
+        #expect(model.capabilities.canUndo)
+
+        model.commitLayerOpacity(id: layerID)
+        #expect(documentUpdates.count == 1)
+    }
+
+    @Test func failedOpacityCommitRestoresTheCommittedRendererPreview() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.studioTestProject()
+        project.commands = [.stroke(.studioTestStroke(layerID: project.layers[0].id))]
+        let injectedError = NSError(
+            domain: "StudioModelTests",
+            code: 9,
+            userInfo: [NSLocalizedDescriptionKey: "persistent opacity commit failure"]
+        )
+        var shouldFail = false
+        var failedReplayCount = 0
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugCommandBufferError: { commandBuffer in
+                if shouldFail, commandBuffer.label == "Watercolor replay" {
+                    failedReplayCount += 1
+                    return injectedError
+                }
+                return commandBuffer.error
+            }
+        )
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) }
+        )
+        let layerID = project.layers[0].id
+        let committedChecksum = try renderer.studioChecksum()
+        model.previewLayerOpacity(id: layerID, opacity: 0.1)
+        #expect(try renderer.studioChecksum() != committedChecksum)
+        shouldFail = true
+
+        model.commitLayerOpacity(id: layerID)
+
+        #expect(model.project == project)
+        #expect(model.displayedLayerOpacity(id: layerID) == 1)
+        #expect(documentUpdates.isEmpty)
+        #expect(!model.capabilities.canUndo)
+        #expect(try renderer.studioChecksum() == committedChecksum)
+        #expect(failedReplayCount == 1)
+        #expect(model.error?.message.contains("persistent opacity commit failure") == true)
     }
 
     @Test func changingLayerOpacityIgnoresANonfiniteValue() throws {
@@ -419,7 +515,7 @@ import WatercolorCore
         } else {
             Issue.record("Expected a merge-down command")
         }
-        #expect(renderer.project == model.project)
+        #expect(model.rendererProject == model.project)
         #expect(documentUpdates == [model.project])
     }
 
@@ -443,7 +539,7 @@ import WatercolorCore
             Issue.record("Expected a clear-layer command")
         }
         #expect(model.selectedLayerID == project.layers[0].id)
-        #expect(renderer.project == model.project)
+        #expect(model.rendererProject == model.project)
         #expect(documentUpdates == [model.project])
     }
 
@@ -462,7 +558,7 @@ import WatercolorCore
 
         #expect(model.project.paper == .rough)
         #expect(model.selectedLayerID == project.layers[0].id)
-        #expect(renderer.project == model.project)
+        #expect(model.rendererProject == model.project)
         #expect(documentUpdates == [model.project])
     }
 
@@ -609,18 +705,16 @@ import WatercolorCore
             userInfo: [NSLocalizedDescriptionKey: "deterministic structural replay failure"]
         )
         var shouldFail = false
-        var failedBuffer: MTLCommandBuffer?
+        var failedReplayCount = 0
         let renderer = try WatercolorRenderer(
             project: project,
             device: device,
             debugCommandBufferError: { commandBuffer in
-                if shouldFail, commandBuffer.label == "Watercolor replay", failedBuffer == nil {
-                    failedBuffer = commandBuffer
+                if shouldFail, commandBuffer.label == "Watercolor replay" {
+                    failedReplayCount += 1
+                    return injectedError
                 }
-                guard let failedBuffer, commandBuffer === failedBuffer else {
-                    return commandBuffer.error
-                }
-                return injectedError
+                return commandBuffer.error
             }
         )
         var documentUpdates: [PaintingProject] = []
@@ -639,6 +733,7 @@ import WatercolorCore
         #expect(documentUpdates.isEmpty)
         #expect(!model.capabilities.canUndo)
         #expect(model.error?.message.contains("deterministic structural replay failure") == true)
+        #expect(failedReplayCount == 1)
     }
 }
 

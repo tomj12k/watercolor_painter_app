@@ -49,8 +49,14 @@ public final class StudioModel: ObservableObject {
     @Published public private(set) var error: StudioFailure?
     @Published public private(set) var capabilities: StudioCapabilities
     @Published public private(set) var requestedAction: StudioActionRequest?
+    @Published public private(set) var canvasWetness: Double
+    @Published public private(set) var layerOpacityPreviews: [UUID: Double]
 
     public var onDocumentUpdate: ((PaintingProject) -> Void)?
+
+    var rendererProject: PaintingProject {
+        renderer.project
+    }
 
     public var canAddLayer: Bool {
         project.layers.count < PaintingProject.maximumLayerCount
@@ -78,9 +84,10 @@ public final class StudioModel: ObservableObject {
         canMoveSelectedLayerDown
     }
 
-    private let renderer: WatercolorRenderer
+    private var renderer: WatercolorRenderer
     private let canvasDelegate: CanvasRendererDelegate
     private var editor: ProjectEditor
+    private weak var attachedCanvas: MTKView?
 
     public convenience init(
         project: PaintingProject,
@@ -105,6 +112,8 @@ public final class StudioModel: ObservableObject {
         error = nil
         capabilities = StudioCapabilities(canPaint: true, canUndo: false, canRedo: false)
         requestedAction = nil
+        canvasWetness = renderer.canvasWetness
+        layerOpacityPreviews = [:]
         self.renderer = renderer
         canvasDelegate = CanvasRendererDelegate(renderer: renderer)
         self.onDocumentUpdate = onDocumentUpdate
@@ -121,6 +130,7 @@ public final class StudioModel: ObservableObject {
 
         do {
             try renderer.renderAndWait(stroke: stroke)
+            canvasWetness = renderer.canvasWetness
             editor.append(.stroke(stroke))
             publishEditorProject()
             error = nil
@@ -219,6 +229,43 @@ public final class StudioModel: ObservableObject {
         )
     }
 
+    public func previewLayerOpacity(id: UUID, opacity: Double) {
+        guard opacity.isFinite,
+              project.layers.contains(where: { $0.id == id })
+        else { return }
+        let clampedOpacity = min(max(opacity, 0), 1)
+        do {
+            try renderer.previewLayerOpacity(id: id, opacity: clampedOpacity)
+            layerOpacityPreviews[id] = clampedOpacity
+            error = nil
+        } catch {
+            self.error = StudioFailure(message: error.localizedDescription)
+        }
+    }
+
+    public func displayedLayerOpacity(id: UUID) -> Double {
+        layerOpacityPreviews[id]
+            ?? project.layers.first(where: { $0.id == id })?.opacity
+            ?? 1
+    }
+
+    public func commitLayerOpacity(id: UUID) {
+        guard let opacity = layerOpacityPreviews[id] else { return }
+        let selectedLayerID = selectedLayerID
+        let didCommit = performProjectEdit(
+            { editor in try editor.setLayerOpacity(id: id, opacity: opacity) },
+            selecting: { project in
+                project.layers.first(where: { $0.id == selectedLayerID })?.id
+            }
+        )
+        if !didCommit {
+            try? renderer.clearLayerOpacityPreview(id: id)
+        } else if renderer.project.layers.first(where: { $0.id == id })?.opacity == opacity {
+            try? renderer.clearLayerOpacityPreview(id: id)
+        }
+        layerOpacityPreviews.removeValue(forKey: id)
+    }
+
     public func mergeSelectedLayerDown() {
         guard let selectedLayerIndex, canMergeSelectedLayerDown else { return }
         let sourceLayerID = selectedLayerID
@@ -303,7 +350,31 @@ public final class StudioModel: ObservableObject {
         error = nil
     }
 
+    @discardableResult
+    func replaceProjectFromDocument(_ replacement: PaintingProject) -> Bool {
+        guard replacement != project else { return true }
+
+        do {
+            try replacement.validate()
+            let candidateRenderer = try renderer.makeCandidate(project: replacement)
+            let nextSelection = replacement.layers.contains(where: { $0.id == selectedLayerID })
+                ? selectedLayerID
+                : replacement.layers[0].id
+            editor = ProjectEditor(project: replacement)
+            project = replacement
+            selectedLayerID = nextSelection
+            replaceRenderer(with: candidateRenderer)
+            refreshCapabilities()
+            error = nil
+            return true
+        } catch {
+            self.error = StudioFailure(message: error.localizedDescription)
+            return false
+        }
+    }
+
     public func configureCanvas(_ view: MTKView) {
+        attachedCanvas = view
         view.device = renderer.renderedTexture.device
         view.colorPixelFormat = .bgra8Unorm
         view.delegate = canvasDelegate
@@ -325,29 +396,42 @@ public final class StudioModel: ObservableObject {
         onDocumentUpdate?(project)
     }
 
+    @discardableResult
     private func performProjectEdit(
         _ edit: (inout ProjectEditor) throws -> Void,
         selecting selection: (PaintingProject) -> UUID?
-    ) {
+    ) -> Bool {
         let previousProject = project
         var updatedEditor = editor
 
         do {
             try edit(&updatedEditor)
             let updatedProject = updatedEditor.project
-            guard updatedProject != previousProject else { return }
-            try renderer.replay(project: updatedProject)
+            guard updatedProject != previousProject else { return true }
+            let candidateRenderer = try renderer.makeCandidate(project: updatedProject)
+            replaceRenderer(with: candidateRenderer)
             editor = updatedEditor
             project = updatedProject
             selectedLayerID = selection(updatedProject) ?? selectedLayerID
             refreshCapabilities()
             onDocumentUpdate?(project)
             error = nil
+            return true
         } catch {
             let failure = StudioFailure(message: error.localizedDescription)
-            try? renderer.replay(project: previousProject)
             self.error = failure
+            return false
         }
+    }
+
+    private func replaceRenderer(with renderer: WatercolorRenderer) {
+        self.renderer = renderer
+        canvasWetness = renderer.canvasWetness
+        layerOpacityPreviews.removeAll()
+        canvasDelegate.replaceRenderer(with: renderer)
+        guard let attachedCanvas else { return }
+        attachedCanvas.device = renderer.renderedTexture.device
+        updateCanvasDisplay(attachedCanvas)
     }
 
     private func nextLayerName() -> String {
@@ -374,9 +458,13 @@ public final class StudioModel: ObservableObject {
 
 @MainActor
 private final class CanvasRendererDelegate: NSObject, MTKViewDelegate {
-    private let renderer: WatercolorRenderer
+    private var renderer: WatercolorRenderer
 
     init(renderer: WatercolorRenderer) {
+        self.renderer = renderer
+    }
+
+    func replaceRenderer(with renderer: WatercolorRenderer) {
         self.renderer = renderer
     }
 

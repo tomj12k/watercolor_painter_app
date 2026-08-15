@@ -51,13 +51,6 @@ public struct StudioView: View {
         .frame(minWidth: 1_050, minHeight: 680)
         .focusedSceneValue(\.studioModel, model)
         .toolbar { studioToolbar }
-        .alert(item: failureBinding) { failure in
-            Alert(
-                title: Text("Studio issue"),
-                message: Text(failure.message),
-                dismissButton: .default(Text("Dismiss")) { model.dismissError() }
-            )
-        }
     }
 
     private var paperStage: some View {
@@ -81,8 +74,8 @@ public struct StudioView: View {
 
                 Rectangle()
                     .stroke(
-                        StudioPalette.cobalt.opacity(0.78),
-                        style: StrokeStyle(lineWidth: 1.5, dash: [1.5, 2.5])
+                        StudioPalette.cobalt.opacity(0.28 + model.canvasWetness * 0.62),
+                        style: StrokeStyle(lineWidth: 1 + model.canvasWetness, dash: [1.5, 2.5])
                     )
                     .frame(width: max(paperRect.width, 0), height: max(paperRect.height, 0))
                     .position(
@@ -94,7 +87,7 @@ public struct StudioView: View {
                     .accessibilityHidden(true)
 
                 HStack(spacing: 6) {
-                    Image(systemName: model.selectedTool == .dry ? "wind" : "drop.fill")
+                    Image(systemName: "drop.fill")
                     Text(activityLabel)
                         .monospacedDigit()
                 }
@@ -105,7 +98,7 @@ public struct StudioView: View {
                 .background(StudioPalette.carbon.opacity(0.88))
                 .overlay(alignment: .leading) {
                     Rectangle()
-                        .fill(model.selectedTool == .dry ? StudioPalette.pigment : StudioPalette.cobalt)
+                        .fill(StudioPalette.cobalt)
                         .frame(width: 2)
                 }
                 .padding(12)
@@ -117,10 +110,7 @@ public struct StudioView: View {
     }
 
     private var activityLabel: String {
-        if model.selectedTool == .dry {
-            return "Dry tool active"
-        }
-        return "Water \(Int((model.brush.water * 100).rounded()))%"
+        "Canvas wetness \(Int((model.canvasWetness * 100).rounded()))%"
     }
 
     private var inspector: some View {
@@ -205,12 +195,4 @@ public struct StudioView: View {
         }
     }
 
-    private var failureBinding: Binding<StudioFailure?> {
-        Binding(
-            get: { model.error },
-            set: { value in
-                if value == nil { model.dismissError() }
-            }
-        )
-    }
 }
