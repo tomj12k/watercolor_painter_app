@@ -8,6 +8,8 @@ public enum ProjectEditingError: Error, Equatable, Sendable {
 }
 
 public struct ProjectEditor: Sendable {
+    private static let maximumHistoryEntries = 100
+
     public private(set) var project: PaintingProject
 
     private var undoHistory: [HistoryEntry] = []
@@ -107,7 +109,7 @@ public struct ProjectEditor: Sendable {
         }
 
         project = entry.before
-        redoHistory.append(entry)
+        Self.append(entry, to: &redoHistory)
         return entry.command
     }
 
@@ -118,13 +120,20 @@ public struct ProjectEditor: Sendable {
         }
 
         project = entry.after
-        undoHistory.append(entry)
+        Self.append(entry, to: &undoHistory)
         return entry.command
     }
 
     private mutating func recordChange(before: PaintingProject, command: PaintingCommand? = nil) {
-        undoHistory.append(HistoryEntry(before: before, after: project, command: command))
+        Self.append(HistoryEntry(before: before, after: project, command: command), to: &undoHistory)
         redoHistory.removeAll()
+    }
+
+    private static func append(_ entry: HistoryEntry, to history: inout [HistoryEntry]) {
+        history.append(entry)
+        if history.count > maximumHistoryEntries {
+            history.removeFirst(history.count - maximumHistoryEntries)
+        }
     }
 
     private func layerIndex(for id: UUID) throws -> Int {

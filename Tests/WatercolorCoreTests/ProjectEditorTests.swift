@@ -132,6 +132,25 @@ import Testing
         #expect(editor.redo() == nil)
         #expect(editor.project.commands == [second])
     }
+
+    @Test func redoHistoryIsLimitedToOneHundredEntries() {
+        let maximumHistoryEntries = 100
+        var editor = ProjectEditor(project: .newDefault())
+        let layerID = editor.project.layers[0].id
+
+        for step in 1...maximumHistoryEntries + 1 {
+            editor.append(.dryLayer(DryLayerCommand(layerID: layerID, steps: step)))
+        }
+        for _ in 0...maximumHistoryEntries {
+            _ = editor.undo()
+        }
+        for _ in 0..<maximumHistoryEntries {
+            _ = editor.redo()
+        }
+
+        #expect(editor.redo() == nil)
+        #expect(editor.project.commands.count == maximumHistoryEntries + 1)
+    }
 }
 
 private extension StrokeCommand {
