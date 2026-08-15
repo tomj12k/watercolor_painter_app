@@ -203,10 +203,15 @@ import WatercolorCore
 
     @Test func paperFibersModulateSimulationEvolution() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let strokeID = UUID(uuidString: "791115F7-61BC-4986-A16F-A8A62E684778")!
         func evolution(on paper: PaperTexture) throws -> Double {
             let project = PaintingProject.testCanvas(64, paper: paper)
             let renderer = try WatercolorRenderer(project: project, device: device)
-            try renderer.renderAndWait(stroke: .testDot(layerID: project.layers[0].id, tool: .water))
+            try renderer.renderAndWait(stroke: .testDot(
+                id: strokeID,
+                layerID: project.layers[0].id,
+                tool: .water
+            ))
             let before = try renderer.debugWetness(x: 32, y: 32)
             try renderer.dry(layerID: project.layers[0].id, steps: 1)
             return try renderer.debugWetness(x: 32, y: 32) / before

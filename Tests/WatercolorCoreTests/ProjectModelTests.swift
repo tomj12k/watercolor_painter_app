@@ -19,7 +19,7 @@ import Testing
     @Test func defaultProjectUsesTheStudioDefaults() {
         let project = PaintingProject.newDefault()
 
-        #expect(project.schemaVersion == 1)
+        #expect(project.schemaVersion == PaintingProject.currentSchemaVersion)
         #expect(project.canvas == CanvasSize(width: 1600, height: 1200))
         #expect(project.paper == .coldPress)
         #expect(project.layers.count == 1)
