@@ -120,6 +120,27 @@ import Testing
         #expect(editor.project == merged)
     }
 
+    @Test func mergeDownCapturesVisibilityOpacityAndNormalizesDestinationMetadata() throws {
+        let bottom = PaintLayer(name: "Bottom", isVisible: false, opacity: 0.25)
+        let top = PaintLayer(name: "Top", isVisible: true, opacity: 0.4)
+        var editor = ProjectEditor(project: project(with: [bottom, top]))
+
+        try editor.mergeDown(id: top.id)
+
+        let destination = try #require(editor.project.layers.first)
+        #expect(destination.id == bottom.id)
+        #expect(destination.isVisible)
+        #expect(destination.opacity == 1)
+        guard case let .mergeDown(command) = try #require(editor.project.commands.last) else {
+            Issue.record("Expected merge-down metadata")
+            return
+        }
+        #expect(command.sourceIsVisible)
+        #expect(command.sourceOpacity == 0.4)
+        #expect(!command.destinationIsVisible)
+        #expect(command.destinationOpacity == 0.25)
+    }
+
     @Test func editingAMissingLayerIsRejected() {
         var editor = ProjectEditor(project: .newDefault())
         let missing = UUID()

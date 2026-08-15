@@ -73,6 +73,55 @@ public struct PaintColor: Codable, Equatable, Sendable {
     }
 
     public static let black = Self(red: 0, green: 0, blue: 0)
+
+    public static func fromSRGB(
+        red: Double,
+        green: Double,
+        blue: Double,
+        alpha: Double = 1
+    ) -> Self {
+        Self(
+            red: linearComponent(fromSRGB: red),
+            green: linearComponent(fromSRGB: green),
+            blue: linearComponent(fromSRGB: blue),
+            alpha: alpha
+        )
+    }
+
+    public func convertedToSRGB() -> Self {
+        Self(
+            red: Self.sRGBComponent(fromLinear: red),
+            green: Self.sRGBComponent(fromLinear: green),
+            blue: Self.sRGBComponent(fromLinear: blue),
+            alpha: alpha
+        )
+    }
+
+    public func mixedLinearly(with other: Self, ratio: Double) -> Self {
+        let ratio = min(max(ratio, 0), 1)
+        return Self(
+            red: red + (other.red - red) * ratio,
+            green: green + (other.green - green) * ratio,
+            blue: blue + (other.blue - blue) * ratio,
+            alpha: alpha + (other.alpha - alpha) * ratio
+        )
+    }
+
+    public static func linearComponent(fromSRGB component: Double) -> Double {
+        let component = min(max(component, 0), 1)
+        if component <= 0.04045 {
+            return component / 12.92
+        }
+        return pow((component + 0.055) / 1.055, 2.4)
+    }
+
+    public static func sRGBComponent(fromLinear component: Double) -> Double {
+        let component = min(max(component, 0), 1)
+        if component <= 0.003_130_8 {
+            return component * 12.92
+        }
+        return 1.055 * pow(component, 1 / 2.4) - 0.055
+    }
 }
 
 public struct BrushSettings: Codable, Equatable, Sendable {
@@ -183,11 +232,59 @@ public struct MergeDownCommand: Codable, Equatable, Sendable, Identifiable {
     public var id: UUID
     public var sourceLayerID: UUID
     public var destinationLayerID: UUID
+    public var sourceIsVisible: Bool
+    public var sourceOpacity: Double
+    public var destinationIsVisible: Bool
+    public var destinationOpacity: Double
 
-    public init(id: UUID = UUID(), sourceLayerID: UUID, destinationLayerID: UUID) {
+    public init(
+        id: UUID = UUID(),
+        sourceLayerID: UUID,
+        destinationLayerID: UUID,
+        sourceIsVisible: Bool = true,
+        sourceOpacity: Double = 1,
+        destinationIsVisible: Bool = true,
+        destinationOpacity: Double = 1
+    ) {
         self.id = id
         self.sourceLayerID = sourceLayerID
         self.destinationLayerID = destinationLayerID
+        self.sourceIsVisible = sourceIsVisible
+        self.sourceOpacity = sourceOpacity
+        self.destinationIsVisible = destinationIsVisible
+        self.destinationOpacity = destinationOpacity
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case sourceLayerID
+        case destinationLayerID
+        case sourceIsVisible
+        case sourceOpacity
+        case destinationIsVisible
+        case destinationOpacity
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        sourceLayerID = try container.decode(UUID.self, forKey: .sourceLayerID)
+        destinationLayerID = try container.decode(UUID.self, forKey: .destinationLayerID)
+        sourceIsVisible = try container.decodeIfPresent(Bool.self, forKey: .sourceIsVisible) ?? true
+        sourceOpacity = try container.decodeIfPresent(Double.self, forKey: .sourceOpacity) ?? 1
+        destinationIsVisible = try container.decodeIfPresent(Bool.self, forKey: .destinationIsVisible) ?? true
+        destinationOpacity = try container.decodeIfPresent(Double.self, forKey: .destinationOpacity) ?? 1
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(sourceLayerID, forKey: .sourceLayerID)
+        try container.encode(destinationLayerID, forKey: .destinationLayerID)
+        try container.encode(sourceIsVisible, forKey: .sourceIsVisible)
+        try container.encode(sourceOpacity, forKey: .sourceOpacity)
+        try container.encode(destinationIsVisible, forKey: .destinationIsVisible)
+        try container.encode(destinationOpacity, forKey: .destinationOpacity)
     }
 }
 
@@ -398,7 +495,9 @@ public struct PaintingProject: Codable, Equatable, Sendable {
             case let .mergeDown(merge):
                 guard merge.sourceLayerID != Self.zeroIdentifier,
                       merge.destinationLayerID != Self.zeroIdentifier,
-                      merge.sourceLayerID != merge.destinationLayerID
+                      merge.sourceLayerID != merge.destinationLayerID,
+                      Self.unitRangeContains(merge.sourceOpacity),
+                      Self.unitRangeContains(merge.destinationOpacity)
                 else {
                     throw ProjectValidationError.invalidCommandRelationship(merge.id)
                 }

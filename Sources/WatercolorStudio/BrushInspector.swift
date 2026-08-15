@@ -132,16 +132,17 @@ struct BrushInspector: View {
     private var colorBinding: Binding<Color> {
         Binding(
             get: {
-                Color(
-                    red: model.brush.color.red,
-                    green: model.brush.color.green,
-                    blue: model.brush.color.blue,
-                    opacity: model.brush.color.alpha
+                let color = model.brush.color.convertedToSRGB()
+                return Color(
+                    red: color.red,
+                    green: color.green,
+                    blue: color.blue,
+                    opacity: color.alpha
                 )
             },
             set: { color in
                 guard let converted = NSColor(color).usingColorSpace(.sRGB) else { return }
-                model.brush.color = PaintColor(
+                model.brush.color = PaintColor.fromSRGB(
                     red: Double(converted.redComponent),
                     green: Double(converted.greenComponent),
                     blue: Double(converted.blueComponent),
@@ -156,11 +157,11 @@ struct BrushInspector: View {
     }
 
     private static let swatches: [(name: String, color: PaintColor, swiftUIColor: Color)] = [
-        ("Carbon", PaintColor(red: 0.11, green: 0.10, blue: 0.09), StudioPalette.carbon),
-        ("Cobalt", PaintColor(red: 0.12, green: 0.32, blue: 0.48), Color(red: 0.12, green: 0.32, blue: 0.48)),
-        ("Pigment red", PaintColor(red: 0.68, green: 0.19, blue: 0.12), Color(red: 0.68, green: 0.19, blue: 0.12)),
-        ("Ochre", PaintColor(red: 0.72, green: 0.48, blue: 0.13), Color(red: 0.72, green: 0.48, blue: 0.13)),
-        ("Sap green", PaintColor(red: 0.20, green: 0.39, blue: 0.20), Color(red: 0.20, green: 0.39, blue: 0.20))
+        ("Carbon", .fromSRGB(red: 0.11, green: 0.10, blue: 0.09), StudioPalette.carbon),
+        ("Cobalt", .fromSRGB(red: 0.12, green: 0.32, blue: 0.48), Color(red: 0.12, green: 0.32, blue: 0.48)),
+        ("Pigment red", .fromSRGB(red: 0.68, green: 0.19, blue: 0.12), Color(red: 0.68, green: 0.19, blue: 0.12)),
+        ("Ochre", .fromSRGB(red: 0.72, green: 0.48, blue: 0.13), Color(red: 0.72, green: 0.48, blue: 0.13)),
+        ("Sap green", .fromSRGB(red: 0.20, green: 0.39, blue: 0.20), Color(red: 0.20, green: 0.39, blue: 0.20))
     ]
 }
 

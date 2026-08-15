@@ -132,9 +132,15 @@ public struct ProjectEditor: Sendable {
         let command = PaintingCommand.mergeDown(
             MergeDownCommand(
                 sourceLayerID: sourceLayer.id,
-                destinationLayerID: destinationLayer.id
+                destinationLayerID: destinationLayer.id,
+                sourceIsVisible: sourceLayer.isVisible,
+                sourceOpacity: sourceLayer.opacity,
+                destinationIsVisible: destinationLayer.isVisible,
+                destinationOpacity: destinationLayer.opacity
             )
         )
+        project.layers[sourceIndex - 1].isVisible = sourceLayer.isVisible || destinationLayer.isVisible
+        project.layers[sourceIndex - 1].opacity = 1
         project.layers.remove(at: sourceIndex)
         project.commands.append(command)
         recordChange(before: before, command: command)

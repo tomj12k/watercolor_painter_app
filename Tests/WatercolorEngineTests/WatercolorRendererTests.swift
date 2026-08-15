@@ -60,7 +60,7 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 32, y: 32).alpha < before)
     }
 
-    @Test func rendererAllocatesFixedReusableTextureArrays() throws {
+    @Test func rendererSizesReusableTextureArraysToActualLayerNeeds() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
         let renderer = try WatercolorRenderer(project: project, device: device)
@@ -70,11 +70,74 @@ import WatercolorCore
         let after = renderer.debugResources
 
         #expect(before == after)
-        #expect(before.pigmentArrayLength == 12)
-        #expect(before.wetnessArrayLength == 12)
+        #expect(before.pigmentArrayLength == 1)
+        #expect(before.wetnessArrayLength == 1)
         #expect(before.pigmentPixelFormat == .rgba16Float)
         #expect(before.wetnessPixelFormat == .r16Float)
         #expect(before.compositePixelFormat == .bgra8Unorm)
+    }
+
+    @Test func rendererCapacityTracksEightAndTwelveLiveLayers() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        func project(layerCount: Int) -> PaintingProject {
+            PaintingProject(
+                canvas: CanvasSize(width: 64, height: 64),
+                paper: .coldPress,
+                layers: (1...layerCount).map { PaintLayer(name: "Layer \($0)") }
+            )
+        }
+
+        let eight = try WatercolorRenderer(project: project(layerCount: 8), device: device)
+        let twelve = try WatercolorRenderer(project: project(layerCount: 12), device: device)
+
+        #expect(eight.debugResources.pigmentArrayLength == 8)
+        #expect(eight.debugResources.wetnessArrayLength == 8)
+        #expect(twelve.debugResources.pigmentArrayLength == 12)
+        #expect(twelve.debugResources.wetnessArrayLength == 12)
+    }
+
+    @Test func strokeSimulationUsesBatchesPaddedDirtyRegionsAndActiveSlices() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(256, paper: .rough)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var stroke = StrokeCommand.testDot(layerID: project.layers[0].id, x: 128, y: 128)
+        stroke.points = (0..<17).map { index in
+            StrokePoint(
+                x: Double(112 + index * 2),
+                y: 128,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
+            )
+        }
+
+        try renderer.renderAndWait(stroke: stroke)
+        let dispatch = renderer.debugLastStrokeDispatch
+
+        #expect(dispatch.stampBatchCount == 3)
+        #expect(dispatch.simulationStepCount == 34)
+        #expect(dispatch.activeSliceDepth == 1)
+        #expect(dispatch.simulationRegion.width < CGFloat(project.canvas.width))
+        #expect(dispatch.simulationRegion.height < CGFloat(project.canvas.height))
+        #expect(dispatch.simulationThreadCount < project.canvas.width * project.canvas.height * 34)
+    }
+
+    @Test func paperFibersModulateSimulationEvolution() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        func evolution(on paper: PaperTexture) throws -> Double {
+            let project = PaintingProject.testCanvas(64, paper: paper)
+            let renderer = try WatercolorRenderer(project: project, device: device)
+            try renderer.renderAndWait(stroke: .testDot(layerID: project.layers[0].id, tool: .water))
+            let before = try renderer.debugWetness(x: 32, y: 32)
+            try renderer.dry(layerID: project.layers[0].id, steps: 1)
+            return try renderer.debugWetness(x: 32, y: 32) / before
+        }
+
+        let hotPress = try evolution(on: .hotPress)
+        let rough = try evolution(on: .rough)
+
+        #expect(abs(hotPress - rough) > 0.000_1)
     }
 
     @Test func structuralCandidatesShareCompiledPipelinesButOwnTheirTextures() throws {
@@ -268,6 +331,73 @@ import WatercolorCore
         let smearSignature = try transformedSignature(tool: .smear, project: project, renderer: renderer)
         #expect(smudgeSignature != smearSignature)
         #expect(wet > 0)
+    }
+
+    @Test func smudgeUsesHorizontalAndVerticalStrokeDirectionWithoutCreatingPigment() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+
+        func moved(from start: StrokePoint, to end: StrokePoint) throws -> (
+            before: RendererDebugPigmentMoments,
+            after: RendererDebugPigmentMoments
+        ) {
+            let renderer = try WatercolorRenderer(project: project, device: device)
+            try renderer.renderAndWait(stroke: .testDot(layerID: project.layers[0].id, x: 32, y: 32))
+            let before = try renderer.debugPigmentMoments(layerID: project.layers[0].id)
+            var brush = BrushSettings.default
+            brush.size = 20
+            let stroke = StrokeCommand(
+                layerID: project.layers[0].id,
+                tool: .smudge,
+                brush: brush,
+                points: [start, end]
+            )
+            try renderer.renderAndWait(stroke: stroke)
+            return (before, try renderer.debugPigmentMoments(layerID: project.layers[0].id))
+        }
+
+        let horizontal = try moved(
+            from: StrokePoint(x: 28, y: 32, pressure: 1, tiltX: 0, tiltY: 0, time: 0),
+            to: StrokePoint(x: 42, y: 32, pressure: 1, tiltX: 0, tiltY: 0, time: 1)
+        )
+        let vertical = try moved(
+            from: StrokePoint(x: 32, y: 28, pressure: 1, tiltX: 0, tiltY: 0, time: 0),
+            to: StrokePoint(x: 32, y: 42, pressure: 1, tiltX: 0, tiltY: 0, time: 1)
+        )
+
+        #expect(horizontal.after.centroidX > horizontal.before.centroidX + 0.2)
+        #expect(abs(horizontal.after.centroidY - horizontal.before.centroidY) < 0.2)
+        #expect(vertical.after.centroidY > vertical.before.centroidY + 0.2)
+        #expect(abs(vertical.after.centroidX - vertical.before.centroidX) < 0.2)
+        #expect(horizontal.after.mass <= horizontal.before.mass * 1.01)
+        #expect(vertical.after.mass <= vertical.before.mass * 1.01)
+    }
+
+    @Test func smearFollowsACurvedPathAndConservesPigmentMass() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        try renderer.renderAndWait(stroke: .testDot(layerID: project.layers[0].id, x: 28, y: 28))
+        let before = try renderer.debugPigmentMoments(layerID: project.layers[0].id)
+        var brush = BrushSettings.default
+        brush.size = 22
+        let smear = StrokeCommand(
+            layerID: project.layers[0].id,
+            tool: .smear,
+            brush: brush,
+            points: [
+                StrokePoint(x: 26, y: 28, pressure: 1, tiltX: 0, tiltY: 0, time: 0),
+                StrokePoint(x: 38, y: 28, pressure: 1, tiltX: 0, tiltY: 0, time: 1),
+                StrokePoint(x: 38, y: 40, pressure: 1, tiltX: 0, tiltY: 0, time: 2)
+            ]
+        )
+
+        try renderer.renderAndWait(stroke: smear)
+        let after = try renderer.debugPigmentMoments(layerID: project.layers[0].id)
+
+        #expect(after.centroidX > before.centroidX + 0.2)
+        #expect(after.centroidY > before.centroidY + 0.2)
+        #expect(after.mass <= before.mass * 1.01)
     }
 
     @Test func everyBrushAndPaperEnumChangesTheDeposit() throws {
@@ -538,6 +668,55 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 32, y: 32, layerID: destination.id).alpha == 0)
     }
 
+    @Test func mergeDownExcludesHiddenSourcePigment() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = mergeFixture(sourceIsVisible: false, sourceOpacity: 1)
+
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let merged = try renderer.debugPixel(x: 32, y: 32, layerID: project.layers[0].id)
+
+        #expect(merged.red < 0.01)
+        #expect(merged.blue > 0.1)
+    }
+
+    @Test func mergeDownBakesTranslucentSourceOpacityIntoPigment() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let translucent = try WatercolorRenderer(
+            project: mergeFixture(sourceIsVisible: true, sourceOpacity: 0.25),
+            device: device
+        )
+        let opaque = try WatercolorRenderer(
+            project: mergeFixture(sourceIsVisible: true, sourceOpacity: 1),
+            device: device
+        )
+
+        let translucentRed = try translucent.debugPixel(x: 32, y: 32).red
+        let opaqueRed = try opaque.debugPixel(x: 32, y: 32).red
+        #expect(translucentRed > 0.01)
+        #expect(translucentRed < opaqueRed * 0.4)
+        #expect(translucent.project.layers[0].isVisible)
+        #expect(translucent.project.layers[0].opacity == 1)
+    }
+
+    @Test func compositeConvertsLinearPigmentBackToSRGBForExport() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.testCanvas(64, paper: .hotPress)
+        var stroke = StrokeCommand.testDot(
+            layerID: project.layers[0].id,
+            color: .fromSRGB(red: 0.5, green: 0.5, blue: 0.5)
+        )
+        stroke.brush.opacity = 1
+        stroke.brush.flow = 1
+        project.commands = [.stroke(stroke)]
+
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let exported = try renderer.compositePixel(x: 32, y: 32)
+
+        #expect(exported.red > 0.7)
+        #expect(abs(exported.red - exported.green) < 0.03)
+        #expect(abs(exported.green - exported.blue) < 0.03)
+    }
+
     @Test func replayDuplicatesPigmentAndWetnessThenLetsLayersDiverge() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let source = PaintLayer(
@@ -644,7 +823,7 @@ import WatercolorCore
         let merged = try renderer.debugPixel(x: 32, y: 32, layerID: destination.id)
         #expect(merged.red > 0.1)
         #expect(merged.alpha > 0.1)
-        #expect(renderer.debugResources.pigmentArrayLength == 12)
+        #expect(renderer.debugResources.pigmentArrayLength == 2)
     }
 
     @Test func replayReleasesDuplicateSourcesAfterTheirLastRelevantUse() throws {
@@ -867,6 +1046,38 @@ import WatercolorCore
         let horizontal = try renderer.debugPixel(x: 38, y: 32).alpha
         let vertical = try renderer.debugPixel(x: 32, y: 38).alpha
         return Int(((center + horizontal * 1.7 + vertical * 2.3) * 100_000).rounded())
+    }
+
+    private func mergeFixture(sourceIsVisible: Bool, sourceOpacity: Double) -> PaintingProject {
+        let destination = PaintLayer(
+            id: UUID(uuidString: "86C089A3-CFFA-44F9-B7F0-57FE68572C25")!,
+            name: "Destination"
+        )
+        let sourceID = UUID(uuidString: "18B8DA86-0C8A-4E98-B7E5-232434CB3839")!
+        return PaintingProject(
+            canvas: CanvasSize(width: 64, height: 64),
+            paper: .coldPress,
+            layers: [destination],
+            commands: [
+                .stroke(.testDot(
+                    id: UUID(uuidString: "27D0DFCA-B8A3-4BAD-9DDE-AF14E3E49DC1")!,
+                    layerID: destination.id,
+                    color: PaintColor(red: 0, green: 0, blue: 1)
+                )),
+                .stroke(.testDot(
+                    id: UUID(uuidString: "8E6C9734-3B1E-4B9E-B930-65EF80A91E4C")!,
+                    layerID: sourceID,
+                    color: PaintColor(red: 1, green: 0, blue: 0)
+                )),
+                .mergeDown(MergeDownCommand(
+                    id: UUID(uuidString: "CA80E47B-AC50-48FC-9AE3-CB0F54D88F57")!,
+                    sourceLayerID: sourceID,
+                    destinationLayerID: destination.id,
+                    sourceIsVisible: sourceIsVisible,
+                    sourceOpacity: sourceOpacity
+                ))
+            ]
+        )
     }
 }
 

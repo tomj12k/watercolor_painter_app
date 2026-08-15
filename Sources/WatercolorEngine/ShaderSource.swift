@@ -24,6 +24,19 @@ enum ShaderSource {
         uint4 dimensions;
     };
 
+    struct MergeParameters {
+        uint2 slices;
+        float2 opacities;
+        uint2 visibility;
+    };
+
+    struct SmudgeParameters {
+        float4 centerRadius;
+        float4 directionStrength;
+        uint4 extra;
+        uint4 stampRect;
+    };
+
     uint hashValue(uint value) {
         value ^= value >> 16;
         value *= 0x7feb352du;
@@ -35,6 +48,12 @@ enum ShaderSource {
 
     float randomValue(uint2 position, uint seed) {
         return float(hashValue(position.x ^ (position.y * 0x9e3779b9u) ^ seed)) / 4294967295.0f;
+    }
+
+    float3 linearToSRGB(float3 color) {
+        float3 low = color * 12.92f;
+        float3 high = 1.055f * pow(max(color, 0.0f), float3(1.0f / 2.4f)) - 0.055f;
+        return select(high, low, color <= 0.0031308f);
     }
 
     float paperNoise(uint2 position, uint paper, uint seed) {
@@ -204,8 +223,13 @@ enum ShaderSource {
         texture2d_array<half, access::write> destinationPigment [[texture(2)]],
         texture2d_array<half, access::write> destinationWetness [[texture(3)]],
         constant SimulationParameters& parameters [[buffer(0)]],
-        uint3 position [[thread_position_in_grid]]
+        uint3 localPosition [[thread_position_in_grid]]
     ) {
+        uint3 position = uint3(
+            localPosition.x + parameters.selection.z,
+            localPosition.y + parameters.selection.w,
+            localPosition.z
+        );
         if (position.x >= sourcePigment.get_width() || position.y >= sourcePigment.get_height() || position.z >= sourcePigment.get_array_size()) {
             return;
         }
@@ -238,13 +262,70 @@ enum ShaderSource {
             float(sourceWetness.read(down, slice).r)
         ) * 0.25f;
 
+        float fiber = paperNoise(pixel, parameters.selection.y, 0x45d9f3bu);
+        float mobility = mix(0.72f, 1.16f, fiber);
+        float retention = mix(0.978f, 0.993f, fiber);
         float wet = float(centerWetness);
-        float nextWetness = (wet + parameters.rates.x * (wetnessAverage - wet)) * parameters.rates.z;
-        float pigmentRate = parameters.rates.y * clamp(wet + wetnessAverage, 0.0f, 1.0f);
+        float nextWetness = (wet + parameters.rates.x * mobility * (wetnessAverage - wet))
+            * parameters.rates.z * retention;
+        float pigmentRate = parameters.rates.y * mobility * clamp(wet + wetnessAverage, 0.0f, 1.0f);
         float4 nextPigment = mix(float4(centerPigment), pigmentAverage, pigmentRate);
 
         destinationPigment.write(half4(clamp(nextPigment, 0.0f, 8.0f)), pixel, slice);
         destinationWetness.write(half4(clamp(nextWetness, 0.0f, 1.0f)), pixel, slice);
+    }
+
+    kernel void synchronizeRegionKernel(
+        texture2d_array<half, access::read> sourcePigment [[texture(0)]],
+        texture2d_array<half, access::read> sourceWetness [[texture(1)]],
+        texture2d_array<half, access::write> destinationPigment [[texture(2)]],
+        texture2d_array<half, access::write> destinationWetness [[texture(3)]],
+        constant SimulationParameters& parameters [[buffer(0)]],
+        uint3 localPosition [[thread_position_in_grid]]
+    ) {
+        uint3 position = uint3(
+            localPosition.x + parameters.selection.z,
+            localPosition.y + parameters.selection.w,
+            localPosition.z
+        );
+        if (position.x >= sourcePigment.get_width() || position.y >= sourcePigment.get_height()
+            || position.z >= sourcePigment.get_array_size()) return;
+        if (parameters.selection.x != allLayers && position.z != parameters.selection.x) return;
+        destinationPigment.write(sourcePigment.read(position.xy, position.z), position.xy, position.z);
+        destinationWetness.write(sourceWetness.read(position.xy, position.z), position.xy, position.z);
+    }
+
+    kernel void smudgeKernel(
+        texture2d_array<half, access::read> sourcePigment [[texture(0)]],
+        texture2d_array<half, access::read> sourceWetness [[texture(1)]],
+        texture2d_array<half, access::write> destinationPigment [[texture(2)]],
+        texture2d_array<half, access::write> destinationWetness [[texture(3)]],
+        constant SmudgeParameters& parameters [[buffer(0)]],
+        uint2 localPosition [[thread_position_in_grid]]
+    ) {
+        if (localPosition.x >= parameters.stampRect.z || localPosition.y >= parameters.stampRect.w) return;
+        uint2 position = parameters.stampRect.xy + localPosition;
+        if (position.x >= sourcePigment.get_width() || position.y >= sourcePigment.get_height()) return;
+
+        uint slice = parameters.extra.x;
+        float2 normalized = (float2(position) + 0.5f - parameters.centerRadius.xy) / parameters.centerRadius.zw;
+        float coverage = clamp((1.0f - length(normalized)) / 0.3f, 0.0f, 1.0f);
+        float strength = parameters.directionStrength.z;
+        float distance = parameters.centerRadius.z * parameters.directionStrength.w * coverage;
+        float2 upstream = float2(position) - parameters.directionStrength.xy * distance;
+        uint2 sourcePosition = uint2(clamp(
+            round(upstream),
+            float2(0.0f),
+            float2(sourcePigment.get_width() - 1u, sourcePigment.get_height() - 1u)
+        ));
+        float amount = clamp(coverage * strength, 0.0f, 0.92f);
+        float4 center = float4(sourcePigment.read(position, slice));
+        float4 transported = float4(sourcePigment.read(sourcePosition, slice));
+        float4 nextPigment = mix(center, transported, amount);
+        float centerWetness = float(sourceWetness.read(position, slice).r);
+        float transportedWetness = float(sourceWetness.read(sourcePosition, slice).r);
+        destinationPigment.write(half4(clamp(nextPigment, 0.0f, 8.0f)), position, slice);
+        destinationWetness.write(half4(clamp(mix(centerWetness, transportedWetness, amount), 0.0f, 1.0f)), position, slice);
     }
 
     kernel void clearKernel(
@@ -265,17 +346,20 @@ enum ShaderSource {
     kernel void mergeKernel(
         texture2d_array<half, access::read_write> pigment [[texture(0)]],
         texture2d_array<half, access::read_write> wetness [[texture(1)]],
-        constant uint2& slices [[buffer(0)]],
+        constant MergeParameters& parameters [[buffer(0)]],
         uint2 position [[thread_position_in_grid]]
     ) {
         if (position.x >= pigment.get_width() || position.y >= pigment.get_height()) return;
-        half4 source = pigment.read(position, slices.x);
-        half4 destination = pigment.read(position, slices.y);
-        pigment.write(half4(clamp(float4(destination) + float4(source), 0.0f, 8.0f)), position, slices.y);
-        pigment.write(half4(0.0h), position, slices.x);
-        half mergedWetness = max(wetness.read(position, slices.x).r, wetness.read(position, slices.y).r);
-        wetness.write(half4(mergedWetness), position, slices.y);
-        wetness.write(half4(0.0h), position, slices.x);
+        float sourceWeight = parameters.visibility.x == 0u ? 0.0f : parameters.opacities.x;
+        float destinationWeight = parameters.visibility.y == 0u ? 0.0f : parameters.opacities.y;
+        float4 source = float4(pigment.read(position, parameters.slices.x)) * sourceWeight;
+        float4 destination = float4(pigment.read(position, parameters.slices.y)) * destinationWeight;
+        pigment.write(half4(clamp(destination + source, 0.0f, 8.0f)), position, parameters.slices.y);
+        pigment.write(half4(0.0h), position, parameters.slices.x);
+        float sourceWetness = float(wetness.read(position, parameters.slices.x).r) * sourceWeight;
+        float destinationWetness = float(wetness.read(position, parameters.slices.y).r) * destinationWeight;
+        wetness.write(half4(max(sourceWetness, destinationWetness)), position, parameters.slices.y);
+        wetness.write(half4(0.0h), position, parameters.slices.x);
     }
 
     kernel void copyLayerKernel(
@@ -383,7 +467,7 @@ enum ShaderSource {
             color = mix(color, pigmentColor, alpha);
         }
 
-        output.write(float4(clamp(color, 0.0f, 1.0f), 1.0f), position);
+        output.write(float4(clamp(linearToSRGB(color), 0.0f, 1.0f), 1.0f), position);
     }
 
     struct DisplayVertex {
