@@ -1,6 +1,7 @@
 import Combine
 import CoreGraphics
 import Foundation
+import MetalKit
 import WatercolorCore
 import WatercolorEngine
 
@@ -39,9 +40,10 @@ public final class StudioModel: ObservableObject {
     @Published public private(set) var error: StudioFailure?
     @Published public private(set) var capabilities: StudioCapabilities
 
-    public let renderer: WatercolorRenderer
     public var onDocumentUpdate: ((PaintingProject) -> Void)?
 
+    private let renderer: WatercolorRenderer
+    private let canvasDelegate: CanvasRendererDelegate
     private var editor: ProjectEditor
 
     public convenience init(
@@ -52,7 +54,7 @@ public final class StudioModel: ObservableObject {
         self.init(project: project, renderer: renderer, onDocumentUpdate: onDocumentUpdate)
     }
 
-    public init(
+    init(
         project: PaintingProject,
         renderer: WatercolorRenderer,
         onDocumentUpdate: ((PaintingProject) -> Void)? = nil
@@ -67,19 +69,44 @@ public final class StudioModel: ObservableObject {
         error = nil
         capabilities = StudioCapabilities(canPaint: true, canUndo: false, canRedo: false)
         self.renderer = renderer
+        canvasDelegate = CanvasRendererDelegate(renderer: renderer)
         self.onDocumentUpdate = onDocumentUpdate
         refreshCapabilities()
     }
 
     public func completeStroke(_ stroke: StrokeCommand) {
+        guard project.layers.contains(where: { $0.id == selectedLayerID }) else {
+            error = StudioFailure(
+                message: StudioCoordinationError.selectedLayerUnavailable(selectedLayerID).localizedDescription
+            )
+            return
+        }
+        guard stroke.layerID == selectedLayerID else {
+            error = StudioFailure(
+                message: StudioCoordinationError.strokeLayerMismatch(
+                    selected: selectedLayerID,
+                    stroke: stroke.layerID
+                ).localizedDescription
+            )
+            return
+        }
+
         do {
-            try renderer.render(stroke: stroke)
+            try renderer.renderAndWait(stroke: stroke)
             editor.append(.stroke(stroke))
             publishEditorProject()
             error = nil
         } catch {
-            self.error = StudioFailure(message: error.localizedDescription)
+            let failure = StudioFailure(message: error.localizedDescription)
+            try? renderer.replay(project: project)
+            self.error = failure
         }
+    }
+
+    public func configureCanvas(_ view: MTKView) {
+        view.device = renderer.renderedTexture.device
+        view.colorPixelFormat = .bgra8Unorm
+        view.delegate = canvasDelegate
     }
 
     private func publishEditorProject() {
@@ -94,5 +121,36 @@ public final class StudioModel: ObservableObject {
             canUndo: editor.canUndo,
             canRedo: editor.canRedo
         )
+    }
+}
+
+@MainActor
+private final class CanvasRendererDelegate: NSObject, MTKViewDelegate {
+    private let renderer: WatercolorRenderer
+
+    init(renderer: WatercolorRenderer) {
+        self.renderer = renderer
+    }
+
+    func draw(in view: MTKView) {
+        renderer.draw(in: view)
+    }
+
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        renderer.mtkView(view, drawableSizeWillChange: size)
+    }
+}
+
+private enum StudioCoordinationError: LocalizedError {
+    case selectedLayerUnavailable(UUID)
+    case strokeLayerMismatch(selected: UUID, stroke: UUID)
+
+    var errorDescription: String? {
+        switch self {
+        case let .selectedLayerUnavailable(identifier):
+            "The selected layer \(identifier.uuidString) is not part of this project."
+        case let .strokeLayerMismatch(selected, stroke):
+            "Stroke layer \(stroke.uuidString) does not match selected layer \(selected.uuidString)."
+        }
     }
 }

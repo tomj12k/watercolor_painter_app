@@ -1,7 +1,8 @@
 import Metal
+import MetalKit
 import Testing
 import WatercolorCore
-import WatercolorEngine
+@testable import WatercolorEngine
 @testable import WatercolorStudio
 
 @Suite @MainActor struct StudioModelTests {
@@ -43,15 +44,92 @@ import WatercolorEngine
         #expect(model.error == nil)
     }
 
-    @Test func selectingAnUnknownLayerDisablesPainting() throws {
+    @Test func selectingAnUnknownLayerDisablesPaintingAndRejectsAStroke() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdateCount = 0
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { _ in documentUpdateCount += 1 }
+        )
+
+        model.selectedLayerID = UUID(uuidString: "187C458F-D40D-427D-970F-3E7A40FD301B")!
+        model.completeStroke(.studioTestStroke(layerID: project.layers[0].id))
+
+        #expect(!model.capabilities.canPaint)
+        #expect(model.project == project)
+        #expect(documentUpdateCount == 0)
+        #expect(model.error != nil)
+        #expect(try renderer.debugPixel(x: 128, y: 128).alpha == 0)
+    }
+
+    @Test func strokeLayerMustMatchTheSelectedLayer() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.studioTestProject()
+        let otherLayer = PaintLayer(
+            id: UUID(uuidString: "0CD27F43-E900-467A-B7CB-D21A7B966681")!,
+            name: "Other"
+        )
+        project.layers.append(otherLayer)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var documentUpdateCount = 0
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { _ in documentUpdateCount += 1 }
+        )
+
+        model.completeStroke(.studioTestStroke(layerID: otherLayer.id))
+
+        #expect(model.project == project)
+        #expect(documentUpdateCount == 0)
+        #expect(model.error?.message.contains(otherLayer.id.uuidString) == true)
+        #expect(try renderer.debugPixel(x: 128, y: 128, layerID: otherLayer.id).alpha == 0)
+    }
+
+    @Test func completedStrokeFailureDoesNotPersistTheCommand() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            completedStrokeCheck: { _ in
+                throw RendererError.allocation("deterministic completed-stroke failure")
+            }
+        )
+        var documentUpdateCount = 0
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { _ in documentUpdateCount += 1 }
+        )
+
+        model.completeStroke(.studioTestStroke(layerID: project.layers[0].id))
+
+        #expect(model.project == project)
+        #expect(documentUpdateCount == 0)
+        #expect(model.error?.message.contains("deterministic completed-stroke failure") == true)
+        #expect(!model.capabilities.canUndo)
+        #expect(try renderer.debugPixel(x: 128, y: 128).alpha == 0)
+    }
+
+    @Test func configuringACanvasAttachesOnlyTheDisplayDelegate() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
         let renderer = try WatercolorRenderer(project: project, device: device)
         let model = StudioModel(project: project, renderer: renderer)
+        let view = MTKView(frame: .zero)
 
-        model.selectedLayerID = UUID(uuidString: "187C458F-D40D-427D-970F-3E7A40FD301B")!
+        model.configureCanvas(view)
 
-        #expect(!model.capabilities.canPaint)
+        #expect(view.device === device)
+        #expect(view.colorPixelFormat == .bgra8Unorm)
+        #expect(view.delegate != nil)
+        #expect(view.delegate !== renderer)
+        view.delegate?.mtkView(view, drawableSizeWillChange: CGSize(width: 320, height: 240))
+        #expect(renderer.viewportSize == CGSize(width: 320, height: 240))
     }
 
     @Test func renderFailurePreservesTheProjectAndReportsTheError() throws {

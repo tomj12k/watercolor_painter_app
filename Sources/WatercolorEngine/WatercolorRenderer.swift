@@ -57,10 +57,23 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private var frontTextureIndex = 0
     private var layerSlices: [UUID: Int] = [:]
     private var lastCommandBuffer: MTLCommandBuffer?
+    private let completedStrokeCheck: (MTLCommandBuffer) throws -> Void
 
-    public init(
+    public convenience init(
         project: PaintingProject,
         device requestedDevice: MTLDevice? = MTLCreateSystemDefaultDevice()
+    ) throws {
+        try self.init(
+            project: project,
+            device: requestedDevice,
+            completedStrokeCheck: { _ in }
+        )
+    }
+
+    init(
+        project: PaintingProject,
+        device requestedDevice: MTLDevice?,
+        completedStrokeCheck: @escaping (MTLCommandBuffer) throws -> Void
     ) throws {
         guard let requestedDevice else {
             throw RendererError.metalUnavailable
@@ -92,6 +105,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.allocation("layer metadata")
         }
         self.layerMetadataBuffer = layerMetadataBuffer
+        self.completedStrokeCheck = completedStrokeCheck
 
         let textures = try Self.makeTextures(
             device: requestedDevice,
@@ -113,6 +127,14 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     }
 
     public func render(stroke: StrokeCommand) throws {
+        try render(stroke: stroke, waitUntilCompleted: false)
+    }
+
+    public func renderAndWait(stroke: StrokeCommand) throws {
+        try render(stroke: stroke, waitUntilCompleted: true)
+    }
+
+    private func render(stroke: StrokeCommand, waitUntilCompleted: Bool) throws {
         guard project.layers.contains(where: { $0.id == stroke.layerID }),
               let slice = layerSlices[stroke.layerID]
         else {
@@ -128,7 +150,10 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         encodeSimulation(steps: Self.simulationStepsPerStroke, targetSlice: Self.allLayers, with: encoder)
         encodeComposite(with: encoder)
         encoder.endEncoding()
-        try submit(commandBuffer, wait: false)
+        try submit(commandBuffer, wait: waitUntilCompleted)
+        if waitUntilCompleted {
+            try completedStrokeCheck(commandBuffer)
+        }
     }
 
     public func replay(project newProject: PaintingProject) throws {

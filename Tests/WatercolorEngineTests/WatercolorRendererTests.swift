@@ -145,6 +145,26 @@ import WatercolorCore
         }
     }
 
+    @Test func completedStrokeWaitsBeforeReturningACompletionFailure() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        let expected = RendererError.allocation("deterministic completed-stroke failure")
+        var observedStatus: MTLCommandBufferStatus?
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            completedStrokeCheck: { commandBuffer in
+                observedStatus = commandBuffer.status
+                throw expected
+            }
+        )
+
+        #expect(throws: expected) {
+            try renderer.renderAndWait(stroke: .testDot(layerID: project.layers[0].id))
+        }
+        #expect(observedStatus == .completed)
+    }
+
     @Test func everyToolHasItsOwnPigmentOrWetnessEffect() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
