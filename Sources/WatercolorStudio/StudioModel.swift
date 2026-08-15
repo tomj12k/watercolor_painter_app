@@ -29,6 +29,42 @@ public struct StudioFailure: Identifiable, Equatable, Sendable {
     }
 }
 
+// CGImage is immutable after creation, so this readback snapshot can safely cross to the export worker.
+struct StudioPNGImageSnapshot: @unchecked Sendable {
+    let image: CGImage
+}
+
+struct StudioPNGExportWorker: Sendable {
+    typealias Operation = @Sendable (StudioPNGImageSnapshot, URL) async throws -> Void
+
+    private let operation: Operation
+
+    init(_ operation: @escaping Operation) {
+        self.operation = operation
+    }
+
+    func export(_ snapshot: StudioPNGImageSnapshot, to destinationURL: URL) async throws {
+        try await operation(snapshot, destinationURL)
+    }
+
+    static let live = Self { snapshot, destinationURL in
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            data,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw StudioCoordinationError.pngEncoding
+        }
+        CGImageDestinationAddImage(destination, snapshot.image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw StudioCoordinationError.pngEncoding
+        }
+        try (data as Data).write(to: destinationURL, options: .atomic)
+    }
+}
+
 @MainActor
 public final class StudioModel: ObservableObject {
     public static let brushSizeRange = 1.0...300.0
@@ -92,6 +128,9 @@ public final class StudioModel: ObservableObject {
     private var renderer: WatercolorRenderer
     private let canvasDelegate: CanvasRendererDelegate
     private var editor: ProjectEditor
+    private let pngExportWorker: StudioPNGExportWorker
+    private var latestPNGExportID: UUID?
+    private var currentPNGExportFailureID: UUID?
     private weak var attachedCanvas: MTKView?
 
     public convenience init(
@@ -105,7 +144,8 @@ public final class StudioModel: ObservableObject {
     init(
         project: PaintingProject,
         renderer: WatercolorRenderer,
-        onDocumentUpdate: ((PaintingProject) -> Void)? = nil
+        onDocumentUpdate: ((PaintingProject) -> Void)? = nil,
+        pngExportWorker: StudioPNGExportWorker = .live
     ) {
         editor = ProjectEditor(project: project)
         self.project = project
@@ -119,6 +159,9 @@ public final class StudioModel: ObservableObject {
         canvasWetness = renderer.canvasWetness
         layerOpacityPreviews = [:]
         self.renderer = renderer
+        self.pngExportWorker = pngExportWorker
+        latestPNGExportID = nil
+        currentPNGExportFailureID = nil
         canvasDelegate = CanvasRendererDelegate(renderer: renderer)
         self.onDocumentUpdate = onDocumentUpdate
         refreshCapabilities()
@@ -363,17 +406,34 @@ public final class StudioModel: ObservableObject {
     }
 
     public func exportPNG(to destinationURL: URL) async {
+        let exportID = UUID()
+        latestPNGExportID = exportID
+        let capturedFailureID = error?.id
+        let capturedExportFailureID = currentPNGExportFailureID
+
         do {
-            let image = try renderer.makeCGImage()
-            let data = try Self.pngData(from: image)
-            try await Task.detached {
-                try data.write(to: destinationURL, options: .atomic)
+            let snapshot = StudioPNGImageSnapshot(image: try renderer.makeCGImage())
+            let worker = pngExportWorker
+            try await Task.detached(priority: .userInitiated) {
+                try await worker.export(snapshot, to: destinationURL)
             }.value
-            error = nil
+            guard latestPNGExportID == exportID,
+                  error?.id == capturedFailureID
+            else { return }
+            if let capturedExportFailureID,
+               capturedFailureID == capturedExportFailureID {
+                error = nil
+                currentPNGExportFailureID = nil
+            }
         } catch {
-            self.error = StudioFailure(
+            guard latestPNGExportID == exportID,
+                  self.error?.id == capturedFailureID
+            else { return }
+            let failure = StudioFailure(
                 message: "Could not export PNG to \(destinationURL.lastPathComponent): \(error.localizedDescription)"
             )
+            self.error = failure
+            currentPNGExportFailureID = failure.id
         }
     }
 
@@ -548,22 +608,6 @@ public final class StudioModel: ObservableObject {
         )
     }
 
-    private static func pngData(from image: CGImage) throws -> Data {
-        let data = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(
-            data,
-            UTType.png.identifier as CFString,
-            1,
-            nil
-        ) else {
-            throw StudioCoordinationError.pngEncoding
-        }
-        CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination) else {
-            throw StudioCoordinationError.pngEncoding
-        }
-        return data as Data
-    }
 }
 
 @MainActor

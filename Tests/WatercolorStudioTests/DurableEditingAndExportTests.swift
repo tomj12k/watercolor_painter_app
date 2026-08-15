@@ -258,6 +258,220 @@ import WatercolorCore
         #expect(model.error?.message.contains("existing.png") == true)
         #expect(model.error?.id != nil)
     }
+
+    @Test func blockedPNGEncodingLeavesTheMainActorSchedulable() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.durableFixture()
+        let blockingGate = BlockingExportGate()
+        let worker = StudioPNGExportWorker { _, _ in
+            blockingGate.block()
+        }
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device),
+            pngExportWorker: worker
+        )
+
+        let export = Task { @MainActor in
+            await model.exportPNG(to: URL(fileURLWithPath: "/tmp/blocked-export.png"))
+        }
+        let encoderStarted = await Task.detached {
+            blockingGate.waitUntilBlocked()
+        }.value
+        #expect(encoderStarted)
+
+        let mainActorRanWhileBlocked = await Task { @MainActor in
+            blockingGate.isBlocked
+        }.value
+
+        #expect(mainActorRanWhileBlocked)
+        blockingGate.release()
+        await export.value
+    }
+
+    @Test func olderExportSuccessDoesNotClearALaterActionFailure() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.durableFixture()
+        let exports = ControlledPNGExports()
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device),
+            pngExportWorker: StudioPNGExportWorker { _, destinationURL in
+                try await exports.run(destinationURL.lastPathComponent)
+            }
+        )
+        let destination = URL(fileURLWithPath: "/tmp/old-success.png")
+        let export = Task { @MainActor in await model.exportPNG(to: destination) }
+        await exports.waitUntilStarted("old-success.png")
+
+        let missingLayerID = UUID(uuidString: "414CFB67-D2B5-45A4-B4CF-68149B67D49C")!
+        model.completeStroke(.durableFixture(layerID: missingLayerID))
+        let laterFailure = try #require(model.error)
+        await exports.complete("old-success.png", with: .success)
+        await export.value
+
+        #expect(model.error == laterFailure)
+        #expect(model.error?.message.contains(missingLayerID.uuidString) == true)
+    }
+
+    @Test func olderExportFailureDoesNotOverwriteALaterActionFailure() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.durableFixture()
+        let exports = ControlledPNGExports()
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device),
+            pngExportWorker: StudioPNGExportWorker { _, destinationURL in
+                try await exports.run(destinationURL.lastPathComponent)
+            }
+        )
+        let destination = URL(fileURLWithPath: "/tmp/old-failure.png")
+        let export = Task { @MainActor in await model.exportPNG(to: destination) }
+        await exports.waitUntilStarted("old-failure.png")
+
+        let missingLayerID = UUID(uuidString: "40991B21-4D75-49D1-BE02-28023D6C950D")!
+        model.completeStroke(.durableFixture(layerID: missingLayerID))
+        let laterFailure = try #require(model.error)
+        await exports.complete("old-failure.png", with: .failure("stale export failure"))
+        await export.value
+
+        #expect(model.error == laterFailure)
+        #expect(model.error?.message.contains("stale export failure") == false)
+    }
+
+    @Test func olderExportSuccessDoesNotClearTheNewestExportFailure() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.durableFixture()
+        let exports = ControlledPNGExports()
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device),
+            pngExportWorker: StudioPNGExportWorker { _, destinationURL in
+                try await exports.run(destinationURL.lastPathComponent)
+            }
+        )
+        let older = Task { @MainActor in
+            await model.exportPNG(to: URL(fileURLWithPath: "/tmp/older-success.png"))
+        }
+        await exports.waitUntilStarted("older-success.png")
+        let newest = Task { @MainActor in
+            await model.exportPNG(to: URL(fileURLWithPath: "/tmp/newest-failure.png"))
+        }
+        await exports.waitUntilStarted("newest-failure.png")
+
+        await exports.complete("newest-failure.png", with: .failure("newest export failure"))
+        await newest.value
+        let newestFailure = try #require(model.error)
+        await exports.complete("older-success.png", with: .success)
+        await older.value
+
+        #expect(model.error == newestFailure)
+        #expect(model.error?.message.contains("newest-failure.png") == true)
+        #expect(model.error?.message.contains("newest export failure") == true)
+    }
+
+    @Test func olderExportFailureDoesNotOverwriteTheNewestExportSuccess() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.durableFixture()
+        let exports = ControlledPNGExports()
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device),
+            pngExportWorker: StudioPNGExportWorker { _, destinationURL in
+                try await exports.run(destinationURL.lastPathComponent)
+            }
+        )
+        let older = Task { @MainActor in
+            await model.exportPNG(to: URL(fileURLWithPath: "/tmp/older-failure.png"))
+        }
+        await exports.waitUntilStarted("older-failure.png")
+        let newest = Task { @MainActor in
+            await model.exportPNG(to: URL(fileURLWithPath: "/tmp/newest-success.png"))
+        }
+        await exports.waitUntilStarted("newest-success.png")
+
+        await exports.complete("newest-success.png", with: .success)
+        await newest.value
+        #expect(model.error == nil)
+        await exports.complete("older-failure.png", with: .failure("older export failure"))
+        await older.value
+
+        #expect(model.error == nil)
+    }
+}
+
+private final class BlockingExportGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let started = DispatchSemaphore(value: 0)
+    private let releaseGate = DispatchSemaphore(value: 0)
+    private var blocked = false
+
+    func block() {
+        lock.withLock { blocked = true }
+        started.signal()
+        _ = releaseGate.wait(timeout: .now() + 2)
+        lock.withLock { blocked = false }
+    }
+
+    func waitUntilBlocked() -> Bool {
+        started.wait(timeout: .now() + 2) == .success
+    }
+
+    var isBlocked: Bool {
+        lock.withLock { blocked }
+    }
+
+    func release() {
+        releaseGate.signal()
+    }
+}
+
+private actor ControlledPNGExports {
+    enum Outcome: Sendable {
+        case success
+        case failure(String)
+    }
+
+    private var started: Set<String> = []
+    private var startWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var outcomes: [String: Outcome] = [:]
+    private var completionWaiters: [String: CheckedContinuation<Outcome, Never>] = [:]
+
+    func run(_ name: String) async throws {
+        started.insert(name)
+        startWaiters.removeValue(forKey: name)?.forEach { $0.resume() }
+        let outcome = if let outcome = outcomes.removeValue(forKey: name) {
+            outcome
+        } else {
+            await withCheckedContinuation { continuation in
+                completionWaiters[name] = continuation
+            }
+        }
+        if case let .failure(message) = outcome {
+            throw ControlledExportError(message: message)
+        }
+    }
+
+    func waitUntilStarted(_ name: String) async {
+        guard !started.contains(name) else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters[name, default: []].append(continuation)
+        }
+    }
+
+    func complete(_ name: String, with outcome: Outcome) {
+        if let continuation = completionWaiters.removeValue(forKey: name) {
+            continuation.resume(returning: outcome)
+        } else {
+            outcomes[name] = outcome
+        }
+    }
+}
+
+private struct ControlledExportError: Error, LocalizedError, Sendable {
+    let message: String
+
+    var errorDescription: String? { message }
 }
 
 private extension PaintingProject {
