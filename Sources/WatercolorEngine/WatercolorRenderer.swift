@@ -566,6 +566,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                 stroke: appendedStroke,
                 pointIndexOffset: transaction.renderedPointCount,
                 initialPreviousPoint: transaction.lastRenderedPoint,
+                finalNextPoint: nextRemainder.first,
                 capturesCommittedState: capturesCommittedState,
                 transaction: transaction,
                 workBudget: transaction.workBudget
@@ -971,6 +972,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         stroke: StrokeCommand,
         pointIndexOffset: Int,
         initialPreviousPoint: StrokePoint?,
+        finalNextPoint: StrokePoint?,
         capturesCommittedState: Bool,
         transaction: StrokePreviewTransaction,
         workBudget initialWorkBudget: RenderWorkBudget
@@ -1000,6 +1002,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                 slice: slice,
                 pointIndexOffset: pointIndexOffset,
                 initialPreviousPoint: initialPreviousPoint,
+                finalNextPoint: finalNextPoint,
                 workBudget: &workBudget,
                 with: encoder
             )
@@ -1755,6 +1758,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         slice: Int,
         pointIndexOffset: Int = 0,
         initialPreviousPoint: StrokePoint? = nil,
+        finalNextPoint: StrokePoint? = nil,
         restrictingSimulationTo restrictedSimulationSlices: Set<Int>? = nil,
         workBudget: inout RenderWorkBudget,
         with encoder: MTLComputeCommandEncoder
@@ -1775,6 +1779,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                 slice: slice,
                 pointIndexOffset: pointIndexOffset + batchStart,
                 previousPoint: batchStart > 0 ? stroke.points[batchStart - 1] : initialPreviousPoint,
+                nextPoint: batchEnd < stroke.points.count ? stroke.points[batchEnd] : finalNextPoint,
                 with: encoder
             )
 
@@ -1912,6 +1917,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         slice: Int,
         pointIndexOffset: Int = 0,
         previousPoint initialPreviousPoint: StrokePoint? = nil,
+        nextPoint finalNextPoint: StrokePoint? = nil,
         with encoder: MTLComputeCommandEncoder
     ) {
         guard !stroke.points.isEmpty else { return }
@@ -1930,6 +1936,16 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
 
         let baseSeed = Self.seed(for: stroke.id)
         for (index, point) in stroke.points.enumerated() {
+            let previousPoint = index > 0 ? stroke.points[index - 1] : initialPreviousPoint
+            let nextPoint = index + 1 < stroke.points.count
+                ? stroke.points[index + 1]
+                : finalNextPoint
+            let orientation = Self.stampOrientation(
+                previous: previousPoint,
+                point: point,
+                next: nextPoint,
+                brush: stroke.brush
+            )
             let pressure = Float(min(max(point.pressure, 0), 1))
             let radius = max(Float(stroke.brush.size) * 0.5 * max(pressure, 0.12), 0.5)
             let horizontalRadius = radius * 1.25
@@ -1960,6 +1976,13 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                     Float(point.tiltX),
                     Float(point.tiltY)
                 ),
+                orientation: orientation,
+                dynamics: SIMD4(
+                    Self.shapeAspect(for: stroke.brush.shape),
+                    Float(stroke.brush.bristleStrength),
+                    Float(stroke.brush.textureStrength),
+                    0
+                ),
                 modes: SIMD4(
                     Self.index(of: stroke.tool),
                     Self.index(of: stroke.brush.shape),
@@ -1972,6 +1995,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                     UInt32(slice),
                     baseSeed ^ (UInt32(truncatingIfNeeded: index + pointIndexOffset) &* 0x9e3779b9)
                 ),
+                behavior: SIMD4(UInt32(stroke.brush.behaviorVersion), 0, 0, 0),
                 stampRect: SIMD4(UInt32(minX), UInt32(minY), UInt32(maxX - minX), UInt32(maxY - minY))
             )
             encoder.setBytes(&parameters, length: MemoryLayout<StampParameters>.stride, index: 0)
@@ -2549,6 +2573,76 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    private static func stampOrientation(
+        previous: StrokePoint?,
+        point: StrokePoint,
+        next: StrokePoint?,
+        brush: BrushSettings
+    ) -> SIMD4<Float> {
+        guard brush.behaviorVersion > 0 else {
+            return SIMD4(1, 0, 0, 0)
+        }
+
+        let base = normalizedVector(dx: point.tiltX, dy: point.tiltY)
+            ?? strokeDirection(previous: previous, point: point, next: next)
+        let radians = brush.rotation * .pi / 180
+        let cosine = cos(radians)
+        let sine = sin(radians)
+        let rotated = SIMD2(
+            base.x * cosine - base.y * sine,
+            base.x * sine + base.y * cosine
+        )
+        return SIMD4(
+            Float(rotated.x),
+            Float(rotated.y),
+            Float(radians),
+            0
+        )
+    }
+
+    private static func strokeDirection(
+        previous: StrokePoint?,
+        point: StrokePoint,
+        next: StrokePoint?
+    ) -> SIMD2<Double> {
+        if let previous, let next,
+           let direction = normalizedVector(
+               dx: next.x - previous.x,
+               dy: next.y - previous.y
+           ) {
+            return direction
+        }
+        if let next,
+           let direction = normalizedVector(dx: next.x - point.x, dy: next.y - point.y) {
+            return direction
+        }
+        if let previous,
+           let direction = normalizedVector(
+               dx: point.x - previous.x,
+               dy: point.y - previous.y
+           ) {
+            return direction
+        }
+        return SIMD2(1, 0)
+    }
+
+    private static func normalizedVector(dx: Double, dy: Double) -> SIMD2<Double>? {
+        guard dx.isFinite, dy.isFinite else { return nil }
+        let magnitude = hypot(dx, dy)
+        guard magnitude.isFinite, magnitude > 0 else { return nil }
+        return SIMD2(dx / magnitude, dy / magnitude)
+    }
+
+    private static func shapeAspect(for shape: BrushShape) -> Float {
+        switch shape {
+        case .round: 1
+        case .flat: 1.9
+        case .filbert: 2
+        case .fan: 1
+        case .rigger: 6
+        }
+    }
+
     private static func index(of tool: PaintTool) -> UInt32 {
         switch tool {
         case .brush: 0
@@ -2679,8 +2773,13 @@ private struct StampParameters {
     var color: SIMD4<Float>
     var brush: SIMD4<Float>
     var effects: SIMD4<Float>
+    /// xy: final unit orientation; z: user rotation in radians; w: reserved.
+    var orientation: SIMD4<Float>
+    /// x: shape aspect; y: bristle strength; z: texture strength; w: reserved.
+    var dynamics: SIMD4<Float>
     var modes: SIMD4<UInt32>
     var extra: SIMD4<UInt32>
+    var behavior: SIMD4<UInt32>
     var stampRect: SIMD4<UInt32>
 }
 
@@ -3058,7 +3157,37 @@ struct RendererDebugLayerFields: Equatable {
     }
 }
 
+struct RendererDebugStampParameterLayout: Equatable {
+    let stride: Int
+    let centerRadiusOffset: Int
+    let colorOffset: Int
+    let brushOffset: Int
+    let effectsOffset: Int
+    let orientationOffset: Int
+    let dynamicsOffset: Int
+    let modesOffset: Int
+    let extraOffset: Int
+    let behaviorOffset: Int
+    let stampRectOffset: Int
+}
+
 extension WatercolorRenderer {
+    static var debugStampParameterLayout: RendererDebugStampParameterLayout {
+        RendererDebugStampParameterLayout(
+            stride: MemoryLayout<StampParameters>.stride,
+            centerRadiusOffset: MemoryLayout<StampParameters>.offset(of: \.centerRadius)!,
+            colorOffset: MemoryLayout<StampParameters>.offset(of: \.color)!,
+            brushOffset: MemoryLayout<StampParameters>.offset(of: \.brush)!,
+            effectsOffset: MemoryLayout<StampParameters>.offset(of: \.effects)!,
+            orientationOffset: MemoryLayout<StampParameters>.offset(of: \.orientation)!,
+            dynamicsOffset: MemoryLayout<StampParameters>.offset(of: \.dynamics)!,
+            modesOffset: MemoryLayout<StampParameters>.offset(of: \.modes)!,
+            extraOffset: MemoryLayout<StampParameters>.offset(of: \.extra)!,
+            behaviorOffset: MemoryLayout<StampParameters>.offset(of: \.behavior)!,
+            stampRectOffset: MemoryLayout<StampParameters>.offset(of: \.stampRect)!
+        )
+    }
+
     func pixelChecksum() throws -> UInt64 {
         let image = try makeCGImage()
         guard let data = image.dataProvider?.data,

@@ -1112,6 +1112,60 @@ import WatercolorCore
         #expect(try renderer.compositeChecksum() == replayed.compositeChecksum())
     }
 
+    @Test func versionOneDirectionalPreviewKeepsLookaheadAndAbsoluteSeedsAcrossBatches() async throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let project = PaintingProject.testCanvas(192)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var complete = StrokeCommand.testDot(
+            id: UUID(uuidString: "86727999-9490-4CE0-9394-A201788C2335")!,
+            layerID: project.layers[0].id
+        )
+        complete.brush.shape = .flat
+        complete.brush.hair = .bristle
+        complete.brush.texture = .mottled
+        complete.brush.size = 24
+        complete.points = (0..<17).map { index in
+            let coordinate: (Double, Double)
+            if index <= 7 {
+                coordinate = (Double(32 + index * 8), 80)
+            } else if index <= 15 {
+                coordinate = (88, Double(80 + (index - 7) * 8))
+            } else {
+                // The retained point turns after the 16th canonical point. Preview
+                // must use it as lookahead for point 15 just as full replay does.
+                coordinate = (96, 144)
+            }
+            return StrokePoint(
+                x: coordinate.0,
+                y: coordinate.1,
+                pressure: 0.7 + Double(index % 3) * 0.1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 60
+            )
+        }
+        var initial = complete
+        initial.points = [complete.points[0]]
+
+        let token = try renderer.beginStrokePreview(initial)
+        try await renderer.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points[1..<11]),
+            token: token
+        )
+        try await renderer.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points[11...]),
+            token: token
+        )
+
+        try await renderer.finishStrokePreview(complete, token: token)
+        var completedProject = project
+        completedProject.commands = [.stroke(complete)]
+        let freshCompleted = try WatercolorRenderer(project: completedProject, device: device)
+        #expect(try renderer.compositeChecksum() == freshCompleted.compositeChecksum())
+    }
+
     @Test func incrementalPreviewKeepsOnlyCanonicalRemainderUntilFinish() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(256)
@@ -2535,6 +2589,279 @@ import WatercolorCore
         }
     }
 
+    @Test func versionOneShapeOrientationFollowsStroke() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let horizontal = compactShapePath(horizontal: true)
+        let vertical = compactShapePath(horizontal: false)
+
+        let flatHorizontal = try renderShapeSample(
+            shape: .flat,
+            points: horizontal,
+            device: device
+        ).metrics
+        let flatVertical = try renderShapeSample(
+            shape: .flat,
+            points: vertical,
+            device: device
+        ).metrics
+        let riggerHorizontal = try renderShapeSample(
+            shape: .rigger,
+            points: horizontal,
+            device: device
+        ).metrics
+        let riggerVertical = try renderShapeSample(
+            shape: .rigger,
+            points: vertical,
+            device: device
+        ).metrics
+
+        print("Shape orientation characterization [flat horizontal]: \(phenotypeDiagnostics(flatHorizontal))")
+        print("Shape orientation characterization [flat vertical]: \(phenotypeDiagnostics(flatVertical))")
+        print("Shape orientation characterization [rigger horizontal]: \(phenotypeDiagnostics(riggerHorizontal))")
+        print("Shape orientation characterization [rigger vertical]: \(phenotypeDiagnostics(riggerVertical))")
+
+        // A flat is a cross-stroke chisel; a rigger's long axis follows the stroke.
+        // A 0.25-radian tolerance allows binary-mask and two-step diffusion variation
+        // without accepting an axis-aligned footprint that fails to rotate by 90 degrees.
+        #expect(orientationDistance(flatHorizontal.orientation, .pi / 2) < 0.25)
+        #expect(orientationDistance(flatVertical.orientation, 0) < 0.25)
+        #expect(orientationDistance(riggerHorizontal.orientation, 0) < 0.25)
+        #expect(orientationDistance(riggerVertical.orientation, .pi / 2) < 0.25)
+    }
+
+    @Test func stampParameterLayoutMatchesAlignedMetalConstantBuffer() {
+        let layout = WatercolorRenderer.debugStampParameterLayout
+
+        #expect(layout.stride == 160)
+        #expect(layout.centerRadiusOffset == 0)
+        #expect(layout.colorOffset == 16)
+        #expect(layout.brushOffset == 32)
+        #expect(layout.effectsOffset == 48)
+        #expect(layout.orientationOffset == 64)
+        #expect(layout.dynamicsOffset == 80)
+        #expect(layout.modesOffset == 96)
+        #expect(layout.extraOffset == 112)
+        #expect(layout.behaviorOffset == 128)
+        #expect(layout.stampRectOffset == 144)
+    }
+
+    @Test func versionOneTabletTiltOverridesTangent() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let horizontal = compactShapePath(horizontal: true)
+        let verticallyTilted = horizontal.map {
+            StrokePoint(
+                x: $0.x,
+                y: $0.y,
+                pressure: $0.pressure,
+                tiltX: 0,
+                tiltY: 0.000_000_000_001,
+                time: $0.time
+            )
+        }
+
+        let pathOriented = try renderShapeSample(
+            shape: .rigger,
+            points: horizontal,
+            device: device
+        ).metrics
+        let tiltOriented = try renderShapeSample(
+            shape: .rigger,
+            points: verticallyTilted,
+            device: device
+        ).metrics
+
+        #expect(orientationDistance(pathOriented.orientation, 0) < 0.25)
+        #expect(orientationDistance(tiltOriented.orientation, .pi / 2) < 0.25)
+        #expect(orientationDistance(pathOriented.orientation, tiltOriented.orientation) > 1.0)
+    }
+
+    @Test func versionOneUserRotationAppliesAfterBaseOrientation() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let verticallyTilted = compactShapePath(horizontal: true).map {
+            StrokePoint(
+                x: $0.x,
+                y: $0.y,
+                pressure: $0.pressure,
+                tiltX: 0,
+                tiltY: 0.8,
+                time: $0.time
+            )
+        }
+
+        let base = try renderShapeSample(
+            shape: .rigger,
+            points: verticallyTilted,
+            device: device
+        ).metrics
+        let rotated = try renderShapeSample(
+            shape: .rigger,
+            points: verticallyTilted,
+            rotation: 90,
+            device: device
+        ).metrics
+
+        #expect(orientationDistance(base.orientation, .pi / 2) < 0.25)
+        #expect(orientationDistance(rotated.orientation, 0) < 0.25)
+        #expect(orientationDistance(base.orientation, rotated.orientation) > 1.0)
+    }
+
+    @Test func versionOneDuplicatePointsUseFiniteNeighborsAndDotsUseStableFallback() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let horizontalDuplicates = [
+            shapePoint(x: 62, y: 64, time: 0),
+            shapePoint(x: 64, y: 64, time: 0.1),
+            shapePoint(x: 64, y: 64, time: 0.2),
+            shapePoint(x: 66, y: 64, time: 0.3)
+        ]
+        let verticalDuplicates = [
+            shapePoint(x: 64, y: 62, time: 0),
+            shapePoint(x: 64, y: 64, time: 0.1),
+            shapePoint(x: 64, y: 64, time: 0.2),
+            shapePoint(x: 64, y: 66, time: 0.3)
+        ]
+        let horizontal = try renderShapeSample(
+            shape: .rigger,
+            points: horizontalDuplicates,
+            device: device
+        ).metrics
+        let vertical = try renderShapeSample(
+            shape: .rigger,
+            points: verticalDuplicates,
+            device: device
+        ).metrics
+        let fallbackDot = try renderShapeSample(
+            shape: .rigger,
+            points: [shapePoint(x: 64, y: 64)],
+            device: device
+        )
+        let horizontalTiltDot = try renderShapeSample(
+            shape: .rigger,
+            points: [shapePoint(x: 64, y: 64, tiltX: 1, tiltY: 0)],
+            device: device
+        )
+
+        #expect(orientationDistance(horizontal.orientation, 0) < 0.25)
+        #expect(orientationDistance(vertical.orientation, .pi / 2) < 0.25)
+        #expect(fallbackDot.checksum == horizontalTiltDot.checksum)
+        #expect(fallbackDot.metrics == horizontalTiltDot.metrics)
+    }
+
+    @Test func versionOneRoundFootprintIsDirectionInvariant() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let horizontal = [shapePoint(x: 64, y: 64, tiltX: 0.9, tiltY: 0)]
+        let vertical = [shapePoint(x: 64, y: 64, tiltX: 0, tiltY: 0.9)]
+        let first = try renderShapeSample(
+            shape: .round,
+            points: horizontal,
+            device: device
+        )
+        let second = try renderShapeSample(
+            shape: .round,
+            points: vertical,
+            rotation: 137,
+            device: device
+        )
+
+        #expect(first.checksum == second.checksum)
+        #expect(first.metrics == second.metrics)
+    }
+
+    @Test func behaviorVersionZeroIgnoresNewOrientationAndDynamicsInputsExactly() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let baseline = compactShapePath(horizontal: true)
+        let changedTilt = baseline.map {
+            StrokePoint(
+                x: $0.x,
+                y: $0.y,
+                pressure: $0.pressure,
+                tiltX: -0.65,
+                tiltY: 0.75,
+                time: $0.time
+            )
+        }
+        let first = try renderShapeSample(
+            shape: .flat,
+            points: baseline,
+            behaviorVersion: 0,
+            rotation: 0,
+            bristleStrength: 0,
+            textureStrength: 0,
+            device: device
+        )
+        let second = try renderShapeSample(
+            shape: .flat,
+            points: changedTilt,
+            behaviorVersion: 0,
+            rotation: -173,
+            bristleStrength: 1,
+            textureStrength: 1,
+            device: device
+        )
+
+        #expect(first.checksum == second.checksum)
+        #expect(first.metrics == second.metrics)
+    }
+
+    @Test func versionOneShapePhenotypesAreNonemptyAndPerceptuallySeparated() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let point = [shapePoint(x: 64, y: 64, tiltX: 0.9, tiltY: 0)]
+        let samples = try Dictionary(uniqueKeysWithValues: [
+            BrushShape.flat,
+            .filbert,
+            .fan,
+            .rigger
+        ].map { shape in
+            (shape, try renderShapeSample(shape: shape, points: point, device: device).metrics)
+        })
+        let flat = try #require(samples[.flat])
+        let filbert = try #require(samples[.filbert])
+        let fan = try #require(samples[.fan])
+        let rigger = try #require(samples[.rigger])
+
+        for (shape, metrics) in samples {
+            print("Shape phenotype characterization [\(shape.rawValue)]: \(phenotypeDiagnostics(metrics))")
+            #expect(metrics.area >= 40, "\(shape.rawValue) footprint is perceptually empty")
+            #expect(metrics.pigmentMass > 0, "\(shape.rawValue) deposits no pigment")
+            #expect(metrics.edgeRoughness > 0, "\(shape.rawValue) has no measurable boundary")
+        }
+
+        // These intentionally broad ratios survive one-pixel mask shifts while rejecting
+        // generic fuzzy circles: the chisel and capsule point on perpendicular axes, the
+        // fan exposes five persistent fingers, and the rigger is much narrower than both.
+        #expect(flat.aspectRatio >= 1.7)
+        #expect(orientationDistance(flat.orientation, .pi / 2) < 0.25)
+        #expect(filbert.aspectRatio >= 1.35)
+        #expect(orientationDistance(filbert.orientation, 0) < 0.25)
+        #expect(orientationDistance(flat.orientation, filbert.orientation) > 1.0)
+        #expect(fan.laneCount == 5)
+        #expect(fan.edgeRoughness > filbert.edgeRoughness * 1.15)
+        #expect(rigger.aspectRatio >= 3.5)
+        #expect(orientationDistance(rigger.orientation, 0) < 0.25)
+        #expect(rigger.area < flat.area * 0.65)
+        #expect(rigger.area < filbert.area * 0.65)
+    }
+
+    @Test func versionOneSmallBrushAntialiasingStaysNonemptyAndScales() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let samples = try [1.0, 2, 4].map { size in
+            try renderShapeSample(
+                shape: .round,
+                points: [shapePoint(x: 64, y: 64)],
+                size: size,
+                device: device
+            ).metrics
+        }
+
+        for (index, metrics) in samples.enumerated() {
+            #expect(metrics.area > 0, "size \([1, 2, 4][index]) brush vanished")
+            #expect(metrics.pigmentMass > 0, "size \([1, 2, 4][index]) brush deposited nothing")
+        }
+        #expect(samples[0].area <= samples[1].area)
+        #expect(samples[1].area <= samples[2].area)
+        #expect(samples[0].pigmentMass < samples[1].pigmentMass)
+        #expect(samples[1].pigmentMass < samples[2].pigmentMass)
+    }
+
     @Test func layerVisibilityOpacityAndOrderAffectComposite() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let bottom = PaintLayer(
@@ -3327,6 +3654,81 @@ import WatercolorCore
         )
     }
 
+    private func compactShapePath(horizontal: Bool) -> [StrokePoint] {
+        [-2.0, 0, 2].enumerated().map { index, offset in
+            shapePoint(
+                x: horizontal ? 64 + offset : 64,
+                y: horizontal ? 64 : 64 + offset,
+                time: Double(index) * 0.1
+            )
+        }
+    }
+
+    private func shapePoint(
+        x: Double,
+        y: Double,
+        tiltX: Double = 0,
+        tiltY: Double = 0,
+        time: Double = 0
+    ) -> StrokePoint {
+        StrokePoint(
+            x: x,
+            y: y,
+            pressure: 1,
+            tiltX: tiltX,
+            tiltY: tiltY,
+            time: time
+        )
+    }
+
+    private func renderShapeSample(
+        shape: BrushShape,
+        points: [StrokePoint],
+        behaviorVersion: Int = 1,
+        rotation: Double = 0,
+        bristleStrength: Double = 0.5,
+        textureStrength: Double = 0.5,
+        size: Double = 42,
+        device: MTLDevice
+    ) throws -> ShapeRenderSample {
+        let project = PaintingProject.testCanvas(128, paper: .hotPress)
+        var brush = BrushSettings.default
+        brush.shape = shape
+        brush.hair = .sable
+        brush.texture = .smooth
+        brush.style = .transparentWash
+        brush.color = PaintColor(red: 0.72, green: 0.18, blue: 0.08, alpha: 1)
+        brush.size = size
+        brush.opacity = 1
+        brush.flow = 1
+        brush.water = 0.1
+        brush.granulation = 0
+        brush.edgeBloom = 0
+        brush.behaviorVersion = behaviorVersion
+        brush.rotation = rotation
+        brush.bristleStrength = bristleStrength
+        brush.textureStrength = textureStrength
+        let stroke = StrokeCommand(
+            id: UUID(uuidString: "93EAD9F9-09D8-47D5-AAC7-3DF8D51E92C9")!,
+            layerID: project.layers[0].id,
+            tool: .brush,
+            brush: brush,
+            points: points
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        try renderer.renderAndWait(stroke: stroke)
+        return ShapeRenderSample(
+            checksum: try renderer.compositeChecksum(),
+            metrics: BrushPhenotypeMetrics.measure(
+                try renderer.debugLayerFields(layerID: project.layers[0].id)
+            )
+        )
+    }
+
+    private func orientationDistance(_ lhs: Double, _ rhs: Double) -> Double {
+        abs(atan2(sin(2 * (lhs - rhs)), cos(2 * (lhs - rhs)))) / 2
+    }
+
     private func phenotypeMetricScalars(_ metrics: BrushPhenotypeMetrics) -> [Double] {
         [
             metrics.area,
@@ -3416,6 +3818,11 @@ private struct CanonicalPhenotypeFixture {
     let name: String
     let strokeID: UUID
     let points: [StrokePoint]
+}
+
+private struct ShapeRenderSample {
+    let checksum: UInt64
+    let metrics: BrushPhenotypeMetrics
 }
 
 private actor RendererPreviewCallSuspension {

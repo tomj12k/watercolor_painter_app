@@ -10,8 +10,11 @@ enum ShaderSource {
         float4 color;
         float4 brush;
         float4 effects;
+        float4 orientation; // xy final unit orientation, z user rotation radians
+        float4 dynamics;    // x shape aspect, y bristle strength, z texture strength
         uint4 modes;
         uint4 extra;
+        uint4 behavior;
         uint4 stampRect;
     };
 
@@ -72,7 +75,7 @@ enum ShaderSource {
         return mix(base, fiber, secondary);
     }
 
-    float shapeCoverage(float2 normalized, uint shape) {
+    float legacyShapeCoverage(float2 normalized, uint shape) {
         float distance;
         switch (shape) {
             case 0:
@@ -98,6 +101,100 @@ enum ShaderSource {
                 break;
         }
         return clamp((1.0f - distance) / 0.28f, 0.0f, 1.0f);
+    }
+
+    float signedBoxDistance(float2 point, float2 halfSize) {
+        float2 offset = abs(point) - halfSize;
+        return length(max(offset, 0.0f)) + min(max(offset.x, offset.y), 0.0f);
+    }
+
+    float signedCapsuleDistance(float2 point, float halfLength, float radius) {
+        float2 nearest = float2(clamp(point.x, -halfLength, halfLength), 0.0f);
+        return length(point - nearest) - radius;
+    }
+
+    float fanFingerDistance(
+        float2 point,
+        float center,
+        float start,
+        float tip
+    ) {
+        float progress = clamp((point.x - start) / max(tip - start, 0.001f), 0.0f, 1.0f);
+        float halfWidth = mix(0.105f, 0.055f, progress);
+        float lateral = abs(point.y - center) - halfWidth;
+        float axial = max(start - point.x, point.x - tip);
+        return max(lateral, axial);
+    }
+
+    float proportionalShapeAntialias(float radius) {
+        // Keep roughly one pixel of transition on small stamps, then scale the
+        // transition with 4.5% of the footprint as the brush grows.
+        return clamp(max(1.2f / max(radius, 1.0f), 0.045f), 0.045f, 0.75f);
+    }
+
+    float versionOneShapeCoverage(
+        float2 normalized,
+        uint shape,
+        float4 orientation,
+        float shapeAspect,
+        float radius
+    ) {
+        if (shape == 0u) {
+            float antialias = proportionalShapeAntialias(radius);
+            return smoothstep(antialias, -antialias, length(normalized) - 1.0f);
+        }
+
+        float2 axis = orientation.xy;
+        if (!all(isfinite(axis)) || length_squared(axis) < 0.000001f) {
+            axis = float2(1.0f, 0.0f);
+        } else {
+            axis = normalize(axis);
+        }
+        float2 local = float2(
+            dot(normalized, axis),
+            dot(normalized, float2(-axis.y, axis.x))
+        );
+        float aspect = max(shapeAspect, 1.0f);
+        float distance;
+        switch (shape) {
+            case 1:
+                distance = signedBoxDistance(local, float2(1.0f / aspect, 1.0f));
+                break;
+            case 2: {
+                float halfWidth = 1.0f / aspect;
+                distance = signedCapsuleDistance(local, 1.0f - halfWidth, halfWidth);
+                break;
+            }
+            case 3: {
+                distance = fanFingerDistance(local, -0.72f, -0.84f, 0.56f);
+                distance = min(distance, fanFingerDistance(local, -0.36f, -0.84f, 0.84f));
+                distance = min(distance, fanFingerDistance(local,  0.00f, -0.84f, 1.00f));
+                distance = min(distance, fanFingerDistance(local,  0.36f, -0.84f, 0.84f));
+                distance = min(distance, fanFingerDistance(local,  0.72f, -0.84f, 0.56f));
+                break;
+            }
+            default: {
+                float halfWidth = 1.0f / aspect;
+                distance = signedCapsuleDistance(local, 1.0f - halfWidth, halfWidth);
+                break;
+            }
+        }
+        float antialias = proportionalShapeAntialias(radius);
+        return smoothstep(antialias, -antialias, distance);
+    }
+
+    float shapeCoverage(
+        float2 normalized,
+        uint shape,
+        uint behaviorVersion,
+        float4 orientation,
+        float shapeAspect,
+        float radius
+    ) {
+        if (behaviorVersion == 0u) {
+            return legacyShapeCoverage(normalized, shape);
+        }
+        return versionOneShapeCoverage(normalized, shape, orientation, shapeAspect, radius);
     }
 
     float hairCoverage(float coverage, uint hair, float noise) {
@@ -137,7 +234,14 @@ enum ShaderSource {
 
         uint slice = parameters.extra.z;
         float2 normalized = (float2(position) + 0.5f - parameters.centerRadius.xy) / parameters.centerRadius.zw;
-        float coverage = shapeCoverage(normalized, parameters.modes.y);
+        float coverage = shapeCoverage(
+            normalized,
+            parameters.modes.y,
+            parameters.behavior.x,
+            parameters.orientation,
+            parameters.dynamics.x,
+            parameters.centerRadius.z
+        );
         if (coverage <= 0.0f) {
             return;
         }
