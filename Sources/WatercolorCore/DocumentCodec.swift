@@ -20,7 +20,7 @@ extension DocumentCodecError: LocalizedError {
 }
 
 public enum PaintingDocumentCodec {
-    public static let maximumDocumentBytes = 256 * 1024 * 1024
+    public static let maximumDocumentBytes = PaintingProject.maximumSerializedStorageBytes
 
     struct AdmissionLimits: Sendable {
         let maximumDocumentBytes: Int
@@ -91,9 +91,11 @@ public enum PaintingDocumentCodec {
         }
 
         do {
-            try project.validate(
-                maximumTotalStrokePointCount: limits.maximumTotalStrokePointCount
-            )
+            try project.validate(limits: ProjectAdmissionLimits(
+                maximumCommandCount: PaintingProject.maximumCommandCount,
+                maximumTotalStrokePointCount: limits.maximumTotalStrokePointCount,
+                maximumSerializedStorageBytes: limits.maximumDocumentBytes
+            ))
         } catch let error as ProjectValidationError {
             throw DocumentCodecError.validationFailed(error)
         }

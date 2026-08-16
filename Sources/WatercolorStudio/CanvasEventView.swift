@@ -3,15 +3,30 @@ import Foundation
 import MetalKit
 import WatercolorCore
 
+enum StrokeExhaustionReason: Equatable, Sendable {
+    case pointCapacity(maximumPointCount: Int)
+
+    var message: String {
+        switch self {
+        case let .pointCapacity(maximumPointCount):
+            "This stroke reached its \(maximumPointCount)-point limit. Try a shorter stroke or use a larger brush for wider spacing."
+        }
+    }
+}
+
 struct StrokeAppendResult: Equatable {
     let points: [StrokePoint]
-    let isExhausted: Bool
+    let exhaustionReason: StrokeExhaustionReason?
+
+    var isExhausted: Bool { exhaustionReason != nil }
 }
 
 struct StrokeFinishResult {
     let stroke: StrokeCommand?
     let points: [StrokePoint]
-    let isExhausted: Bool
+    let exhaustionReason: StrokeExhaustionReason?
+
+    var isExhausted: Bool { exhaustionReason != nil }
 }
 
 struct CanvasStrokeBuilder {
@@ -22,7 +37,7 @@ struct CanvasStrokeBuilder {
     private var stroke: StrokeCommand?
     private var latestInputPoint: StrokePoint?
     private var distanceToNextSample: Double?
-    private var isExhausted = false
+    private var exhaustionReason: StrokeExhaustionReason?
 
     init(
         canvasSize: CGSize,
@@ -59,26 +74,29 @@ struct CanvasStrokeBuilder {
         )
         latestInputPoint = point
         distanceToNextSample = nil
-        isExhausted = false
+        exhaustionReason = nil
     }
 
     mutating func append(_ point: StrokePoint) -> StrokeAppendResult {
-        guard !isExhausted,
+        guard exhaustionReason == nil,
               stroke != nil,
               let previousInputPoint = latestInputPoint
         else {
-            return StrokeAppendResult(points: [], isExhausted: isExhausted)
+            return StrokeAppendResult(points: [], exhaustionReason: exhaustionReason)
         }
         let point = clamped(point)
         if samePosition(previousInputPoint, point) {
             latestInputPoint = point
-            return StrokeAppendResult(points: [], isExhausted: false)
+            return StrokeAppendResult(points: [], exhaustionReason: nil)
         }
         let spacing = samplingSpacing(for: stroke!.brush)
         let remainingCapacity = maximumPointCount - stroke!.points.count
         guard remainingCapacity > 0 else {
-            isExhausted = true
-            return StrokeAppendResult(points: [], isExhausted: true)
+            let reason = StrokeExhaustionReason.pointCapacity(
+                maximumPointCount: maximumPointCount
+            )
+            exhaustionReason = reason
+            return StrokeAppendResult(points: [], exhaustionReason: reason)
         }
 
         let sampling = StrokeSampler.sample(
@@ -91,8 +109,13 @@ struct CanvasStrokeBuilder {
         distanceToNextSample = sampling.distanceToNextSample
         latestInputPoint = point
         self.stroke?.points.append(contentsOf: sampling.points)
-        isExhausted = sampling.reachedPointLimit
-        return StrokeAppendResult(points: sampling.points, isExhausted: isExhausted)
+        if sampling.reachedPointLimit {
+            exhaustionReason = .pointCapacity(maximumPointCount: maximumPointCount)
+        }
+        return StrokeAppendResult(
+            points: sampling.points,
+            exhaustionReason: exhaustionReason
+        )
     }
 
     mutating func finish() -> StrokeCommand? {
@@ -104,29 +127,48 @@ struct CanvasStrokeBuilder {
             stroke = nil
             latestInputPoint = nil
             distanceToNextSample = nil
-            isExhausted = false
+            exhaustionReason = nil
         }
 
         var appendedPoints: [StrokePoint] = []
         if let point {
-            appendedPoints = append(point).points
+            let appendResult = append(point)
+            appendedPoints = appendResult.points
+            if let exhaustionReason = appendResult.exhaustionReason {
+                return StrokeFinishResult(
+                    stroke: nil,
+                    points: [],
+                    exhaustionReason: exhaustionReason
+                )
+            }
         }
-        guard !isExhausted, stroke != nil, let endpoint = latestInputPoint else {
-            return StrokeFinishResult(stroke: nil, points: [], isExhausted: true)
+        if let exhaustionReason {
+            return StrokeFinishResult(
+                stroke: nil,
+                points: [],
+                exhaustionReason: exhaustionReason
+            )
+        }
+        guard stroke != nil, let endpoint = latestInputPoint else {
+            return StrokeFinishResult(stroke: nil, points: [], exhaustionReason: nil)
         }
         guard let lastStoredPoint = stroke!.points.last else {
-            return StrokeFinishResult(stroke: nil, points: [], isExhausted: false)
+            return StrokeFinishResult(stroke: nil, points: [], exhaustionReason: nil)
         }
         if samePosition(lastStoredPoint, endpoint) {
             stroke!.points[stroke!.points.count - 1] = endpoint
         } else {
             guard stroke!.points.count < maximumPointCount else {
-                return StrokeFinishResult(stroke: nil, points: [], isExhausted: true)
+                return StrokeFinishResult(
+                    stroke: nil,
+                    points: [],
+                    exhaustionReason: .pointCapacity(maximumPointCount: maximumPointCount)
+                )
             }
             stroke!.points.append(endpoint)
             appendedPoints.append(endpoint)
         }
-        return StrokeFinishResult(stroke: stroke, points: appendedPoints, isExhausted: false)
+        return StrokeFinishResult(stroke: stroke, points: appendedPoints, exhaustionReason: nil)
     }
 
     private func samplingSpacing(for brush: BrushSettings) -> Double {
@@ -361,24 +403,24 @@ public final class CanvasEventView: MTKView {
     private func appendStrokePoint(from event: NSEvent) {
         guard strokeBuilder != nil else { return }
         let appendResult = strokeBuilder!.append(strokePoint(from: event))
-        guard !appendResult.isExhausted else {
-            model.cancelStrokePreview()
-            strokeBuilder = nil
-            updateInputAvailability()
+        guard let exhaustionReason = appendResult.exhaustionReason else {
+            guard !appendResult.points.isEmpty else { return }
+            if let strokeID = strokeBuilder?.strokeID {
+                model.appendStrokePreview(id: strokeID, points: appendResult.points)
+            }
             return
         }
-        guard !appendResult.points.isEmpty else { return }
-        if let strokeID = strokeBuilder?.strokeID {
-            model.appendStrokePreview(id: strokeID, points: appendResult.points)
-        }
+        model.cancelStrokePreview(reason: exhaustionReason)
+        strokeBuilder = nil
+        updateInputAvailability()
     }
 
     private func completeStroke(with event: NSEvent) {
         guard strokeBuilder != nil else { return }
         let completion = strokeBuilder!.finish(at: strokePoint(from: event))
         strokeBuilder = nil
-        guard !completion.isExhausted else {
-            model.cancelStrokePreview()
+        if let exhaustionReason = completion.exhaustionReason {
+            model.cancelStrokePreview(reason: exhaustionReason)
             updateInputAvailability()
             return
         }

@@ -73,6 +73,34 @@ import Testing
         }
     }
 
+    @Test func retainedRendererCheckpointsParticipateInCandidatePeakAdmission() throws {
+        let exactPolicy = RendererResourcePolicy(maximumWorkingSetBytes: 5_484)
+
+        let estimate = try exactPolicy.admit(
+            width: 8,
+            height: 4,
+            layerCapacity: 2,
+            structuralCandidateCapacity: 3,
+            retainedCheckpointBytes: 100
+        )
+
+        #expect(estimate.retainedCheckpointBytes == 100)
+        #expect(estimate.totalBytes == 5_484)
+
+        let rejectingPolicy = RendererResourcePolicy(maximumWorkingSetBytes: 5_483)
+        #expect(
+            throws: RendererError.resourceBudgetExceeded(required: 5_484, available: 5_483)
+        ) {
+            try rejectingPolicy.admit(
+                width: 8,
+                height: 4,
+                layerCapacity: 2,
+                structuralCandidateCapacity: 3,
+                retainedCheckpointBytes: 100
+            )
+        }
+    }
+
     @Test func estimateRejectsIntegerOverflow() {
         let policy = RendererResourcePolicy(maximumWorkingSetBytes: .max)
 
@@ -99,9 +127,20 @@ import Testing
         }
     }
 
-    @Test func zeroRecommendedWorkingSetUsesTheFallbackBudget() {
-        let policy = RendererResourcePolicy(recommendedMaximumWorkingSetBytes: 0)
+    @Test(arguments: [
+        (recommended: UInt64(0), expected: 536_870_912),
+        (recommended: UInt64(268_435_456), expected: 93_952_409),
+        (recommended: UInt64(1_073_741_824), expected: 375_809_638),
+        (recommended: UInt64(17_179_869_184), expected: 2_147_483_648)
+    ])
+    func liveBudgetUsesFallbackOnlyForAnUnavailableRecommendation(
+        recommended: UInt64,
+        expected: Int
+    ) {
+        let policy = RendererResourcePolicy(
+            recommendedMaximumWorkingSetBytes: recommended
+        )
 
-        #expect(policy.maximumWorkingSetBytes == 512 * 1024 * 1024)
+        #expect(policy.maximumWorkingSetBytes == expected)
     }
 }

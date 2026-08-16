@@ -180,6 +180,195 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 48, y: 48).alpha > 0.1)
     }
 
+    @Test func activePreviewRejectsEveryPublicNontransactionalMutation() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        let preview = StrokeCommand.testDot(layerID: project.layers[0].id)
+        let otherStroke = StrokeCommand.testDot(
+            layerID: project.layers[0].id,
+            x: 16,
+            y: 16
+        )
+
+        func assertRejected(
+            _ label: String,
+            prepare: (WatercolorRenderer) throws -> Void = { _ in },
+            operation: (WatercolorRenderer) throws -> Void
+        ) throws {
+            let renderer = try WatercolorRenderer(project: project, device: device)
+            try prepare(renderer)
+            let checksumBefore = try renderer.compositeChecksum()
+            let projectBefore = renderer.project
+            let token = try renderer.beginStrokePreview(preview)
+            do {
+                try operation(renderer)
+                Issue.record("Expected active preview to reject \(label)")
+            } catch let error as RendererError {
+                #expect(error == .invalidStrokePreview)
+            }
+            try renderer.cancelStrokePreview(token)
+            #expect(renderer.project == projectBefore)
+            #expect(try renderer.compositeChecksum() == checksumBefore)
+        }
+
+        try assertRejected("render") { renderer in
+            try renderer.render(stroke: otherStroke)
+        }
+        try assertRejected("renderAndWait") { renderer in
+            try renderer.renderAndWait(stroke: otherStroke)
+        }
+        try assertRejected("recordRenderedStroke") { renderer in
+            try renderer.recordRenderedStroke(otherStroke)
+        }
+        try assertRejected("replay") { renderer in
+            try renderer.replay(project: project)
+        }
+        try assertRejected("applyMetadata") { renderer in
+            var updated = project
+            updated.layers[0].opacity = 0.5
+            try renderer.applyMetadata(project: updated)
+        }
+        try assertRejected("dry") { renderer in
+            try renderer.dry(layerID: project.layers[0].id, steps: 1)
+        }
+        try assertRejected("previewLayerOpacity") { renderer in
+            try renderer.previewLayerOpacity(id: project.layers[0].id, opacity: 0.5)
+        }
+        try assertRejected(
+            "clearLayerOpacityPreview",
+            prepare: { renderer in
+                try renderer.previewLayerOpacity(id: project.layers[0].id, opacity: 0.5)
+            },
+            operation: { renderer in
+                try renderer.clearLayerOpacityPreview(id: project.layers[0].id)
+            }
+        )
+    }
+
+    @Test func atomicRenderAndRecordRejectsEveryProspectiveProjectBoundary() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+
+        func assertRejected(
+            project: PaintingProject,
+            limits: ProjectAdmissionLimits,
+            stroke: StrokeCommand,
+            expected: ProjectValidationError
+        ) throws {
+            var strokeSubmissions = 0
+            let renderer = try WatercolorRenderer(
+                project: project,
+                device: device,
+                debugProjectAdmissionLimits: limits,
+                debugCommandBufferError: { commandBuffer in
+                    if commandBuffer.label == "Watercolor stroke" {
+                        strokeSubmissions += 1
+                    }
+                    return commandBuffer.error
+                }
+            )
+            let checksumBefore = try renderer.compositeChecksum()
+
+            #expect(throws: RendererError.invalidProject(expected)) {
+                try renderer.renderAndRecord(stroke: stroke)
+            }
+
+            #expect(strokeSubmissions == 0)
+            #expect(renderer.project == project)
+            #expect(try renderer.compositeChecksum() == checksumBefore)
+        }
+
+        var commandProject = PaintingProject.testCanvas(64)
+        commandProject.commands = (0..<2).map { _ in
+            .clearLayer(LayerCommand(layerID: UUID()))
+        }
+        let commandStroke = StrokeCommand.testDot(layerID: commandProject.layers[0].id)
+        try assertRejected(
+            project: commandProject,
+            limits: ProjectAdmissionLimits(
+                maximumCommandCount: 2,
+                maximumTotalStrokePointCount: 8,
+                maximumSerializedStorageBytes: 32 * 1024
+            ),
+            stroke: commandStroke,
+            expected: .commandLimitExceeded(3)
+        )
+
+        var pointProject = PaintingProject.testCanvas(64)
+        var existingStroke = StrokeCommand.testDot(layerID: pointProject.layers[0].id)
+        existingStroke.points.append(StrokePoint(
+            x: 33, y: 32, pressure: 1, tiltX: 0, tiltY: 0, time: 1
+        ))
+        pointProject.commands = [.stroke(existingStroke)]
+        var pointStroke = StrokeCommand.testDot(layerID: pointProject.layers[0].id)
+        pointStroke.points.append(StrokePoint(
+            x: 17, y: 16, pressure: 1, tiltX: 0, tiltY: 0, time: 1
+        ))
+        try assertRejected(
+            project: pointProject,
+            limits: ProjectAdmissionLimits(
+                maximumCommandCount: 4,
+                maximumTotalStrokePointCount: 3,
+                maximumSerializedStorageBytes: 32 * 1024
+            ),
+            stroke: pointStroke,
+            expected: .totalStrokePointLimitExceeded(4)
+        )
+
+        let storageProject = PaintingProject.testCanvas(64)
+        let storageStroke = StrokeCommand.testDot(layerID: storageProject.layers[0].id)
+        try assertRejected(
+            project: storageProject,
+            limits: ProjectAdmissionLimits(
+                maximumCommandCount: 4,
+                maximumTotalStrokePointCount: 8,
+                maximumSerializedStorageBytes: 6_000
+            ),
+            stroke: storageStroke,
+            expected: .documentByteLimitExceeded(7_454)
+        )
+
+        let duplicateID = UUID(uuidString: "4C8D7524-9274-453E-B2F9-CDA1B196AB87")!
+        var duplicateProject = PaintingProject.testCanvas(64)
+        duplicateProject.commands = [
+            .clearLayer(LayerCommand(id: duplicateID, layerID: UUID()))
+        ]
+        let duplicateStroke = StrokeCommand.testDot(
+            id: duplicateID,
+            layerID: duplicateProject.layers[0].id
+        )
+        try assertRejected(
+            project: duplicateProject,
+            limits: ProjectAdmissionLimits(
+                maximumCommandCount: 4,
+                maximumTotalStrokePointCount: 8,
+                maximumSerializedStorageBytes: 32 * 1024
+            ),
+            stroke: duplicateStroke,
+            expected: .duplicateCommandIdentifier(duplicateID)
+        )
+    }
+
+    @Test func recordRenderedStrokeCannotCreateAnInvalidProject() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let duplicateID = UUID(uuidString: "E020FB42-DA9A-40F5-B6C7-B720FB3E7D59")!
+        var project = PaintingProject.testCanvas(64)
+        project.commands = [
+            .clearLayer(LayerCommand(id: duplicateID, layerID: UUID()))
+        ]
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let duplicateStroke = StrokeCommand.testDot(
+            id: duplicateID,
+            layerID: project.layers[0].id
+        )
+
+        #expect(
+            throws: RendererError.invalidProject(.duplicateCommandIdentifier(duplicateID))
+        ) {
+            try renderer.recordRenderedStroke(duplicateStroke)
+        }
+        #expect(renderer.project == project)
+    }
+
     @Test func rendererCapacityTracksEightAndTwelveLiveLayers() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         func project(layerCount: Int) -> PaintingProject {
@@ -267,6 +456,84 @@ import WatercolorCore
             #expect(dispatch.activeSliceDepth == 1)
             #expect(try renderer.compositeChecksum() != 0)
         }
+    }
+
+    @Test func benchmarkConfiguredMaximumPreviewCommitAndCancelLatency() async throws {
+        guard ProcessInfo.processInfo.environment["WATERCOLOR_RUN_BENCHMARK"] == "1",
+              let device = MTLCreateSystemDefaultDevice()
+        else { return }
+
+        let configuredMaximumPointCount = 512
+        let project = PaintingProject.testCanvas(64)
+        let admissionLimits = ProjectAdmissionLimits(
+            maximumCommandCount: 4,
+            maximumTotalStrokePointCount: configuredMaximumPointCount,
+            maximumSerializedStorageBytes: 256 * 1024
+        )
+        var stroke = StrokeCommand.testDot(layerID: project.layers[0].id)
+        stroke.brush.size = 4
+        stroke.points = (0..<configuredMaximumPointCount).map { index in
+            let progress = Double(index) / Double(configuredMaximumPointCount - 1)
+            return StrokePoint(
+                x: 8 + progress * 48,
+                y: 32 + sin(progress * .pi * 8) * 16,
+                pressure: 0.8,
+                tiltX: 0,
+                tiltY: 0,
+                time: progress
+            )
+        }
+        var initial = stroke
+        initial.points = [stroke.points[0]]
+
+        let commitRenderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugProjectAdmissionLimits: admissionLimits,
+            debugCommandBufferError: { $0.error }
+        )
+        let commitToken = try commitRenderer.beginStrokePreview(initial)
+        let encodeStart = ProcessInfo.processInfo.systemUptime
+        try await commitRenderer.appendStrokePreview(
+            id: stroke.id,
+            points: Array(stroke.points.dropFirst()),
+            token: commitToken
+        )
+        let encodeMilliseconds = (ProcessInfo.processInfo.systemUptime - encodeStart) * 1_000
+        let commitStart = ProcessInfo.processInfo.systemUptime
+        try await commitRenderer.finishStrokePreview(stroke, token: commitToken)
+        try commitRenderer.recordRenderedStroke(stroke)
+        let commitMilliseconds = (ProcessInfo.processInfo.systemUptime - commitStart) * 1_000
+
+        let cancelRenderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugProjectAdmissionLimits: admissionLimits,
+            debugCommandBufferError: { $0.error }
+        )
+        let checksumBeforeCancel = try cancelRenderer.compositeChecksum()
+        let cancelToken = try cancelRenderer.beginStrokePreview(initial)
+        try await cancelRenderer.appendStrokePreview(
+            id: stroke.id,
+            points: Array(stroke.points.dropFirst()),
+            token: cancelToken
+        )
+        let cancelStart = ProcessInfo.processInfo.systemUptime
+        try await cancelRenderer.restoreStrokePreviewCancellation(cancelToken)
+        let cancelMilliseconds = (ProcessInfo.processInfo.systemUptime - cancelStart) * 1_000
+
+        print(
+            "WATERCOLOR_RESOURCE_LATENCY phase=preview_transaction "
+                + "configured_max_points=\(configuredMaximumPointCount) "
+                + "encode_ms=\(String(format: "%.3f", encodeMilliseconds)) "
+                + "commit_ms=\(String(format: "%.3f", commitMilliseconds)) "
+                + "cancel_ms=\(String(format: "%.3f", cancelMilliseconds))"
+        )
+        #expect(commitRenderer.project.commands == [.stroke(stroke)])
+        #expect(try cancelRenderer.compositeChecksum() == checksumBeforeCancel)
+        #expect(encodeMilliseconds < 2_000)
+        #expect(commitMilliseconds < 2_000)
+        #expect(cancelMilliseconds < 2_000)
     }
 
     @Test func strokeSimulationUsesBatchesPaddedDirtyRegionsAndActiveSlices() throws {
@@ -565,6 +832,73 @@ import WatercolorCore
         #expect(try renderer.compositeChecksum() == previewChecksum)
     }
 
+    @Test(arguments: [
+        (tool: PaintTool.brush, pointCount: 16),
+        (tool: PaintTool.brush, pointCount: 19),
+        (tool: PaintTool.smudge, pointCount: 16),
+        (tool: PaintTool.smear, pointCount: 19)
+    ])
+    func previewFinishEncodesOnlyTheUnpreviewedCanonicalRemainder(
+        tool: PaintTool,
+        pointCount: Int
+    ) async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.testCanvas(128)
+        project.commands = [
+            .stroke(.testDot(
+                id: UUID(uuidString: "494B919D-5FB1-49BE-A8C5-E970A9F9C1ED")!,
+                layerID: project.layers[0].id,
+                x: 64,
+                y: 64
+            ))
+        ]
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var complete = StrokeCommand.testDot(
+            id: UUID(uuidString: "5DD4CDB3-F584-4322-A19D-68BFC85B298A")!,
+            layerID: project.layers[0].id
+        )
+        complete.tool = tool
+        var points: [StrokePoint] = []
+        for index in 0..<pointCount {
+            points.append(StrokePoint(
+                x: Double(24 + index * 4),
+                y: Double(64 + index % 3),
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
+            ))
+        }
+        complete.points = points
+        var initial = complete
+        initial.points = [complete.points[0]]
+        let token = try renderer.beginStrokePreview(initial)
+        try await renderer.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points.dropFirst()),
+            token: token
+        )
+
+        var prefixProject = project
+        var prefix = complete
+        prefix.points = Array(complete.points.prefix(pointCount - pointCount % 8))
+        prefixProject.commands.append(.stroke(prefix))
+        let freshPrefix = try WatercolorRenderer(project: prefixProject, device: device)
+        let preFinishChecksum = try renderer.compositeChecksum()
+        #expect(preFinishChecksum == (try freshPrefix.compositeChecksum()))
+
+        try await renderer.finishStrokePreview(complete, token: token)
+
+        var completedProject = project
+        completedProject.commands.append(.stroke(complete))
+        let freshCompleted = try WatercolorRenderer(project: completedProject, device: device)
+        #expect(renderer.debugLastPreviewFinishEncodedPointCount == pointCount % 8)
+        #expect(try renderer.compositeChecksum() == freshCompleted.compositeChecksum())
+        if pointCount % 8 == 0 {
+            #expect(try renderer.compositeChecksum() == preFinishChecksum)
+        }
+    }
+
     @Test func emptyIncrementalPreviewDeltaDoesNotSubmitGPUWork() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
@@ -635,6 +969,86 @@ import WatercolorCore
         let recoveryToken = try renderer.beginStrokePreview(recovery)
         try await renderer.finishStrokePreview(recovery, token: recoveryToken)
         #expect(try renderer.debugPixel(x: 32, y: 32).alpha > 0.1)
+    }
+
+    @Test func previewWorkBudgetSpansEveryDeltaInOneSemanticStroke() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        let workPolicy = RendererWorkPolicy(
+            maximumCommandThreads: 140_000,
+            maximumProjectThreads: 140_000
+        )
+        var splitSubmissions = 0
+        let splitRenderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugWorkPolicy: workPolicy,
+            debugCommandBufferError: { commandBuffer in
+                if commandBuffer.label == "Watercolor stroke preview" {
+                    splitSubmissions += 1
+                }
+                return commandBuffer.error
+            }
+        )
+        var complete = StrokeCommand.testDot(layerID: project.layers[0].id)
+        complete.points = (0..<16).map { index in
+            StrokePoint(
+                x: 32,
+                y: 32,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
+            )
+        }
+        var initial = complete
+        initial.points = [complete.points[0]]
+        let checksumBefore = try splitRenderer.compositeChecksum()
+        let splitToken = try splitRenderer.beginStrokePreview(initial)
+
+        try await splitRenderer.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points[1..<8]),
+            token: splitToken
+        )
+        let admittedPrefixChecksum = try splitRenderer.compositeChecksum()
+        #expect(splitSubmissions == 1)
+
+        await #expect(throws: RendererError.self) {
+            try await splitRenderer.appendStrokePreview(
+                id: complete.id,
+                points: Array(complete.points[8..<16]),
+                token: splitToken
+            )
+        }
+        #expect(splitSubmissions == 1)
+        #expect(try splitRenderer.compositeChecksum() == admittedPrefixChecksum)
+        try splitRenderer.cancelStrokePreview(splitToken)
+        #expect(try splitRenderer.compositeChecksum() == checksumBefore)
+
+        var singleSubmissionCount = 0
+        let singleRenderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugWorkPolicy: workPolicy,
+            debugCommandBufferError: { commandBuffer in
+                if commandBuffer.label == "Watercolor stroke preview" {
+                    singleSubmissionCount += 1
+                }
+                return commandBuffer.error
+            }
+        )
+        let singleToken = try singleRenderer.beginStrokePreview(initial)
+        await #expect(throws: RendererError.self) {
+            try await singleRenderer.appendStrokePreview(
+                id: complete.id,
+                points: Array(complete.points[1..<16]),
+                token: singleToken
+            )
+        }
+        #expect(singleSubmissionCount == 0)
+        #expect(try singleRenderer.compositeChecksum() == checksumBefore)
+        try singleRenderer.cancelStrokePreview(singleToken)
     }
 
     @Test func overlappingAppendIsRejectedWithoutReusingTheInFlightBatchOffset() async throws {
@@ -880,6 +1294,73 @@ import WatercolorCore
         #expect(try renderer.debugWetness(x: 16, y: 16, layerID: first.id) == wetnessBefore)
     }
 
+    @Test func asynchronousCancellationNeverUsesACommandBufferBlockingWait() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var preview = StrokeCommand.testDot(layerID: project.layers[0].id)
+        preview.points = (0..<8).map { index in
+            StrokePoint(
+                x: Double(16 + index * 4),
+                y: 32,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
+            )
+        }
+        var initial = preview
+        initial.points = [preview.points[0]]
+        let token = try renderer.beginStrokePreview(initial)
+        try await renderer.appendStrokePreview(
+            id: preview.id,
+            points: Array(preview.points.dropFirst()),
+            token: token
+        )
+
+        try await renderer.restoreStrokePreviewCancellation(token)
+
+        #expect(renderer.debugSynchronousPreviewCancellationWaitCount == 0)
+    }
+
+    @Test func asynchronousCancellationReplayNeverBlocksForGPUCompletion() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let wet = PaintLayer(name: "Wet")
+        let selected = PaintLayer(name: "Selected")
+        var project = PaintingProject(
+            canvas: CanvasSize(width: 64, height: 64),
+            paper: .rough,
+            layers: [wet, selected]
+        )
+        project.commands = [.stroke(.testDot(layerID: wet.id, x: 16, y: 16))]
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let checksumBefore = try renderer.compositeChecksum()
+        var preview = StrokeCommand.testDot(layerID: selected.id)
+        preview.points = (0..<8).map { index in
+            StrokePoint(
+                x: Double(32 + index * 3),
+                y: 40,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
+            )
+        }
+        var initial = preview
+        initial.points = [preview.points[0]]
+        let token = try renderer.beginStrokePreview(initial)
+        try await renderer.appendStrokePreview(
+            id: preview.id,
+            points: Array(preview.points.dropFirst()),
+            token: token
+        )
+
+        try await renderer.restoreStrokePreviewCancellation(token)
+
+        #expect(renderer.debugSynchronousPreviewCancellationReplayCount == 0)
+        #expect(try renderer.compositeChecksum() == checksumBefore)
+    }
+
     @Test func failedMultilayerPreviewFinishReplaysCommittedProject() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let first = PaintLayer(name: "Wet")
@@ -904,6 +1385,7 @@ import WatercolorCore
                     : commandBuffer.error
             }
         )
+        let synchronousReplayCountBefore = renderer.debugSynchronousReplaySubmissionCount
         let checksumBefore = try renderer.compositeChecksum()
         let wetnessBefore = try renderer.debugWetness(x: 16, y: 16, layerID: first.id)
         var preview = StrokeCommand.testDot(layerID: second.id)
@@ -930,6 +1412,11 @@ import WatercolorCore
         await #expect(throws: RendererError.self) {
             try await renderer.finishStrokePreview(preview, token: token)
         }
+        #expect(
+            renderer.debugSynchronousReplaySubmissionCount
+                == synchronousReplayCountBefore
+        )
+        #expect(renderer.debugSynchronousPreviewCancellationReplayCount == 0)
         #expect(try renderer.compositeChecksum() == checksumBefore)
         #expect(try renderer.debugWetness(x: 16, y: 16, layerID: first.id) == wetnessBefore)
     }
@@ -952,6 +1439,7 @@ import WatercolorCore
                     : commandBuffer.error
             }
         )
+        let synchronousReplayCountBefore = renderer.debugSynchronousReplaySubmissionCount
         let checksumBefore = try renderer.compositeChecksum()
         let preview = StrokeCommand.testDot(layerID: project.layers[0].id, x: 48, y: 48)
 
@@ -960,6 +1448,11 @@ import WatercolorCore
         await #expect(throws: RendererError.self) {
             try await renderer.finishStrokePreview(preview, token: token)
         }
+        #expect(
+            renderer.debugSynchronousReplaySubmissionCount
+                == synchronousReplayCountBefore
+        )
+        #expect(renderer.debugSynchronousPreviewCancellationWaitCount == 0)
         #expect(try renderer.compositeChecksum() == checksumBefore)
     }
 
@@ -984,6 +1477,38 @@ import WatercolorCore
         let second = try renderer.debugPixel(x: 29, y: 31)
 
         #expect(first == second)
+    }
+
+    @Test(arguments: [32, 128])
+    func publicReplayRejectsCanvasDimensionChangesBeforeMutation(
+        replacementSide: Int
+    ) async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let checksumBefore = try renderer.compositeChecksum()
+        var replacement = project
+        replacement.canvas = CanvasSize(width: replacementSide, height: replacementSide)
+
+        do {
+            try renderer.replay(project: replacement)
+            Issue.record("Expected dimension-changing replay to require makeCandidate")
+            return
+        } catch let error as RendererError {
+            #expect(error == .invalidMetadataChange)
+        }
+
+        #expect(renderer.project == project)
+        #expect(try renderer.compositeChecksum() == checksumBefore)
+        let preview = StrokeCommand.testDot(layerID: project.layers[0].id)
+        let token = try renderer.beginStrokePreview(preview)
+        try await renderer.finishStrokePreview(preview, token: token)
+        let committedPreviewChecksum = try renderer.compositeChecksum()
+        let secondToken = try renderer.beginStrokePreview(
+            .testDot(layerID: project.layers[0].id, x: 16, y: 16)
+        )
+        try renderer.cancelStrokePreview(secondToken)
+        #expect(try renderer.compositeChecksum() == committedPreviewChecksum)
     }
 
     @Test func discardedStrokeStillAdvancesSurvivingWetLayer() throws {

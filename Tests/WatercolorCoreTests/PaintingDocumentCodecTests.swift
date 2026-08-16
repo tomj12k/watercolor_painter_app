@@ -46,6 +46,41 @@ import Testing
         #expect(try PaintingDocumentCodec.decode(data, limits: limits) == project)
     }
 
+    @Test func benchmarkConfiguredMaximumLengthEncodingLatency() throws {
+        guard ProcessInfo.processInfo.environment["WATERCOLOR_RUN_BENCHMARK"] == "1" else {
+            return
+        }
+        let configuredMaximumPointCount = 512
+        let project = PaintingProject.pointLimitFixture(
+            pointCount: configuredMaximumPointCount,
+            point: StrokePoint(
+                x: 123.456_789_012_345_67,
+                y: 234.567_890_123_456_78,
+                pressure: 0.876_543_210_987_654_3,
+                tiltX: -0.123_456_789_012_345_67,
+                tiltY: 0.123_456_789_012_345_67,
+                time: 123_456_789_012_345.67
+            )
+        )
+        let limits = PaintingDocumentCodec.AdmissionLimits(
+            maximumDocumentBytes: 256 * 1024,
+            maximumTotalStrokePointCount: configuredMaximumPointCount
+        )
+
+        let start = ProcessInfo.processInfo.systemUptime
+        let data = try PaintingDocumentCodec.encode(project, limits: limits)
+        let elapsedMilliseconds = (ProcessInfo.processInfo.systemUptime - start) * 1_000
+
+        print(
+            "WATERCOLOR_RESOURCE_LATENCY phase=document_encode "
+                + "configured_max_points=\(configuredMaximumPointCount) "
+                + "elapsed_ms=\(String(format: "%.3f", elapsedMilliseconds)) "
+                + "encoded_bytes=\(data.count)"
+        )
+        #expect(data.count <= limits.maximumDocumentBytes)
+        #expect(elapsedMilliseconds < 1_000)
+    }
+
     @Test func codecRejectsDataAboveTheDocumentByteLimitBeforeDecoding() {
         let limits = PaintingDocumentCodec.AdmissionLimits(
             maximumDocumentBytes: 4 * 1024,
@@ -70,6 +105,27 @@ import Testing
 
         #expect(throws: DocumentCodecError.validationFailed(.totalStrokePointLimitExceeded(129))) {
             _ = try PaintingDocumentCodec.encode(project, limits: limits)
+        }
+    }
+
+    @Test func codecUsesConservativeStorageAdmissionBeforeEncoding() throws {
+        var project = PaintingProject.newDefault()
+        project.commands = (0..<12).map { _ in
+            .clearLayer(LayerCommand(layerID: UUID()))
+        }
+        let limits = PaintingDocumentCodec.AdmissionLimits(
+            maximumDocumentBytes: 24 * 1024,
+            maximumTotalStrokePointCount: 128
+        )
+        #expect(try JSONEncoder().encode(project).count < limits.maximumDocumentBytes)
+
+        do {
+            _ = try PaintingDocumentCodec.encode(project, limits: limits)
+            Issue.record("Expected conservative storage admission to reject the project")
+        } catch let DocumentCodecError.validationFailed(.documentByteLimitExceeded(required)) {
+            #expect(required > limits.maximumDocumentBytes)
+        } catch {
+            Issue.record("Expected documentByteLimitExceeded, got \(error)")
         }
     }
 

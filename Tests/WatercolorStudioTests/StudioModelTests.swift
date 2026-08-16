@@ -47,16 +47,29 @@ import WatercolorCore
 
     @Test func commandCapacityIsCheckedBeforeRendering() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let maximumCommandCount = 2
         var project = PaintingProject.studioTestProject()
-        project.commands = (0..<PaintingProject.maximumCommandCount).map { _ in
+        project.commands = (0..<maximumCommandCount).map { _ in
             .clearLayer(LayerCommand(layerID: UUID()))
         }
-        let renderer = try WatercolorRenderer(project: project, device: device)
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugProjectAdmissionLimits: ProjectAdmissionLimits(
+                maximumCommandCount: maximumCommandCount,
+                maximumTotalStrokePointCount: 128,
+                maximumSerializedStorageBytes: 1_048_576
+            ),
+            debugCommandBufferError: { $0.error }
+        )
         var documentUpdates: [PaintingProject] = []
         let model = StudioModel(
             project: project,
             renderer: renderer,
-            onDocumentUpdate: { documentUpdates.append($0) }
+            onDocumentUpdate: { documentUpdates.append($0) },
+            maximumCommandCount: maximumCommandCount,
+            maximumTotalStrokePointCount: 128,
+            maximumSerializedStorageBytes: 1_048_576
         )
         let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
         let checksumBefore = try renderer.studioChecksum()
@@ -64,30 +77,43 @@ import WatercolorCore
         model.beginStrokePreview(stroke)
 
         #expect(!model.isStrokePreviewActive)
-        #expect(model.project.commands.count == PaintingProject.maximumCommandCount)
-        #expect(model.rendererProject.commands.count == PaintingProject.maximumCommandCount)
+        #expect(model.project.commands.count == maximumCommandCount)
+        #expect(model.rendererProject.commands.count == maximumCommandCount)
         #expect(documentUpdates.isEmpty)
-        #expect(model.error?.message.contains("100000") == true)
+        #expect(model.error?.message.contains("2") == true)
         #expect(try renderer.studioChecksum() == checksumBefore)
 
         model.completeStroke(stroke)
 
-        #expect(model.project.commands.count == PaintingProject.maximumCommandCount)
-        #expect(model.rendererProject.commands.count == PaintingProject.maximumCommandCount)
+        #expect(model.project.commands.count == maximumCommandCount)
+        #expect(model.rendererProject.commands.count == maximumCommandCount)
         #expect(documentUpdates.isEmpty)
-        #expect(model.error?.message.contains("100000") == true)
+        #expect(model.error?.message.contains("2") == true)
         #expect(try renderer.studioChecksum() == checksumBefore)
     }
 
     @Test func aggregatePointCapacityIsCheckedBeforeSynchronousRendering() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let project = PaintingProject.studioPointCapacityProject(pointCount: 1_999_999)
-        let renderer = try WatercolorRenderer(project: project, device: device)
+        let maximumTotalStrokePointCount = 4
+        let project = PaintingProject.studioPointCapacityProject(pointCount: 3)
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugProjectAdmissionLimits: ProjectAdmissionLimits(
+                maximumCommandCount: 8,
+                maximumTotalStrokePointCount: maximumTotalStrokePointCount,
+                maximumSerializedStorageBytes: 1_048_576
+            ),
+            debugCommandBufferError: { $0.error }
+        )
         var documentUpdates: [PaintingProject] = []
         let model = StudioModel(
             project: project,
             renderer: renderer,
-            onDocumentUpdate: { documentUpdates.append($0) }
+            onDocumentUpdate: { documentUpdates.append($0) },
+            maximumCommandCount: 8,
+            maximumTotalStrokePointCount: maximumTotalStrokePointCount,
+            maximumSerializedStorageBytes: 1_048_576
         )
         var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
         stroke.points.append(StrokePoint(x: 129, y: 128, pressure: 1, tiltX: 0, tiltY: 0, time: 1))
@@ -102,29 +128,125 @@ import WatercolorCore
         #expect(try renderer.studioChecksum() == checksumBefore)
     }
 
-    @Test func previewCommitRechecksAggregatePointCapacityAfterAwaitingUpdates() async throws {
+    @Test func serializedStorageCapacityIsCheckedBeforeEveryStrokeMutation() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let project = PaintingProject.studioPointCapacityProject(pointCount: 1_999_999)
+        let project = PaintingProject.studioTestProject()
         let renderer = try WatercolorRenderer(project: project, device: device)
         var documentUpdates: [PaintingProject] = []
         let model = StudioModel(
             project: project,
             renderer: renderer,
-            onDocumentUpdate: { documentUpdates.append($0) }
+            onDocumentUpdate: { documentUpdates.append($0) },
+            maximumSerializedStorageBytes: 6_000
         )
-        let preview = StrokeCommand.studioTestStroke(layerID: project.layers[0].id, x: 64, y: 64)
-        var finalStroke = preview
-        finalStroke.points.append(StrokePoint(x: 96, y: 64, pressure: 1, tiltX: 0, tiltY: 0, time: 1))
+        let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
         let checksumBefore = try renderer.studioChecksum()
 
+        #expect(model.beginStrokePreview(stroke) == .unavailable)
+        #expect(model.error?.message.contains("document storage capacity") == true)
+        #expect(!model.isStrokePreviewActive)
+
+        model.completeStroke(stroke)
+
+        #expect(model.project == project)
+        #expect(model.rendererProject == project)
+        #expect(documentUpdates.isEmpty)
+        #expect(model.error?.message.contains("document storage capacity") == true)
+        #expect(try renderer.studioChecksum() == checksumBefore)
+    }
+
+    @Test func directStrokeUsesAtomicRendererAdmissionBeforeSubmission() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        var strokeSubmissions = 0
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugProjectAdmissionLimits: ProjectAdmissionLimits(
+                maximumCommandCount: 4,
+                maximumTotalStrokePointCount: 8,
+                maximumSerializedStorageBytes: 6_000
+            ),
+            debugCommandBufferError: { commandBuffer in
+                if commandBuffer.label == "Watercolor stroke" {
+                    strokeSubmissions += 1
+                }
+                return commandBuffer.error
+            }
+        )
+        let model = StudioModel(project: project, renderer: renderer)
+        let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
+        let checksumBefore = try renderer.studioChecksum()
+
+        model.completeStroke(stroke)
+
+        #expect(strokeSubmissions == 0)
+        #expect(model.project == project)
+        #expect(model.rendererProject == project)
+        #expect(try renderer.studioChecksum() == checksumBefore)
+        #expect(model.error?.message.contains("unsafe to render") == true)
+    }
+
+    @Test func previewCommitRechecksAggregatePointCapacityAfterAwaitingUpdates() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let maximumTotalStrokePointCount = 10
+        let project = PaintingProject.studioPointCapacityProject(pointCount: 3)
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugProjectAdmissionLimits: ProjectAdmissionLimits(
+                maximumCommandCount: 8,
+                maximumTotalStrokePointCount: maximumTotalStrokePointCount,
+                maximumSerializedStorageBytes: 1_048_576
+            ),
+            debugCommandBufferError: { $0.error }
+        )
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) },
+            maximumCommandCount: 8,
+            maximumTotalStrokePointCount: maximumTotalStrokePointCount,
+            maximumSerializedStorageBytes: 1_048_576
+        )
+        var finalStroke = StrokeCommand.studioTestStroke(
+            layerID: project.layers[0].id,
+            x: 64,
+            y: 64
+        )
+        finalStroke.points = (0..<8).map { index in
+            StrokePoint(
+                x: Double(64 + index * 8),
+                y: 64,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
+            )
+        }
+        var preview = finalStroke
+        preview.points = [finalStroke.points[0]]
+        let checksumBefore = try renderer.studioChecksum()
+        let synchronousReplayCountBefore = renderer.debugSynchronousReplaySubmissionCount
+
         model.beginStrokePreview(preview)
+        model.appendStrokePreview(
+            id: preview.id,
+            points: Array(finalStroke.points.dropFirst())
+        )
         await model.waitForStrokePreviewIdle()
         #expect(model.isStrokePreviewActive)
-        #expect(try renderer.studioChecksum() == checksumBefore)
 
         await model.commitStrokePreview(finalStroke)
 
         #expect(!model.isStrokePreviewActive)
+        #expect(
+            renderer.debugSynchronousReplaySubmissionCount
+                == synchronousReplayCountBefore
+        )
+        #expect(renderer.debugSynchronousPreviewCancellationWaitCount == 0)
+        #expect(renderer.debugSynchronousPreviewCancellationReplayCount == 0)
         #expect(model.project.commands.count == project.commands.count)
         #expect(model.rendererProject.commands.count == project.commands.count)
         #expect(documentUpdates.isEmpty)
@@ -447,6 +569,7 @@ import WatercolorCore
         #expect(renderer.debugLastStrokeDispatch.stampBatchCount == 1)
         #expect(renderer.debugLastStrokeDispatch.simulationStepCount == 16)
         model.cancelStrokePreview()
+        await model.waitForStrokePreviewCancellation()
     }
 
     @Test func cancellingLiveStrokePreviewRestoresTheCommittedRaster() async throws {
@@ -475,10 +598,74 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 64, y: 64).alpha > 0.05)
 
         model.cancelStrokePreview()
+        await model.waitForStrokePreviewCancellation()
 
         #expect(!model.isStrokePreviewActive)
         #expect(model.project.commands.isEmpty)
         #expect(try renderer.studioChecksum() == before)
+    }
+
+    @Test func cancellationRestorationKeepsTheMainActorSchedulable() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let cancellation = ControlledPreviewSuspension()
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, id, points, token in
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
+                },
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
+                },
+                cancel: { renderer, token in
+                    _ = try await cancellation.suspendOnce()
+                    try await renderer.restoreStrokePreviewCancellation(token)
+                }
+            )
+        )
+        var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
+        stroke.points = (0..<8).map { index in
+            StrokePoint(
+                x: Double(64 + index * 8),
+                y: 64,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
+            )
+        }
+        var initial = stroke
+        initial.points = [stroke.points[0]]
+        let checksumBefore = try renderer.studioChecksum()
+        #expect(model.beginStrokePreview(initial) == .accepted)
+        model.appendStrokePreview(id: stroke.id, points: Array(stroke.points.dropFirst()))
+        await model.waitForStrokePreviewIdle()
+
+        model.cancelStrokePreview()
+        await cancellation.waitUntilSuspended()
+        #expect(!model.capabilities.canPaint)
+        #expect(
+            model.beginStrokePreview(StrokeCommand.studioTestStroke(
+                layerID: project.layers[0].id
+            ))
+                == .busy
+        )
+
+        var heartbeatRan = false
+        let heartbeat = Task { @MainActor in
+            heartbeatRan = true
+            await cancellation.resume()
+        }
+        await model.waitForStrokePreviewCancellation()
+        await heartbeat.value
+
+        #expect(heartbeatRan)
+        #expect(!model.isStrokePreviewActive)
+        #expect(model.capabilities.canPaint)
+        #expect(try renderer.studioChecksum() == checksumBefore)
     }
 
     @Test func failedLiveStrokePreviewNeverCommitsAndRollsBack() async throws {
@@ -520,6 +707,7 @@ import WatercolorCore
         model.beginStrokePreview(initial)
         model.appendStrokePreview(id: stroke.id, points: Array(stroke.points[1...]))
         await model.commitStrokePreview(stroke)
+        await model.waitForStrokePreviewCancellation()
 
         #expect(!model.isStrokePreviewActive)
         #expect(model.project.commands.isEmpty)
@@ -551,6 +739,7 @@ import WatercolorCore
         )
         let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
         let checksumBefore = try renderer.studioChecksum()
+        let synchronousReplayCountBefore = renderer.debugSynchronousReplaySubmissionCount
 
         #expect(model.beginStrokePreview(stroke) == .accepted)
         let commit = Task { @MainActor in
@@ -560,6 +749,7 @@ import WatercolorCore
 
         #expect(!model.capabilities.canPaint)
         model.cancelStrokePreview()
+        await model.waitForStrokePreviewCancellation()
         #expect(model.project == project)
         #expect(documentUpdates.isEmpty)
         #expect(try renderer.studioChecksum() == checksumBefore)
@@ -567,6 +757,10 @@ import WatercolorCore
         await finish.resume()
         await commit.value
 
+        #expect(
+            renderer.debugSynchronousReplaySubmissionCount
+                == synchronousReplayCountBefore
+        )
         #expect(model.project == project)
         #expect(model.rendererProject == project)
         #expect(documentUpdates.isEmpty)
@@ -683,6 +877,7 @@ import WatercolorCore
         }
         await update.waitUntilSuspended()
         model.cancelStrokePreview()
+        await model.waitForStrokePreviewCancellation()
         let secondPoint = StrokePoint(
             x: 200, y: 192, pressure: 1, tiltX: 0, tiltY: 0, time: 1
         )
@@ -701,6 +896,7 @@ import WatercolorCore
         #expect(model.error == nil)
         #expect(model.pendingStrokePreviewPointCountForTesting == 0)
         model.cancelStrokePreview()
+        await model.waitForStrokePreviewCancellation()
     }
 
     @Test func failedPreviewRestorationDisablesPaintingUntilRendererRebuild() async throws {
@@ -748,6 +944,7 @@ import WatercolorCore
         shouldFailReplay = true
 
         model.cancelStrokePreview()
+        await model.waitForStrokePreviewCancellation()
 
         #expect(model.project == project)
         #expect(documentUpdates.isEmpty)
@@ -809,6 +1006,7 @@ import WatercolorCore
         shouldFailCancellation = true
 
         model.cancelStrokePreview()
+        await model.waitForStrokePreviewCancellation()
 
         #expect(model.project == project)
         #expect(model.rendererRecoveryError != nil)
@@ -869,6 +1067,47 @@ import WatercolorCore
         #expect(!model.capabilities.canPaint)
     }
 
+    @Test func finishFailureBeforeRendererCommitRestoresTheTransactionAsynchronously() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let injectedError = NSError(
+            domain: "StudioModelTests",
+            code: 46,
+            userInfo: [NSLocalizedDescriptionKey: "finish rejected before renderer commit"]
+        )
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, id, points, token in
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
+                },
+                finish: { _, _, _ in
+                    throw injectedError
+                }
+            )
+        )
+        let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
+        let checksumBefore = try renderer.studioChecksum()
+        let synchronousReplayCountBefore = renderer.debugSynchronousReplaySubmissionCount
+
+        #expect(model.beginStrokePreview(stroke) == .accepted)
+        await model.commitStrokePreview(stroke)
+
+        #expect(model.project == project)
+        #expect(model.rendererProject == project)
+        #expect(!model.isStrokePreviewActive)
+        #expect(model.rendererRecoveryError == nil)
+        #expect(model.capabilities.canPaint)
+        #expect(model.error?.message.contains("finish rejected before renderer commit") == true)
+        #expect(try renderer.studioChecksum() == checksumBefore)
+        #expect(
+            renderer.debugSynchronousReplaySubmissionCount
+                == synchronousReplayCountBefore
+        )
+    }
+
     @Test func finishFailureAfterCancellationCannotReplaceRecoveredState() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
@@ -896,6 +1135,7 @@ import WatercolorCore
         }
         await finish.waitUntilSuspended()
         model.cancelStrokePreview()
+        await model.waitForStrokePreviewCancellation()
 
         await finish.fail(message: "finish completed after cancellation")
         await commit.value
@@ -952,6 +1192,7 @@ import WatercolorCore
         model.beginStrokePreview(initial)
         model.appendStrokePreview(id: hostile.id, points: Array(hostile.points[1...]))
         await model.waitForStrokePreviewIdle()
+        await model.waitForStrokePreviewCancellation()
 
         #expect(!model.isStrokePreviewActive)
         #expect(model.error?.message.contains("simulation threads") == true)
@@ -1757,7 +1998,7 @@ import WatercolorCore
         #expect(!model.canDuplicateSelectedLayer)
     }
 
-    @Test func previewOwnershipDisablesHistoryAndEveryLayerAction() throws {
+    @Test func previewOwnershipDisablesHistoryAndEveryLayerAction() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
         let renderer = try WatercolorRenderer(project: project, device: device)
@@ -1793,6 +2034,7 @@ import WatercolorCore
         #expect(!model.canMergeSelectedLayerDown)
 
         model.cancelStrokePreview()
+        await model.waitForStrokePreviewCancellation()
 
         #expect(model.canModifyProject)
         #expect(model.capabilities.canUndo)
@@ -1963,6 +2205,33 @@ import WatercolorCore
         model.undo()
         #expect(model.project.paper == .rough)
         #expect(model.rendererIdentity == roughRendererIdentity)
+    }
+
+    @Test func devicePeakAdmissionEvictsRetainedCheckpointsBeforeCandidateAllocation() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugResourcePolicy: RendererResourcePolicy(
+                maximumWorkingSetBytes: 5_505_416
+            )
+        )
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            rendererCheckpointByteBudget: 64 * 1024 * 1024
+        )
+
+        model.selectPaper(.rough)
+        #expect(model.project.paper == .rough)
+        #expect(model.rendererCheckpointCountForTesting == 1)
+
+        model.selectPaper(.hotPress)
+
+        #expect(model.project.paper == .hotPress)
+        #expect(model.rendererCheckpointCountForTesting == 1)
+        #expect(model.error == nil)
     }
 
     @Test func oversizedRendererIsNeverRetainedAndUndoFallsBackToEquivalentReplay() throws {

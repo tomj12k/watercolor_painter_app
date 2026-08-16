@@ -205,24 +205,59 @@ import WatercolorCore
         #expect(noPressureStroke.points.count == fullPressureStroke.points.count)
     }
 
-    @Test func sizeOneStrokeNeverStoresMoreThanTheDurablePointLimit() throws {
+    @Test func configuredPointLimitCarriesATypedDragExhaustionReason() throws {
         var brush = BrushSettings.default
         brush.size = 1
-        var builder = CanvasStrokeBuilder(canvasSize: .init(width: 100_000, height: 100))
+        let maximumPointCount = 4
+        var builder = CanvasStrokeBuilder(
+            canvasSize: .init(width: 100, height: 100),
+            maximumPointCount: maximumPointCount
+        )
         builder.begin(
             layerID: UUID(), tool: .brush, brush: brush,
             point: .init(x: 0, y: 50, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
         )
         let appendResult = builder.append(
-            .init(x: 50_000, y: 50, pressure: 1, tiltX: 0, tiltY: 0, time: 1)
+            .init(x: 50, y: 50, pressure: 1, tiltX: 0, tiltY: 0, time: 1)
         )
 
         let stroke = try #require(builder.currentStroke)
-        #expect(stroke.points.count == PaintingProject.maximumStrokePointCount)
-        #expect(appendResult.points.count == PaintingProject.maximumStrokePointCount - 1)
+        #expect(stroke.points.count == maximumPointCount)
+        #expect(appendResult.points.count == maximumPointCount - 1)
         #expect(appendResult.isExhausted)
+        #expect(
+            appendResult.exhaustionReason
+                == .pointCapacity(maximumPointCount: maximumPointCount)
+        )
         let completion = builder.finish(at: nil)
         #expect(completion.isExhausted)
+        #expect(
+            completion.exhaustionReason
+                == .pointCapacity(maximumPointCount: maximumPointCount)
+        )
+    }
+
+    @Test func pointerUpExhaustionCarriesTheConfiguredTypedReason() {
+        var builder = CanvasStrokeBuilder(
+            canvasSize: .init(width: 100, height: 100),
+            maximumPointCount: 1
+        )
+        builder.begin(
+            layerID: UUID(),
+            tool: .brush,
+            brush: .default,
+            point: .init(x: 10, y: 10, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
+        )
+
+        let completion = builder.finish(at: .init(
+            x: 20, y: 10, pressure: 1, tiltX: 0, tiltY: 0, time: 1
+        ))
+
+        #expect(completion.stroke == nil)
+        #expect(
+            completion.exhaustionReason
+                == .pointCapacity(maximumPointCount: 1)
+        )
     }
 
     @Test func exactlyFullStrokeCompletesWithoutExhaustion() throws {
@@ -388,6 +423,7 @@ import WatercolorCore
             StrokePoint(x: 100, y: 192, pressure: 1, tiltX: 0, tiltY: 0, time: 2)
         ]])
         model.cancelStrokePreview()
+        await model.waitForStrokePreviewCancellation()
     }
 
     @Test func longCanvasDragMutatesTheStoredBuilderWithoutRepeatedPrefixCopies() async throws {
@@ -429,6 +465,7 @@ import WatercolorCore
 
         await model.waitForStrokePreviewIdle()
         model.cancelStrokePreview()
+        await model.waitForStrokePreviewCancellation()
     }
 
     @Test func builderStrokeCompletesToItsSnapshottedLayerAfterSelectionChanges() throws {
@@ -663,6 +700,7 @@ import WatercolorCore
         view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
         model.configureCanvas(view)
         let committedAlpha = try renderer.debugPixel(x: 16, y: 16, layerID: layer.id).alpha
+        let checksumBefore = try canvasChecksum(renderer)
         #expect(model.maximumPointCountForNewStroke == 1)
 
         view.mouseDown(with: try #require(canvasMouseEvent(
@@ -672,10 +710,16 @@ import WatercolorCore
         view.mouseDragged(with: try #require(canvasMouseEvent(
             .leftMouseDragged, timestamp: 2, eventNumber: 2, location: .init(x: 200, y: 64)
         )))
+        await model.waitForStrokePreviewCancellation()
 
         #expect(!model.isStrokePreviewActive)
         #expect(!view.hasTransientInputStateForTesting)
         #expect(model.project == project)
+        #expect(
+            model.error?.message
+                == "This stroke reached its 1-point limit. Try a shorter stroke or use a larger brush for wider spacing."
+        )
+        #expect(try canvasChecksum(renderer) == checksumBefore)
         #expect(try renderer.debugPixel(x: 16, y: 16, layerID: layer.id).alpha == committedAlpha)
 
         let recovery = try #require(canvasMouseEvent(
@@ -689,7 +733,61 @@ import WatercolorCore
         await waitForStrokePreviewToFinish(in: model)
 
         #expect(model.project.commands.count == 2)
+        #expect(model.error == nil)
         #expect(try renderer.debugPixel(x: 96, y: 160, layerID: layer.id).alpha > 0.05)
+    }
+
+    @Test func pointerUpPointExhaustionRestoresAndReportsBeforeContinuedPainting() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let layer = PaintLayer(name: "Layer")
+        let existingStroke = StrokeCommand(
+            layerID: layer.id,
+            tool: .brush,
+            brush: .default,
+            points: [StrokePoint(x: 16, y: 16, pressure: 1, tiltX: 0, tiltY: 0, time: 0)]
+        )
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [layer],
+            commands: [.stroke(existingStroke)]
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            maximumTotalStrokePointCount: 2
+        )
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+        let checksumBefore = try canvasChecksum(renderer)
+
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown, timestamp: 1, eventNumber: 1, location: .init(x: 64, y: 64)
+        )))
+        view.mouseUp(with: try #require(canvasMouseEvent(
+            .leftMouseUp, timestamp: 2, eventNumber: 2, location: .init(x: 128, y: 64)
+        )))
+        await model.waitForStrokePreviewCancellation()
+
+        #expect(model.project == project)
+        #expect(try canvasChecksum(renderer) == checksumBefore)
+        #expect(
+            model.error?.message
+                == "This stroke reached its 1-point limit. Try a shorter stroke or use a larger brush for wider spacing."
+        )
+
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown, timestamp: 3, eventNumber: 3, location: .init(x: 96, y: 96)
+        )))
+        view.mouseUp(with: try #require(canvasMouseEvent(
+            .leftMouseUp, timestamp: 4, eventNumber: 4, location: .init(x: 96, y: 96)
+        )))
+        await waitForStrokePreviewToFinish(in: model)
+
+        #expect(model.project.commands.count == 2)
+        #expect(model.error == nil)
     }
 }
 
@@ -732,6 +830,19 @@ private actor CanvasPreviewUpdateCounter {
 private func waitForStrokePreviewToFinish(in model: StudioModel) async {
     for _ in 0..<1_000 where model.isStrokePreviewActive {
         await Task.yield()
+    }
+}
+
+@MainActor
+private func canvasChecksum(_ renderer: WatercolorRenderer) throws -> UInt64 {
+    let image = try renderer.makeCGImage()
+    guard let data = image.dataProvider?.data,
+          let bytes = CFDataGetBytePtr(data)
+    else {
+        throw RendererError.readback("The test could not access image bytes")
+    }
+    return (0..<CFDataGetLength(data)).reduce(UInt64(0)) { checksum, index in
+        (checksum &* 16_777_619) ^ UInt64(bytes[index])
     }
 }
 

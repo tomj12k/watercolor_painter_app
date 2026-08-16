@@ -61,9 +61,26 @@ struct StrokePreviewRendererOperation {
         StrokeCommand,
         RendererStrokePreviewToken
     ) async throws -> Void
+    typealias Cancel = @MainActor (
+        WatercolorRenderer,
+        RendererStrokePreviewToken
+    ) async throws -> Void
 
     let update: Update
     let finish: Finish
+    let cancel: Cancel
+
+    init(
+        update: @escaping Update,
+        finish: @escaping Finish,
+        cancel: @escaping Cancel = { renderer, token in
+            try await renderer.restoreStrokePreviewCancellation(token)
+        }
+    ) {
+        self.update = update
+        self.finish = finish
+        self.cancel = cancel
+    }
 
     static let live = Self(
         update: { renderer, id, points, token in
@@ -71,6 +88,9 @@ struct StrokePreviewRendererOperation {
         },
         finish: { renderer, stroke, token in
             try await renderer.finishStrokePreview(stroke, token: token)
+        },
+        cancel: { renderer, token in
+            try await renderer.restoreStrokePreviewCancellation(token)
         }
     )
 }
@@ -197,9 +217,10 @@ public final class StudioModel: ObservableObject {
     private var pendingStrokePreviewPoints: [StrokePoint]
     private var strokePreviewDrainTask: Task<Void, Never>?
     private var strokePreviewDrainToken: StudioStrokePreviewToken?
+    private var strokePreviewCancellationTask: Task<Void, Never>?
     private var rendererCheckpoints: [RendererCheckpoint]
     private let rendererCheckpointByteBudget: Int
-    private let maximumTotalStrokePointCount: Int
+    private let projectAdmissionLimits: ProjectAdmissionLimits
 
     public var isStrokePreviewActive: Bool {
         strokePreviewState.token != nil
@@ -219,7 +240,7 @@ public final class StudioModel: ObservableObject {
     }
 
     private var canAppendCommand: Bool {
-        project.commands.count < PaintingProject.maximumCommandCount
+        project.commands.count < projectAdmissionLimits.maximumCommandCount
     }
 
     var maximumPointCountForNewStroke: Int {
@@ -241,7 +262,9 @@ public final class StudioModel: ObservableObject {
         pngExportWorker: StudioPNGExportWorker = .live,
         rendererCheckpointByteBudget: Int = StudioModel.defaultRendererCheckpointByteBudget,
         strokePreviewOperation: StrokePreviewRendererOperation = .live,
-        maximumTotalStrokePointCount: Int = PaintingProject.maximumTotalStrokePointCount
+        maximumCommandCount: Int = PaintingProject.maximumCommandCount,
+        maximumTotalStrokePointCount: Int = PaintingProject.maximumTotalStrokePointCount,
+        maximumSerializedStorageBytes: Int = PaintingProject.maximumSerializedStorageBytes
     ) {
         editor = ProjectEditor(project: project)
         self.project = project
@@ -265,9 +288,14 @@ public final class StudioModel: ObservableObject {
         pendingStrokePreviewPoints = []
         strokePreviewDrainTask = nil
         strokePreviewDrainToken = nil
+        strokePreviewCancellationTask = nil
         rendererCheckpoints = []
         self.rendererCheckpointByteBudget = max(rendererCheckpointByteBudget, 0)
-        self.maximumTotalStrokePointCount = max(maximumTotalStrokePointCount, 0)
+        projectAdmissionLimits = ProjectAdmissionLimits(
+            maximumCommandCount: maximumCommandCount,
+            maximumTotalStrokePointCount: maximumTotalStrokePointCount,
+            maximumSerializedStorageBytes: maximumSerializedStorageBytes
+        )
         canvasDelegate = CanvasRendererDelegate(renderer: renderer)
         self.onDocumentUpdate = onDocumentUpdate
         refreshCapabilities()
@@ -319,7 +347,7 @@ public final class StudioModel: ObservableObject {
         await waitForStrokePreviewIdle(token: token)
         guard isFinalizingStrokePreview(token), renderer === token.renderer else { return }
         guard canAppendStroke(stroke) else {
-            cancelStrokePreviewAfterAdmissionFailure(token: token)
+            await cancelStrokePreviewAfterAdmissionFailure(token: token)
             if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
             return
         }
@@ -336,14 +364,28 @@ public final class StudioModel: ObservableObject {
         } catch {
             guard isFinalizingStrokePreview(token), renderer === token.renderer else { return }
             let failure = StudioFailure(message: error.localizedDescription)
-            invalidateStrokePreview(token)
             if case RendererError.strokePreviewRestoration = error {
+                invalidateStrokePreview(token)
                 enterRendererRecovery(error)
             } else {
                 do {
-                    try token.renderer.replay(project: project)
+                    try await token.renderer.restoreStrokePreviewCancellation(
+                        token.rendererToken
+                    )
+                    guard isFinalizingStrokePreview(token),
+                          renderer === token.renderer
+                    else { return }
+                    try await token.renderer.replayAsynchronously(project: project)
+                    guard isFinalizingStrokePreview(token),
+                          renderer === token.renderer
+                    else { return }
+                    invalidateStrokePreview(token)
                     self.error = failure
                 } catch {
+                    guard isFinalizingStrokePreview(token),
+                          renderer === token.renderer
+                    else { return }
+                    invalidateStrokePreview(token)
                     enterRendererRecovery(error)
                 }
             }
@@ -352,21 +394,24 @@ public final class StudioModel: ObservableObject {
         if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
     }
 
-    func cancelStrokePreview() {
+    func cancelStrokePreview(reason: StrokeExhaustionReason? = nil) {
         guard let token = strokePreviewState.token else { return }
+        guard !isCancellingStrokePreview(token) else { return }
         let wasFinalizing = isFinalizingStrokePreview(token)
-        invalidateStrokePreview(token)
-        do {
-            try token.renderer.cancelStrokePreview(token.rendererToken)
-            if wasFinalizing {
-                try token.renderer.replay(project: project)
-            }
-            error = nil
-        } catch {
-            enterRendererRecovery(error)
-        }
+        beginStrokePreviewCancellation(
+            token: token,
+            wasFinalizing: wasFinalizing,
+            failure: reason.map { StudioFailure(message: $0.message) }
+        )
         refreshCapabilities()
         if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
+    }
+
+    func waitForStrokePreviewCancellation() async {
+        while let task = strokePreviewCancellationTask {
+            await task.value
+            if strokePreviewCancellationTask == nil { return }
+        }
     }
 
     func waitForStrokePreviewIdle() async {
@@ -432,14 +477,50 @@ public final class StudioModel: ObservableObject {
         token: StudioStrokePreviewToken
     ) {
         guard isCurrentStrokePreview(token) else { return }
-        invalidateStrokePreview(token)
-        do {
-            try token.renderer.cancelStrokePreview(token.rendererToken)
-            error = StudioFailure(message: previewError.localizedDescription)
-        } catch {
-            enterRendererRecovery(error)
-        }
+        beginStrokePreviewCancellation(
+            token: token,
+            wasFinalizing: false,
+            failure: StudioFailure(message: previewError.localizedDescription)
+        )
         refreshCapabilities()
+    }
+
+    private func beginStrokePreviewCancellation(
+        token: StudioStrokePreviewToken,
+        wasFinalizing: Bool,
+        failure: StudioFailure?
+    ) {
+        guard isCurrentStrokePreview(token) else { return }
+        strokePreviewState = .cancelling(token)
+        pendingStrokePreviewPoints = []
+        strokePreviewDrainTask?.cancel()
+        strokePreviewDrainTask = nil
+        strokePreviewDrainToken = nil
+        let operation = strokePreviewOperation
+        let committedProject = project
+        let task = Task { @MainActor [weak self] in
+            await Task.yield()
+            do {
+                try await operation.cancel(token.renderer, token.rendererToken)
+                if wasFinalizing {
+                    try await token.renderer.replayAsynchronously(project: committedProject)
+                }
+                guard let self, self.isCancellingStrokePreview(token) else { return }
+                self.strokePreviewState = .idle
+                self.error = failure
+            } catch {
+                guard let self, self.isCancellingStrokePreview(token) else { return }
+                self.strokePreviewState = .idle
+                self.enterRendererRecovery(error)
+            }
+            guard let self else { return }
+            self.strokePreviewCancellationTask = nil
+            self.refreshCapabilities()
+            if let attachedCanvas = self.attachedCanvas {
+                self.updateCanvasDisplay(attachedCanvas)
+            }
+        }
+        strokePreviewCancellationTask = task
     }
 
     func completeStroke(_ stroke: StrokeCommand) {
@@ -452,8 +533,7 @@ public final class StudioModel: ObservableObject {
         }
 
         do {
-            try renderer.renderAndWait(stroke: stroke)
-            try renderer.recordRenderedStroke(stroke)
+            try renderer.renderAndRecord(stroke: stroke)
             canvasWetness = renderer.canvasWetness
             editor.append(.stroke(stroke))
             publishEditorProject()
@@ -472,7 +552,7 @@ public final class StudioModel: ObservableObject {
 
     private func reportCommandCapacityFailure() {
         error = StudioFailure(
-            message: "The project has reached its command capacity of \(PaintingProject.maximumCommandCount)."
+            message: "The project has reached its command capacity of \(projectAdmissionLimits.maximumCommandCount)."
         )
     }
 
@@ -482,33 +562,34 @@ public final class StudioModel: ObservableObject {
             reportCommandCapacityFailure()
             return false
         }
-        guard prospectiveStrokePointCapacityError(for: stroke) == nil else {
-            error = StudioFailure(
-                message: "The project has reached its point capacity of \(maximumTotalStrokePointCount)."
+        do {
+            try project.validateForRendering(
+                adding: stroke,
+                limits: projectAdmissionLimits
             )
+        } catch let validationError as ProjectValidationError {
+            switch validationError {
+            case .commandLimitExceeded:
+                reportCommandCapacityFailure()
+            case .totalStrokePointLimitExceeded:
+                error = StudioFailure(
+                    message: "The project has reached its point capacity of \(projectAdmissionLimits.maximumTotalStrokePointCount)."
+                )
+            case .documentByteLimitExceeded:
+                error = StudioFailure(
+                    message: "The project has reached its document storage capacity. Use a shorter stroke or remove painting history before continuing."
+                )
+            default:
+                error = StudioFailure(
+                    message: RendererError.invalidProject(validationError).localizedDescription
+                )
+            }
+            return false
+        } catch {
+            self.error = StudioFailure(message: error.localizedDescription)
             return false
         }
         return true
-    }
-
-    private func prospectiveStrokePointCapacityError(
-        for stroke: StrokeCommand
-    ) -> ProjectValidationError? {
-        var totalPointCount = 0
-        for command in project.commands {
-            guard case let .stroke(existingStroke) = command else { continue }
-            let (updatedTotal, didOverflow) = totalPointCount.addingReportingOverflow(existingStroke.points.count)
-            guard !didOverflow else {
-                return .totalStrokePointLimitExceeded(Int.max)
-            }
-            totalPointCount = updatedTotal
-        }
-
-        let (updatedTotal, didOverflow) = totalPointCount.addingReportingOverflow(stroke.points.count)
-        guard !didOverflow, updatedTotal <= maximumTotalStrokePointCount else {
-            return .totalStrokePointLimitExceeded(didOverflow ? Int.max : updatedTotal)
-        }
-        return nil
     }
 
     private var remainingStrokePointCapacity: Int {
@@ -519,22 +600,21 @@ public final class StudioModel: ObservableObject {
             guard !didOverflow else { return 0 }
             totalPointCount = updatedTotal
         }
-        return max(maximumTotalStrokePointCount - totalPointCount, 0)
+        return max(projectAdmissionLimits.maximumTotalStrokePointCount - totalPointCount, 0)
     }
 
     private func cancelStrokePreviewAfterAdmissionFailure(
         token: StudioStrokePreviewToken
-    ) {
+    ) async {
         guard isFinalizingStrokePreview(token) else { return }
         let admissionFailure = error
-        invalidateStrokePreview(token)
-        do {
-            try token.renderer.cancelStrokePreview(token.rendererToken)
-            error = admissionFailure
-        } catch {
-            enterRendererRecovery(error)
-        }
+        beginStrokePreviewCancellation(
+            token: token,
+            wasFinalizing: false,
+            failure: admissionFailure
+        )
         refreshCapabilities()
+        await waitForStrokePreviewCancellation()
     }
 
     private func nextStrokePreviewToken(
@@ -564,6 +644,11 @@ public final class StudioModel: ObservableObject {
 
     private func isFinalizingStrokePreview(_ token: StudioStrokePreviewToken) -> Bool {
         guard case let .finalizing(current) = strokePreviewState else { return false }
+        return current == token
+    }
+
+    private func isCancellingStrokePreview(_ token: StudioStrokePreviewToken) -> Bool {
+        guard case let .cancelling(current) = strokePreviewState else { return false }
         return current == token
     }
 
@@ -874,7 +959,7 @@ public final class StudioModel: ObservableObject {
         do {
             try replacement.validate()
             rendererCheckpoints.removeAll()
-            let candidateRenderer = try renderer.makeCandidate(project: replacement)
+            let candidateRenderer = try makeRendererCandidate(project: replacement)
             let nextSelection = replacement.layers.contains(where: { $0.id == selectedLayerID })
                 ? selectedLayerID
                 : replacement.layers[0].id
@@ -929,7 +1014,7 @@ public final class StudioModel: ObservableObject {
                 replaceRenderer(with: checkpointRenderer, checkpointCurrent: true)
             } else {
                 rendererCheckpoints.removeAll()
-                let candidateRenderer = try renderer.makeCandidate(project: updatedProject)
+                let candidateRenderer = try makeRendererCandidate(project: updatedProject)
                 replaceRenderer(with: candidateRenderer)
             }
             publishSuccessfulEdit(
@@ -958,7 +1043,7 @@ public final class StudioModel: ObservableObject {
             let preparedCheckpoint = rendererRecoveryError == nil
                 ? prepareCurrentRendererCheckpointForCandidateAllocation()
                 : nil
-            let candidateRenderer = try renderer.makeCandidate(project: updatedProject)
+            let candidateRenderer = try makeRendererCandidate(project: updatedProject)
             if let preparedCheckpoint {
                 appendRendererCheckpoint(preparedCheckpoint)
             }
@@ -993,7 +1078,7 @@ public final class StudioModel: ObservableObject {
                 try renderer.applyMetadata(project: updatedProject)
             } else {
                 rendererCheckpoints.removeAll()
-                let candidateRenderer = try renderer.makeCandidate(project: updatedProject)
+                let candidateRenderer = try makeRendererCandidate(project: updatedProject)
                 replaceRenderer(with: candidateRenderer)
             }
             publishSuccessfulEdit(
@@ -1060,6 +1145,26 @@ public final class StudioModel: ObservableObject {
         appendRendererCheckpoint(checkpoint)
     }
 
+    private func makeRendererCandidate(
+        project: PaintingProject
+    ) throws -> WatercolorRenderer {
+        let retainedBytes = rendererCheckpoints.reduce(into: 0) { total, checkpoint in
+            let (updatedTotal, didOverflow) = total.addingReportingOverflow(
+                checkpoint.estimatedBytes
+            )
+            total = didOverflow ? .max : updatedTotal
+        }
+        do {
+            return try renderer.makeCandidate(
+                project: project,
+                retainedCheckpointBytes: retainedBytes
+            )
+        } catch RendererError.resourceBudgetExceeded where retainedBytes > 0 {
+            rendererCheckpoints.removeAll()
+            return try renderer.makeCandidate(project: project)
+        }
+    }
+
     private func prepareCurrentRendererCheckpointForCandidateAllocation() -> RendererCheckpoint? {
         let checkpoint = RendererCheckpoint(
             project: project,
@@ -1116,6 +1221,7 @@ public final class StudioModel: ObservableObject {
         capabilities = StudioCapabilities(
             canPaint: rendererRecoveryError == nil
                 && !isStrokePreviewFinalizing
+                && !strokePreviewState.isCancelling
                 && project.layers.contains(where: { $0.id == selectedLayerID }),
             canUndo: canModifyProject && editor.canUndo,
             canRedo: canModifyProject && editor.canRedo
@@ -1140,12 +1246,18 @@ private enum StudioStrokePreviewState {
     case idle
     case active(StudioStrokePreviewToken)
     case finalizing(StudioStrokePreviewToken)
+    case cancelling(StudioStrokePreviewToken)
 
     var token: StudioStrokePreviewToken? {
         switch self {
         case .idle: nil
-        case let .active(token), let .finalizing(token): token
+        case let .active(token), let .finalizing(token), let .cancelling(token): token
         }
+    }
+
+    var isCancelling: Bool {
+        if case .cancelling = self { return true }
+        return false
     }
 }
 

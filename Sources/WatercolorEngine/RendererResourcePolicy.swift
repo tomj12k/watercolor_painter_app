@@ -5,6 +5,7 @@ struct RendererResourceEstimate: Equatable, Sendable {
     let liveBytes: Int
     let previewBytes: Int
     let candidateBytes: Int
+    let retainedCheckpointBytes: Int
     let totalBytes: Int
 }
 
@@ -20,15 +21,18 @@ struct RendererResourcePolicy: Sendable {
     }
 
     init(recommendedMaximumWorkingSetBytes: UInt64) {
-        let recommended = Int(clamping: recommendedMaximumWorkingSetBytes)
-        let (fraction, didOverflow) = (recommended / 100).multipliedReportingOverflow(by: 35)
-        let safeFraction = didOverflow ? Self.absoluteMaximumBytes : fraction
-        self.init(
-            maximumWorkingSetBytes: min(
-                max(safeFraction, Self.fallbackMaximumBytes),
-                Self.absoluteMaximumBytes
-            )
-        )
+        guard recommendedMaximumWorkingSetBytes > 0 else {
+            self.init(maximumWorkingSetBytes: Self.fallbackMaximumBytes)
+            return
+        }
+
+        let quotient = recommendedMaximumWorkingSetBytes / 100
+        let remainder = recommendedMaximumWorkingSetBytes % 100
+        let safeFraction = quotient * 35 + remainder * 35 / 100
+        self.init(maximumWorkingSetBytes: min(
+            Int(clamping: safeFraction),
+            Self.absoluteMaximumBytes
+        ))
     }
 
     static func live(device: MTLDevice) -> Self {
@@ -40,12 +44,14 @@ struct RendererResourcePolicy: Sendable {
         width: Int,
         height: Int,
         layerCapacity: Int,
-        structuralCandidateCapacity: Int
+        structuralCandidateCapacity: Int,
+        retainedCheckpointBytes: Int = 0
     ) throws -> RendererResourceEstimate {
         guard width > 0,
               height > 0,
               layerCapacity > 0,
-              structuralCandidateCapacity > 0
+              structuralCandidateCapacity > 0,
+              retainedCheckpointBytes >= 0
         else {
             throw overflowError
         }
@@ -59,7 +65,8 @@ struct RendererResourcePolicy: Sendable {
         )
         let candidateBytes = try add(candidateRendererBytes, previewBytes)
         let liveAndPreviewBytes = try add(liveBytes, previewBytes)
-        let totalBytes = try add(liveAndPreviewBytes, candidateBytes)
+        let liveCandidateBytes = try add(liveAndPreviewBytes, candidateBytes)
+        let totalBytes = try add(liveCandidateBytes, retainedCheckpointBytes)
 
         guard totalBytes <= maximumWorkingSetBytes else {
             throw RendererError.resourceBudgetExceeded(
@@ -71,6 +78,7 @@ struct RendererResourcePolicy: Sendable {
             liveBytes: liveBytes,
             previewBytes: previewBytes,
             candidateBytes: candidateBytes,
+            retainedCheckpointBytes: retainedCheckpointBytes,
             totalBytes: totalBytes
         )
     }

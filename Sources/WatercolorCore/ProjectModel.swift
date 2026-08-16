@@ -344,6 +344,30 @@ public struct PaintLayer: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
+public struct ProjectAdmissionLimits: Equatable, Sendable {
+    public let maximumCommandCount: Int
+    public let maximumTotalStrokePointCount: Int
+    public let maximumSerializedStorageBytes: Int
+
+    public init(
+        maximumCommandCount: Int,
+        maximumTotalStrokePointCount: Int,
+        maximumSerializedStorageBytes: Int
+    ) {
+        self.maximumCommandCount = max(maximumCommandCount, 0)
+        self.maximumTotalStrokePointCount = max(maximumTotalStrokePointCount, 0)
+        self.maximumSerializedStorageBytes = max(maximumSerializedStorageBytes, 0)
+    }
+
+    public static var production: Self {
+        Self(
+            maximumCommandCount: PaintingProject.maximumCommandCount,
+            maximumTotalStrokePointCount: PaintingProject.maximumTotalStrokePointCount,
+            maximumSerializedStorageBytes: PaintingProject.maximumSerializedStorageBytes
+        )
+    }
+}
+
 public enum ProjectValidationError: Error, Equatable, Sendable {
     case unsupportedSchema(Int)
     case invalidCanvasSize(CanvasSize)
@@ -376,6 +400,7 @@ public struct PaintingProject: Codable, Equatable, Sendable {
     public static let maximumCommandCount = 100_000
     public static let maximumStrokePointCount = 65_536
     public static let maximumTotalStrokePointCount = 2_000_000
+    public static let maximumSerializedStorageBytes = 256 * 1024 * 1024
     public static let maximumDryStepCount = 4_096
     public static let brushSizeRange = 1.0...300.0
 
@@ -410,14 +435,22 @@ public struct PaintingProject: Codable, Equatable, Sendable {
     public func validate() throws {
         try validate(
             requireMinimumCanvasDimension: true,
-            maximumTotalStrokePointCount: Self.maximumTotalStrokePointCount
+            limits: .production
         )
+    }
+
+    public func validate(limits: ProjectAdmissionLimits) throws {
+        try validate(requireMinimumCanvasDimension: true, limits: limits)
     }
 
     func validate(maximumTotalStrokePointCount: Int) throws {
         try validate(
             requireMinimumCanvasDimension: true,
-            maximumTotalStrokePointCount: maximumTotalStrokePointCount
+            limits: ProjectAdmissionLimits(
+                maximumCommandCount: Self.maximumCommandCount,
+                maximumTotalStrokePointCount: maximumTotalStrokePointCount,
+                maximumSerializedStorageBytes: Self.maximumSerializedStorageBytes
+            )
         )
     }
 
@@ -426,7 +459,23 @@ public struct PaintingProject: Codable, Equatable, Sendable {
     public func validateForRendering() throws {
         try validate(
             requireMinimumCanvasDimension: false,
-            maximumTotalStrokePointCount: Self.maximumTotalStrokePointCount
+            limits: .production
+        )
+    }
+
+    public func validateForRendering(limits: ProjectAdmissionLimits) throws {
+        try validate(requireMinimumCanvasDimension: false, limits: limits)
+    }
+
+    public func validateForRendering(
+        adding stroke: StrokeCommand,
+        limits: ProjectAdmissionLimits = .production
+    ) throws {
+        var prospectiveProject = self
+        prospectiveProject.commands.append(.stroke(stroke))
+        try prospectiveProject.validate(
+            requireMinimumCanvasDimension: false,
+            limits: limits
         )
     }
 
@@ -439,7 +488,7 @@ public struct PaintingProject: Codable, Equatable, Sendable {
 
     private func validate(
         requireMinimumCanvasDimension: Bool,
-        maximumTotalStrokePointCount: Int
+        limits: ProjectAdmissionLimits
     ) throws {
         guard schemaVersion == Self.currentSchemaVersion else {
             throw ProjectValidationError.unsupportedSchema(schemaVersion)
@@ -479,8 +528,13 @@ public struct PaintingProject: Codable, Equatable, Sendable {
             }
         }
 
-        guard commands.count <= Self.maximumCommandCount else {
+        guard commands.count <= limits.maximumCommandCount else {
             throw ProjectValidationError.commandLimitExceeded(commands.count)
+        }
+
+        let serializedStorageBytes = try serializedStorageCharge()
+        guard serializedStorageBytes <= limits.maximumSerializedStorageBytes else {
+            throw ProjectValidationError.documentByteLimitExceeded(serializedStorageBytes)
         }
 
         var commandIdentifiers = Set<UUID>()
@@ -500,7 +554,9 @@ public struct PaintingProject: Codable, Equatable, Sendable {
                     throw ProjectValidationError.invalidCommandRelationship(stroke.id)
                 }
                 let (updatedTotal, didOverflow) = totalStrokePointCount.addingReportingOverflow(stroke.points.count)
-                guard !didOverflow, updatedTotal <= maximumTotalStrokePointCount else {
+                guard !didOverflow,
+                      updatedTotal <= limits.maximumTotalStrokePointCount
+                else {
                     throw ProjectValidationError.totalStrokePointLimitExceeded(
                         didOverflow ? Int.max : updatedTotal
                     )
@@ -583,6 +639,38 @@ public struct PaintingProject: Codable, Equatable, Sendable {
 
     private static func unitRangeContains(_ value: Double) -> Bool {
         value.isFinite && (0...1).contains(value)
+    }
+
+    public func serializedStorageCharge() throws -> Int {
+        var total = 4_096
+        for layer in layers {
+            total = try Self.checkedStorageAdd(total, 1_024)
+            let escapedNameBytes = try Self.checkedStorageMultiply(layer.name.utf8.count, 6)
+            total = try Self.checkedStorageAdd(total, escapedNameBytes)
+        }
+        for command in commands {
+            total = try Self.checkedStorageAdd(total, 2_048)
+            guard case let .stroke(stroke) = command else { continue }
+            let pointBytes = try Self.checkedStorageMultiply(stroke.points.count, 256)
+            total = try Self.checkedStorageAdd(total, pointBytes)
+        }
+        return total
+    }
+
+    private static func checkedStorageAdd(_ lhs: Int, _ rhs: Int) throws -> Int {
+        let (result, didOverflow) = lhs.addingReportingOverflow(rhs)
+        guard !didOverflow else {
+            throw ProjectValidationError.documentByteLimitExceeded(.max)
+        }
+        return result
+    }
+
+    private static func checkedStorageMultiply(_ lhs: Int, _ rhs: Int) throws -> Int {
+        let (result, didOverflow) = lhs.multipliedReportingOverflow(by: rhs)
+        guard !didOverflow else {
+            throw ProjectValidationError.documentByteLimitExceeded(.max)
+        }
+        return result
     }
 
     private static let zeroIdentifier = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
