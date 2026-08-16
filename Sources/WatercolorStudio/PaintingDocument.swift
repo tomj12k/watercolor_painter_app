@@ -28,10 +28,19 @@ public struct PaintingDocument: FileDocument {
     }
 
     public init(configuration: ReadConfiguration) throws {
-        guard let data = configuration.file.regularFileContents else {
+        try self.init(fileWrapper: configuration.file)
+    }
+
+    init(
+        fileWrapper: FileWrapper,
+        decode: (Data) throws -> PaintingProject = PaintingDocumentCodec.decode
+    ) throws {
+        guard fileWrapper.isRegularFile,
+              let data = fileWrapper.regularFileContents
+        else {
             throw DocumentCodecError.malformedData
         }
-        project = try PaintingDocumentCodec.decode(data)
+        project = try decode(data)
         needsInitialConfiguration = false
     }
 

@@ -10,11 +10,17 @@ extension DocumentCodecError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .malformedData:
-            "The file does not contain a valid watercolor project."
+            "The file does not contain a valid watercolor painting. Open a different copy or restore it from a backup."
         case let .unsupportedSchema(version):
-            "This project uses newer schema version \(version) and cannot be opened by this version of Watercolor Studio."
+            "This painting uses newer version \(version) and cannot be opened here. Update Watercolor Studio, then try again."
         case let .validationFailed(error):
-            "The watercolor project is invalid: \(String(describing: error))."
+            switch error {
+            case .layerLimitExceeded, .commandLimitExceeded, .documentByteLimitExceeded,
+                 .totalStrokePointLimitExceeded:
+                "This painting is too large to open safely. Open a smaller copy or remove history in the version that created it."
+            default:
+                "The file contains invalid painting data and was not opened. Open a different copy or restore it from a backup."
+            }
         }
     }
 }

@@ -3,6 +3,25 @@ import Testing
 @testable import WatercolorCore
 
 @Suite(.serialized) struct PaintingDocumentCodecTests {
+    @Test func localizedRecoveryTextIsCategorySpecificAndDoesNotExposeIdentifiers() {
+        let identifier = UUID(uuidString: "8E482653-D45C-48A2-9CD0-95F85418C11D")!
+        let malformed = DocumentCodecError.malformedData.localizedDescription
+        let invalid = DocumentCodecError.validationFailed(
+            .invalidBrushParameter(identifier)
+        ).localizedDescription
+        let overBudget = DocumentCodecError.validationFailed(
+            .documentByteLimitExceeded(300_000_000)
+        ).localizedDescription
+        let newer = DocumentCodecError.unsupportedSchema(99).localizedDescription
+
+        #expect(malformed.contains("valid watercolor"))
+        #expect(invalid.contains("invalid painting data"))
+        #expect(overBudget.contains("too large"))
+        #expect(newer.contains("newer version"))
+        #expect(!invalid.contains(identifier.uuidString))
+        #expect(Set([malformed, invalid, overBudget, newer]).count == 4)
+    }
+
     @Test func codecRejectsEncodedDocumentsAboveTheByteLimit() {
         let project = PaintingProject.pointLimitFixture(
             pointCount: 128,
