@@ -183,14 +183,23 @@ import WatercolorCore
     @Test func actualGPUFinishCancelOverlapLeavesTheLaterTransactionUsable() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
-        let terminal = RendererPreviewTerminalCompletionGate(labels: ["finish", "cancel"])
+        let finishWaitEvent = try #require(device.makeSharedEvent())
+        let finishWaitValue: UInt64 = 1
+        let finishCommitted = RendererPreviewCommandBufferMilestone()
+        let cancellationBegan = RendererPreviewMilestone()
         let renderer = try WatercolorRenderer(
             project: project,
             device: device,
-            debugPreviewTerminalDidComplete: { label in
-                await terminal.suspend(label: label)
+            debugPreviewFinishWaitEvent: finishWaitEvent,
+            value: finishWaitValue,
+            finishDidCommit: { commandBuffer in
+                finishCommitted.record(commandBuffer)
+            },
+            cancellationDidBegin: {
+                cancellationBegan.record()
             }
         )
+        let checksumBefore = try renderer.compositeChecksum()
         let first = StrokeCommand.testDot(
             id: UUID(uuidString: "A20E398B-E36C-46CB-868E-54A0BD84AD65")!,
             layerID: project.layers[0].id,
@@ -201,25 +210,35 @@ import WatercolorCore
         let finishing = Task { @MainActor in
             try await renderer.finishStrokePreview(first, token: firstToken)
         }
-        await terminal.waitUntilSuspended(label: "finish")
+        let finishCommandBuffer = await finishCommitted.waitForCommandBuffer().commandBuffer
+        #expect(finishWaitEvent.signaledValue < finishWaitValue)
+        #expect(
+            finishCommandBuffer.status == .committed
+                || finishCommandBuffer.status == .scheduled
+        )
 
         let cancelling = Task { @MainActor in
             try await renderer.restoreStrokePreviewCancellation(firstToken)
         }
-        await terminal.waitUntilSuspended(label: "cancel")
-        await terminal.resume(label: "finish")
-
-        await #expect(throws: RendererError.invalidStrokePreview) {
-            try await finishing.value
-        }
+        await cancellationBegan.waitUntilRecorded()
+        #expect(finishWaitEvent.signaledValue < finishWaitValue)
+        #expect(
+            finishCommandBuffer.status == .committed
+                || finishCommandBuffer.status == .scheduled
+        )
         #expect(throws: RendererError.invalidStrokePreview) {
             _ = try renderer.beginStrokePreview(
                 StrokeCommand.testDot(layerID: project.layers[0].id, x: 32, y: 32)
             )
         }
 
-        await terminal.resume(label: "cancel")
+        finishWaitEvent.signaledValue = finishWaitValue
+
+        await #expect(throws: RendererError.invalidStrokePreview) {
+            try await finishing.value
+        }
         try await cancelling.value
+        #expect(try renderer.compositeChecksum() == checksumBefore)
         let later = StrokeCommand.testDot(
             id: UUID(uuidString: "05228DF2-F510-44E2-881F-896B2DD1E6D5")!,
             layerID: project.layers[0].id,
@@ -3154,35 +3173,52 @@ private actor RendererPreviewUpdateGate {
     }
 }
 
-private actor RendererPreviewTerminalCompletionGate {
-    private let labels: Set<String>
-    private var suspendedLabels: Set<String> = []
-    private var suspensionWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
-    private var completions: [String: CheckedContinuation<Void, Never>] = [:]
+@MainActor
+private final class RendererPreviewCommandBufferMilestone {
+    private var reference: RendererPreviewCommandBufferReference?
+    private var waiters: [
+        CheckedContinuation<RendererPreviewCommandBufferReference, Never>
+    ] = []
 
-    init(labels: Set<String>) {
-        self.labels = labels
+    func record(_ commandBuffer: MTLCommandBuffer) {
+        guard reference == nil else { return }
+        let reference = RendererPreviewCommandBufferReference(commandBuffer: commandBuffer)
+        self.reference = reference
+        let waiters = waiters
+        self.waiters.removeAll()
+        waiters.forEach { $0.resume(returning: reference) }
     }
 
-    func suspend(label: String) async {
-        guard labels.contains(label), !suspendedLabels.contains(label) else { return }
-        suspendedLabels.insert(label)
-        let waiters = suspensionWaiters.removeValue(forKey: label) ?? []
+    func waitForCommandBuffer() async -> RendererPreviewCommandBufferReference {
+        if let reference { return reference }
+        return await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+}
+
+private struct RendererPreviewCommandBufferReference: @unchecked Sendable {
+    let commandBuffer: MTLCommandBuffer
+}
+
+@MainActor
+private final class RendererPreviewMilestone {
+    private var wasRecorded = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func record() {
+        guard !wasRecorded else { return }
+        wasRecorded = true
+        let waiters = waiters
+        self.waiters.removeAll()
         waiters.forEach { $0.resume() }
-        await withCheckedContinuation { continuation in
-            completions[label] = continuation
-        }
     }
 
-    func waitUntilSuspended(label: String) async {
-        guard !suspendedLabels.contains(label) else { return }
+    func waitUntilRecorded() async {
+        guard !wasRecorded else { return }
         await withCheckedContinuation { continuation in
-            suspensionWaiters[label, default: []].append(continuation)
+            waiters.append(continuation)
         }
-    }
-
-    func resume(label: String) {
-        completions.removeValue(forKey: label)?.resume()
     }
 }
 

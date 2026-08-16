@@ -135,11 +135,15 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private var layerSlices: [UUID: Int] = [:]
     private var layerOpacityPreviews: [UUID: Double] = [:]
     private var lastCommandBuffer: MTLCommandBuffer?
+    private var lastCommandBufferCompletion: CommandBufferCompletion?
     private let commandBufferErrorProvider: CommandBufferErrorProvider
     #if DEBUG
     private let previewAppendWillCommit: (() async -> Void)?
     private let previewCancellationWillSubmit: (() async -> Void)?
-    private let previewTerminalDidComplete: ((String) async -> Void)?
+    private let previewFinishWaitEvent: MTLSharedEvent?
+    private let previewFinishWaitValue: UInt64
+    private let previewFinishDidCommit: ((MTLCommandBuffer) -> Void)?
+    private let previewCancellationDidBegin: (() -> Void)?
     #endif
     private var strokePreview: StrokePreviewTransaction?
     private let previewTextureAllocationCount: Int
@@ -273,7 +277,10 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     convenience init(
         project: PaintingProject,
         device requestedDevice: MTLDevice?,
-        debugPreviewTerminalDidComplete: @escaping (String) async -> Void
+        debugPreviewFinishWaitEvent: MTLSharedEvent,
+        value: UInt64,
+        finishDidCommit: @escaping (MTLCommandBuffer) -> Void,
+        cancellationDidBegin: @escaping () -> Void
     ) throws {
         try self.init(
             project: project,
@@ -283,7 +290,10 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             workPolicy: nil,
             performsResourceAdmission: true,
             commandBufferError: { $0.error },
-            previewTerminalDidComplete: debugPreviewTerminalDidComplete
+            previewFinishWaitEvent: debugPreviewFinishWaitEvent,
+            previewFinishWaitValue: value,
+            previewFinishDidCommit: finishDidCommit,
+            previewCancellationDidBegin: cancellationDidBegin
         )
     }
 
@@ -316,7 +326,10 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         commandBufferError: @escaping (MTLCommandBuffer) -> Error?,
         previewAppendWillCommit: (() async -> Void)? = nil,
         previewCancellationWillSubmit: (() async -> Void)? = nil,
-        previewTerminalDidComplete: ((String) async -> Void)? = nil,
+        previewFinishWaitEvent: MTLSharedEvent? = nil,
+        previewFinishWaitValue: UInt64 = 0,
+        previewFinishDidCommit: ((MTLCommandBuffer) -> Void)? = nil,
+        previewCancellationDidBegin: (() -> Void)? = nil,
         projectAdmissionLimits requestedProjectAdmissionLimits: ProjectAdmissionLimits? = nil
     ) throws {
         let resolvedProjectAdmissionLimits = requestedProjectAdmissionLimits ?? .production
@@ -376,10 +389,14 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         #if DEBUG
         self.previewAppendWillCommit = previewAppendWillCommit
         self.previewCancellationWillSubmit = previewCancellationWillSubmit
-        self.previewTerminalDidComplete = previewTerminalDidComplete
+        self.previewFinishWaitEvent = previewFinishWaitEvent
+        self.previewFinishWaitValue = previewFinishWaitValue
+        self.previewFinishDidCommit = previewFinishDidCommit
+        self.previewCancellationDidBegin = previewCancellationDidBegin
         #endif
         strokePreview = nil
         activeSimulationRegions = [:]
+        lastCommandBufferCompletion = nil
 
         let textures = try Self.makeTextures(
             device: requestedDevice,
@@ -650,6 +667,14 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         var workBudget = transaction.workBudget
         let previousSimulationState = simulationStateSnapshot
         let commandBuffer = try makeCommandBuffer(label: "Commit watercolor stroke preview")
+        #if DEBUG
+        if let previewFinishWaitEvent {
+            commandBuffer.encodeWaitForEvent(
+                previewFinishWaitEvent,
+                value: previewFinishWaitValue
+            )
+        }
+        #endif
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw RendererError.allocation("a stroke preview completion encoder")
         }
@@ -691,20 +716,21 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             transaction.requireReplayOnCancel()
         }
         let provider = commandBufferErrorProvider
-        lastCommandBuffer = commandBuffer
+        trackCommandBuffer(commandBuffer)
         await withCheckedContinuation { continuation in
             commandBuffer.addCompletedHandler { completed in
                 transaction.record(provider.error(for: completed))
                 continuation.resume()
             }
             commandBuffer.commit()
+            #if DEBUG
+            previewFinishDidCommit?(commandBuffer)
+            #endif
         }
         if lastCommandBuffer === commandBuffer {
             lastCommandBuffer = nil
+            lastCommandBufferCompletion = nil
         }
-        #if DEBUG
-        await previewTerminalDidComplete?("finish")
-        #endif
         guard ownsStrokePreview(transaction, phase: .finishing) else {
             throw RendererError.invalidStrokePreview
         }
@@ -744,6 +770,9 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.invalidStrokePreview
         }
         transaction.phase = .cancelling
+        #if DEBUG
+        previewCancellationDidBegin?()
+        #endif
         activeSimulationRegions = transaction.committedSimulationRegions
         guard let snapshotState = transaction.snapshotStateForCancellation() else {
             try resolveStrokePreview(transaction, phase: .cancelling)
@@ -755,9 +784,6 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                     project: project,
                     transaction: transaction
                 )
-                #if DEBUG
-                await previewTerminalDidComplete?("cancel")
-                #endif
                 try resolveStrokePreview(transaction, phase: .cancelling)
             } catch {
                 failStrokePreviewCancellationIfOwned(transaction)
@@ -775,9 +801,6 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                     project: project,
                     transaction: transaction
                 )
-                #if DEBUG
-                await previewTerminalDidComplete?("cancel")
-                #endif
                 try resolveStrokePreview(transaction, phase: .cancelling)
             } catch {
                 failStrokePreviewCancellationIfOwned(transaction)
@@ -805,9 +828,6 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                 throw RendererError.invalidStrokePreview
             }
             try await submitAndWait(commandBuffer)
-            #if DEBUG
-            await previewTerminalDidComplete?("cancel")
-            #endif
             try resolveStrokePreview(transaction, phase: .cancelling)
         } catch {
             failStrokePreviewCancellationIfOwned(transaction)
@@ -991,7 +1011,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         encodeComposite(with: encoder)
         encoder.endEncoding()
         let provider = commandBufferErrorProvider
-        lastCommandBuffer = commandBuffer
+        trackCommandBuffer(commandBuffer)
         await withCheckedContinuation { continuation in
             commandBuffer.addCompletedHandler { completed in
                 if capturesCommittedState, completed.status == .completed {
@@ -1013,6 +1033,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         #endif
         if lastCommandBuffer === commandBuffer {
             lastCommandBuffer = nil
+            lastCommandBufferCompletion = nil
         }
         if let failure = transaction.failureDescription {
             throw RendererError.allocation("GPU execution: \(failure)")
@@ -1465,8 +1486,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
         commandBuffer.present(drawable)
+        trackCommandBuffer(commandBuffer)
         commandBuffer.commit()
-        lastCommandBuffer = commandBuffer
     }
 
     public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
@@ -2272,12 +2293,26 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         return commandBuffer
     }
 
-    private func submit(_ commandBuffer: MTLCommandBuffer, wait: Bool) throws {
-        commandBuffer.commit()
+    @discardableResult
+    private func trackCommandBuffer(
+        _ commandBuffer: MTLCommandBuffer
+    ) -> CommandBufferCompletion {
+        let completion = CommandBufferCompletion()
+        commandBuffer.addCompletedHandler { _ in
+            completion.complete()
+        }
         lastCommandBuffer = commandBuffer
+        lastCommandBufferCompletion = completion
+        return completion
+    }
+
+    private func submit(_ commandBuffer: MTLCommandBuffer, wait: Bool) throws {
+        trackCommandBuffer(commandBuffer)
+        commandBuffer.commit()
         if wait {
             commandBuffer.waitUntilCompleted()
             lastCommandBuffer = nil
+            lastCommandBufferCompletion = nil
             if let error = commandBufferErrorProvider.error(for: commandBuffer) {
                 throw RendererError.allocation("GPU execution: \(error.localizedDescription)")
             }
@@ -2286,15 +2321,12 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
 
     private func submitAndWait(_ commandBuffer: MTLCommandBuffer) async throws {
         let provider = commandBufferErrorProvider
-        lastCommandBuffer = commandBuffer
-        await withCheckedContinuation { continuation in
-            commandBuffer.addCompletedHandler { _ in
-                continuation.resume()
-            }
-            commandBuffer.commit()
-        }
+        let completion = trackCommandBuffer(commandBuffer)
+        commandBuffer.commit()
+        await completion.wait()
         if lastCommandBuffer === commandBuffer {
             lastCommandBuffer = nil
+            lastCommandBufferCompletion = nil
         }
         if let error = provider.error(for: commandBuffer) {
             throw RendererError.allocation("GPU execution: \(error.localizedDescription)")
@@ -2305,6 +2337,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         guard let commandBuffer = lastCommandBuffer else { return }
         commandBuffer.waitUntilCompleted()
         lastCommandBuffer = nil
+        lastCommandBufferCompletion = nil
         if let error = commandBufferErrorProvider.error(for: commandBuffer) {
             if readback {
                 throw RendererError.readback(error.localizedDescription)
@@ -2316,13 +2349,13 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private func synchronizeGPUAsynchronously(readback: Bool) async throws {
         guard let commandBuffer = lastCommandBuffer else { return }
         let provider = commandBufferErrorProvider
-        await withCheckedContinuation { continuation in
-            commandBuffer.addCompletedHandler { _ in
-                continuation.resume()
-            }
+        guard let completion = lastCommandBufferCompletion else {
+            throw RendererError.allocation("a tracked GPU completion")
         }
+        await completion.wait()
         if lastCommandBuffer === commandBuffer {
             lastCommandBuffer = nil
+            lastCommandBufferCompletion = nil
         }
         if let error = provider.error(for: commandBuffer) {
             if readback {
@@ -2738,6 +2771,38 @@ private final class CommandBufferErrorProvider: @unchecked Sendable {
 
     func error(for commandBuffer: MTLCommandBuffer) -> Error? {
         operation(commandBuffer)
+    }
+}
+
+private final class CommandBufferCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isComplete = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func complete() {
+        lock.lock()
+        guard !isComplete else {
+            lock.unlock()
+            return
+        }
+        isComplete = true
+        let waiters = waiters
+        self.waiters.removeAll()
+        lock.unlock()
+        waiters.forEach { $0.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if isComplete {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+                lock.unlock()
+            }
+        }
     }
 }
 
@@ -3210,7 +3275,6 @@ extension WatercolorRenderer {
         )
         encoder.endEncoding()
         commandBuffer.commit()
-        lastCommandBuffer = commandBuffer
         commandBuffer.waitUntilCompleted()
         if let error = commandBuffer.error {
             throw RendererError.readback(error.localizedDescription)
