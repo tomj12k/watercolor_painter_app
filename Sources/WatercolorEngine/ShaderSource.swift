@@ -75,6 +75,39 @@ enum ShaderSource {
         return mix(base, fiber, secondary);
     }
 
+    float smoothValueNoise(float2 position, float cellSize, uint seed) {
+        float2 scaled = position / max(cellSize, 1.0f);
+        float2 base = floor(scaled);
+        float2 fraction = scaled - base;
+        float2 weight = fraction * fraction * (3.0f - 2.0f * fraction);
+        uint2 cell = uint2(base);
+        float v00 = randomValue(cell, seed);
+        float v10 = randomValue(cell + uint2(1u, 0u), seed);
+        float v01 = randomValue(cell + uint2(0u, 1u), seed);
+        float v11 = randomValue(cell + uint2(1u, 1u), seed);
+        return mix(mix(v00, v10, weight.x), mix(v01, v11, weight.x), weight.y);
+    }
+
+    // Version-one texture fields interpolate between noise cells and blend a
+    // second octave, so texture modulates deposits as a continuous field with
+    // per-paper character instead of hard-edged blocks. The legacy paperNoise
+    // above is unchanged for behavior-version-zero documents and the paper
+    // tint of the composite.
+    float smoothPaperNoise(float2 position, uint paper, uint seed) {
+        float frequency;
+        float secondary;
+        switch (paper) {
+            case 0: frequency = 15.0f; secondary = 0.18f; break;
+            case 1: frequency = 9.0f; secondary = 0.34f; break;
+            case 2: frequency = 5.0f; secondary = 0.55f; break;
+            case 3: frequency = 7.0f; secondary = 0.72f; break;
+            default: frequency = 3.0f; secondary = 0.42f; break;
+        }
+        float base = smoothValueNoise(position, frequency, seed ^ (paper * 0x51ed270bu));
+        float detail = smoothValueNoise(position, frequency * 0.41f, seed ^ 0xa511e9b3u);
+        return mix(base, detail, secondary);
+    }
+
     float legacyShapeCoverage(float2 normalized, uint shape) {
         float distance;
         switch (shape) {
@@ -329,15 +362,15 @@ enum ShaderSource {
             case 0:
                 break;
             case 1: {
-                float valley = paperNoise(position, paper, strokeSeed ^ 0x243f6a88u);
+                float valley = smoothPaperNoise(float2(position), paper, strokeSeed ^ 0x243f6a88u);
                 texturedCoverage = coverage * mix(0.30f, 1.24f, valley);
                 pigment = mix(0.72f, 1.32f, valley);
                 water = 0.92f;
                 break;
             }
             case 2: {
-                uint2 connectedCoordinate = position / 4u;
-                float skip = paperNoise(connectedCoordinate, paper, strokeSeed ^ 0x85a308d3u);
+                float2 connectedCoordinate = float2(position) / 4.0f;
+                float skip = smoothPaperNoise(connectedCoordinate, paper, strokeSeed ^ 0x85a308d3u);
                 float interior = smoothstep(0.18f, 0.52f, coverage);
                 float skipCoverage = smoothstep(0.48f, 0.70f, skip);
                 texturedCoverage = coverage * mix(1.0f, skipCoverage, interior);
@@ -391,7 +424,7 @@ enum ShaderSource {
                 water = 1.92f;
                 break;
             case 2: {
-                float skip = paperNoise(position / 4u, paper, strokeSeed ^ 0x13198a2eu);
+                float skip = smoothPaperNoise(float2(position) / 4.0f, paper, strokeSeed ^ 0x13198a2eu);
                 float interior = smoothstep(0.18f, 0.52f, coverage);
                 styledCoverage = coverage * mix(
                     1.0f,
@@ -471,7 +504,7 @@ enum ShaderSource {
             }
         } else {
             uint strokeSeed = parameters.behavior.y;
-            grain = paperNoise(position, parameters.extra.y, strokeSeed);
+            grain = smoothPaperNoise(float2(position), parameters.extra.y, strokeSeed);
             VersionOneProfile hair = versionOneHairProfile(
                 coverage,
                 normalized,
