@@ -59,6 +59,14 @@ make_fixture() {
         '  ditto) failure_stage="ditto" ;;' \
         'esac' \
         'if [[ -n "${FAIL_STAGE:-}" && "${FAIL_STAGE}" == "${failure_stage}" ]]; then exit 70; fi' \
+        'if [[ "${tool_name}" == "xcrun" && "${1:-}" == "notarytool" && "${BLOCK_NOTARY:-}" == "1" ]]; then' \
+        '  : > "${BLOCK_STARTED}"' \
+        '  for ((wait_attempt = 0; wait_attempt < 1000; wait_attempt += 1)); do' \
+        '    if [[ -e "${BLOCK_RELEASE}" ]]; then break; fi' \
+        '    /bin/sleep 0.01' \
+        '  done' \
+        '  if [[ ! -e "${BLOCK_RELEASE}" ]]; then exit 75; fi' \
+        'fi' \
         'if [[ "${tool_name}" == "ditto" ]]; then' \
         '  archive_path=""' \
         '  for tool_argument in "$@"; do archive_path="${tool_argument}"; done' \
@@ -156,6 +164,56 @@ done < "${fixture_log}"
 [[ "${command_lines[8]}" == spctl'|--assess|--type|execute|'* ]]
 published_entries="$(find "${fixture_repository}/.build/distribution" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')"
 [[ "${published_entries}" == "1" ]]
+
+make_fixture "concurrent-distribution"
+block_started="${fixture_repository}/notary-started"
+block_release="${fixture_repository}/notary-release"
+first_output="${fixture_repository}/first-output.log"
+run_distribution \
+    DEVELOPER_ID_APPLICATION="Developer ID Application: Watercolor Test (ABCDE12345)" \
+    NOTARYTOOL_PROFILE="watercolor-test-profile" \
+    ALLOW_EXISTING_FINAL="1" \
+    BLOCK_NOTARY="1" \
+    BLOCK_STARTED="${block_started}" \
+    BLOCK_RELEASE="${block_release}" \
+    > "${first_output}" 2>&1 &
+first_distribution_pid=$!
+for ((wait_attempt = 0; wait_attempt < 1000; wait_attempt += 1)); do
+    if [[ -e "${block_started}" ]]; then break; fi
+    /bin/sleep 0.01
+done
+if [[ ! -e "${block_started}" ]]; then
+    : > "${block_release}"
+    wait "${first_distribution_pid}" || true
+    echo "First distribution never reached the controlled notarization gate" >&2
+    exit 1
+fi
+concurrent_distribution_accepted=false
+if run_distribution \
+    DEVELOPER_ID_APPLICATION="Developer ID Application: Watercolor Test (ABCDE12345)" \
+    NOTARYTOOL_PROFILE="watercolor-test-profile";
+then
+    concurrent_distribution_accepted=true
+fi
+: > "${block_release}"
+if ! wait "${first_distribution_pid}"; then
+    cat "${first_output}" >&2
+    echo "First distribution failed after releasing notarization" >&2
+    exit 1
+fi
+if [[ "${concurrent_distribution_accepted}" == true ]]; then
+    echo "Concurrent distribution unexpectedly acquired shared publication state" >&2
+    exit 1
+fi
+if [[ ! -x "${fixture_final}/Contents/MacOS/WatercolorStudio" ]]; then
+    echo "Lock owner did not publish the verified distribution" >&2
+    exit 1
+fi
+executable_count="$(find "${fixture_final}" -type f -name WatercolorStudio -print | wc -l | tr -d ' ')"
+if [[ "${executable_count}" != "1" ]] || [[ -e "${fixture_repository}/.build/distribution/.package.lock" ]]; then
+    echo "Concurrent distribution nested output or left its lock behind" >&2
+    exit 1
+fi
 
 make_fixture "failed-publication-restores-existing"
 mkdir -p "${fixture_final}/Contents"
@@ -263,7 +321,10 @@ for failure_stage in codesign-sign codesign-verify ditto notarytool stapler-stap
         echo "Distribution unexpectedly survived ${failure_stage} failure" >&2
         exit 1
     fi
-    [[ ! -e "${fixture_final}" ]]
+    if [[ -e "${fixture_final}" ]] || [[ -e "${fixture_repository}/.build/distribution/.package.lock" ]]; then
+        echo "${failure_stage} failure published output or left the distribution locked" >&2
+        exit 1
+    fi
 done
 
 grep -Eq '^\.PHONY:.*distribution' "${source_repository}/Makefile"

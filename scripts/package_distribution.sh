@@ -23,6 +23,8 @@ done
 local_application="${repository_root}/.build/release/Watercolor Studio.app"
 distribution_directory="${repository_root}/.build/distribution"
 final_application="${distribution_directory}/Watercolor Studio.app"
+lock_directory="${distribution_directory}/.package.lock"
+lock_acquired=false
 working_directory=""
 previous_application=""
 failed_application=""
@@ -69,6 +71,15 @@ cleanup() {
         rm -rf "${working_directory}"
     fi
 
+    if [[ "${lock_acquired}" == true ]]; then
+        if ! rmdir "${lock_directory}"; then
+            echo "Failed to release the distribution lock at: ${lock_directory}" >&2
+            if [[ "${exit_status}" -eq 0 ]]; then
+                exit_status=6
+            fi
+        fi
+    fi
+
     if [[ "${restoration_failed}" == true ]]; then
         exit 5
     fi
@@ -79,6 +90,13 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+mkdir -p "${distribution_directory}"
+if ! mkdir "${lock_directory}" 2>/dev/null; then
+    echo "Another distribution build is already running or a stale lock exists at: ${lock_directory}" >&2
+    exit 4
+fi
+lock_acquired=true
+
 cd "${repository_root}"
 "${repository_root}/scripts/package_app.sh"
 
@@ -87,7 +105,6 @@ if [[ ! -x "${local_application}/Contents/MacOS/WatercolorStudio" ]]; then
     exit 3
 fi
 
-mkdir -p "${distribution_directory}"
 working_directory="$(mktemp -d "${distribution_directory}/.package.XXXXXX")"
 staged_application="${working_directory}/Watercolor Studio.app"
 notarization_archive="${working_directory}/Watercolor Studio.zip"
