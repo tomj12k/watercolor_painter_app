@@ -1702,6 +1702,57 @@ import WatercolorCore
         #expect(try splitRenderer.compositeChecksum() == checksumBefore)
     }
 
+    @Test func densePaintCompositesWithoutPerPixelWhiteSpeckle() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(256)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var brush = BrushSettings.default
+        brush.size = 160
+        brush.opacity = 1
+        brush.flow = 1
+        brush.color = PaintColor(red: 0.05, green: 0.05, blue: 0.05)
+        for strokeIndex in 0..<3 {
+            let stroke = StrokeCommand(
+                layerID: project.layers[0].id,
+                tool: .brush,
+                brush: brush,
+                points: [StrokePoint(
+                    x: 128,
+                    y: 128,
+                    pressure: 1,
+                    tiltX: 0,
+                    tiltY: 0,
+                    time: Double(strokeIndex)
+                )]
+            )
+            try renderer.renderAndWait(stroke: stroke)
+        }
+
+        let image = try renderer.makeCGImage()
+        let data = try #require(image.dataProvider?.data)
+        let bytes = try #require(CFDataGetBytePtr(data))
+        let bytesPerRow = image.bytesPerRow
+        func luminance(_ x: Int, _ y: Int) -> Double {
+            let offset = y * bytesPerRow + x * 4
+            // BGRA little-endian: average the three color channels.
+            return (Double(bytes[offset]) + Double(bytes[offset + 1]) + Double(bytes[offset + 2]))
+                / (3 * 255)
+        }
+        var maximumAdjacentJump = 0.0
+        for y in 100...156 {
+            for x in 96...159 {
+                maximumAdjacentJump = max(
+                    maximumAdjacentJump,
+                    abs(luminance(x + 1, y) - luminance(x, y))
+                )
+            }
+        }
+        // The composite's paper grain must read as soft mottling, not
+        // per-pixel noise: in dense dark paint an uncorrelated grain lets
+        // single white pixels bleed through as speckle.
+        #expect(maximumAdjacentJump <= 0.031)
+    }
+
     @Test func granulatingTextureModulatesDepositsSmoothlyWithoutHardCellEdges() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(256)

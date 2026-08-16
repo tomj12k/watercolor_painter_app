@@ -844,7 +844,11 @@ enum ShaderSource {
         if (position.x >= output.get_width() || position.y >= output.get_height()) return;
 
         uint paper = parameters.dimensions.z;
-        float grain = paperNoise(position, paper, 0x74a7c15du);
+        // Smooth, half-frequency grain: an uncorrelated per-pixel grain reads
+        // as white speckle wherever dense paint saturates the deposit, and
+        // even a fine smooth octave leaves visible stepping there. The wider
+        // cells keep the per-paper tooth as soft mottling.
+        float grain = smoothPaperNoise(float2(position) * 0.5f, paper, 0x74a7c15du);
         float grainStrength;
         switch (paper) {
             case 0: grainStrength = 0.012f; break;
