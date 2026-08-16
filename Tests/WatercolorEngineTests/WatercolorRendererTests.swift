@@ -2754,6 +2754,61 @@ import WatercolorCore
         #expect(try migratedRenderer.compositeChecksum() == expectedRenderer.compositeChecksum())
     }
 
+    @Test func versionTwoPayloadWithoutDynamicsPreservesRenderingAcrossMigrationAndReopen() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let layerID = UUID(uuidString: "6DCB29A6-F30B-4A8D-A4AE-F8C14A15687C")!
+        let strokeID = UUID(uuidString: "D320F90A-3213-45D7-8DBF-8312B1DD687E")!
+        let layer = PaintLayer(id: layerID, name: "Version 2 paint")
+        let expectedBrush = BrushSettings(
+            shape: .flat,
+            hair: .bristle,
+            texture: .mottled,
+            style: .glazing,
+            color: PaintColor(red: 0.5, green: 0.25, blue: 0.75, alpha: 0.9),
+            size: 24,
+            opacity: 0.8,
+            flow: 0.7,
+            water: 0.6,
+            granulation: 0.4,
+            edgeBloom: 0.2,
+            behaviorVersion: 0,
+            spacing: 0.18,
+            rotation: 0,
+            bristleStrength: 0.5,
+            textureStrength: 0.5
+        )
+        let expected = PaintingProject(
+            schemaVersion: 3,
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .rough,
+            layers: [layer],
+            commands: [.stroke(StrokeCommand(
+                id: strokeID,
+                layerID: layerID,
+                tool: .brush,
+                brush: expectedBrush,
+                points: [
+                    StrokePoint(x: 96, y: 120, pressure: 0.8, tiltX: 0, tiltY: 0, time: 0),
+                    StrokePoint(x: 160, y: 120, pressure: 0.9, tiltX: 0, tiltY: 0, time: 1)
+                ]
+            ))]
+        )
+
+        let migrated = try PaintingDocumentCodec.decode(versionTwoPayloadWithoutDynamics())
+        let expectedRenderer = try WatercolorRenderer(project: expected, device: device)
+        let expectedChecksum = try expectedRenderer.compositeChecksum()
+        let migratedRenderer = try WatercolorRenderer(project: migrated, device: device)
+
+        #expect(migrated == expected)
+        #expect(try migratedRenderer.compositeChecksum() == expectedChecksum)
+
+        let reopened = try PaintingDocumentCodec.decode(PaintingDocumentCodec.encode(migrated))
+        let reopenedRenderer = try WatercolorRenderer(project: reopened, device: device)
+
+        #expect(reopened == expected)
+        #expect(try reopenedRenderer.compositeChecksum() == expectedChecksum)
+    }
+
     @Test func replayDuplicatesPigmentAndWetnessThenLetsLayersDiverge() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let source = PaintLayer(
@@ -3225,6 +3280,47 @@ private final class RendererPreviewMilestone {
             waiters.append(continuation)
         }
     }
+}
+
+private func versionTwoPayloadWithoutDynamics() throws -> Data {
+    let object: [String: Any] = [
+        "schemaVersion": 2,
+        "canvas": ["width": 256, "height": 256],
+        "paper": "rough",
+        "layers": [[
+            "id": "6DCB29A6-F30B-4A8D-A4AE-F8C14A15687C",
+            "name": "Version 2 paint",
+            "isVisible": true,
+            "opacity": 1.0
+        ]],
+        "commands": [[
+            "stroke": [
+                "_0": [
+                    "id": "D320F90A-3213-45D7-8DBF-8312B1DD687E",
+                    "layerID": "6DCB29A6-F30B-4A8D-A4AE-F8C14A15687C",
+                    "tool": "brush",
+                    "brush": [
+                        "shape": "flat",
+                        "hair": "bristle",
+                        "texture": "mottled",
+                        "style": "glazing",
+                        "color": ["red": 0.5, "green": 0.25, "blue": 0.75, "alpha": 0.9],
+                        "size": 24.0,
+                        "opacity": 0.8,
+                        "flow": 0.7,
+                        "water": 0.6,
+                        "granulation": 0.4,
+                        "edgeBloom": 0.2
+                    ],
+                    "points": [
+                        ["x": 96.0, "y": 120.0, "pressure": 0.8, "tiltX": 0.0, "tiltY": 0.0, "time": 0.0],
+                        ["x": 160.0, "y": 120.0, "pressure": 0.9, "tiltX": 0.0, "tiltY": 0.0, "time": 1.0]
+                    ]
+                ]
+            ]
+        ]]
+    ]
+    return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
 }
 
 private extension PaintingProject {
