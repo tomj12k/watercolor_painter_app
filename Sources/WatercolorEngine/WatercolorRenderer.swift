@@ -138,6 +138,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private let commandBufferErrorProvider: CommandBufferErrorProvider
     #if DEBUG
     private let previewAppendWillCommit: (() async -> Void)?
+    private let previewCancellationWillSubmit: (() async -> Void)?
     private let previewTerminalDidComplete: ((String) async -> Void)?
     #endif
     private var strokePreview: StrokePreviewTransaction?
@@ -255,6 +256,23 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     convenience init(
         project: PaintingProject,
         device requestedDevice: MTLDevice?,
+        debugPreviewCancellationWillSubmit: @escaping () async -> Void
+    ) throws {
+        try self.init(
+            project: project,
+            device: requestedDevice,
+            pipelineResources: nil,
+            resourcePolicy: nil,
+            workPolicy: nil,
+            performsResourceAdmission: true,
+            commandBufferError: { $0.error },
+            previewCancellationWillSubmit: debugPreviewCancellationWillSubmit
+        )
+    }
+
+    convenience init(
+        project: PaintingProject,
+        device requestedDevice: MTLDevice?,
         debugPreviewTerminalDidComplete: @escaping (String) async -> Void
     ) throws {
         try self.init(
@@ -297,6 +315,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         performsResourceAdmission: Bool,
         commandBufferError: @escaping (MTLCommandBuffer) -> Error?,
         previewAppendWillCommit: (() async -> Void)? = nil,
+        previewCancellationWillSubmit: (() async -> Void)? = nil,
         previewTerminalDidComplete: ((String) async -> Void)? = nil,
         projectAdmissionLimits requestedProjectAdmissionLimits: ProjectAdmissionLimits? = nil
     ) throws {
@@ -356,6 +375,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         commandBufferErrorProvider = CommandBufferErrorProvider(commandBufferError)
         #if DEBUG
         self.previewAppendWillCommit = previewAppendWillCommit
+        self.previewCancellationWillSubmit = previewCancellationWillSubmit
         self.previewTerminalDidComplete = previewTerminalDidComplete
         #endif
         strokePreview = nil
@@ -725,19 +745,22 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         }
         transaction.phase = .cancelling
         activeSimulationRegions = transaction.committedSimulationRegions
-        guard let snapshotState = transaction.resolveSnapshotCapture() else {
+        guard let snapshotState = transaction.snapshotStateForCancellation() else {
             try resolveStrokePreview(transaction, phase: .cancelling)
             return
         }
         if transaction.replaysOnCancel {
             do {
-                try await replayAsynchronously(project: project, admittingResources: true)
+                try await replayStrokePreviewCancellation(
+                    project: project,
+                    transaction: transaction
+                )
                 #if DEBUG
                 await previewTerminalDidComplete?("cancel")
                 #endif
                 try resolveStrokePreview(transaction, phase: .cancelling)
             } catch {
-                clearStrokePreviewIfOwned(transaction, phase: .cancelling)
+                failStrokePreviewCancellationIfOwned(transaction)
                 throw error
             }
             return
@@ -748,35 +771,46 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             return
         case .submitted:
             do {
-                try await replayAsynchronously(project: project, admittingResources: true)
+                try await replayStrokePreviewCancellation(
+                    project: project,
+                    transaction: transaction
+                )
                 #if DEBUG
                 await previewTerminalDidComplete?("cancel")
                 #endif
                 try resolveStrokePreview(transaction, phase: .cancelling)
             } catch {
-                clearStrokePreviewIfOwned(transaction, phase: .cancelling)
+                failStrokePreviewCancellationIfOwned(transaction)
                 throw error
             }
             return
         case .committed:
             break
         }
-        let commandBuffer = try makeCommandBuffer(label: "Cancel watercolor stroke preview")
-        try encodeStrokePreviewSnapshotRestore(transaction, with: commandBuffer)
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
-            clearStrokePreviewIfOwned(transaction, phase: .cancelling)
-            throw RendererError.allocation("a stroke preview cancellation encoder")
-        }
-        encodeComposite(with: encoder)
-        encoder.endEncoding()
         do {
+            #if DEBUG
+            await previewCancellationWillSubmit?()
+            #endif
+            guard ownsStrokePreview(transaction, phase: .cancelling) else {
+                throw RendererError.invalidStrokePreview
+            }
+            let commandBuffer = try makeCommandBuffer(label: "Cancel watercolor stroke preview")
+            try encodeStrokePreviewSnapshotRestore(transaction, with: commandBuffer)
+            guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                throw RendererError.allocation("a stroke preview cancellation encoder")
+            }
+            encodeComposite(with: encoder)
+            encoder.endEncoding()
+            guard ownsStrokePreview(transaction, phase: .cancelling) else {
+                throw RendererError.invalidStrokePreview
+            }
             try await submitAndWait(commandBuffer)
             #if DEBUG
             await previewTerminalDidComplete?("cancel")
             #endif
             try resolveStrokePreview(transaction, phase: .cancelling)
         } catch {
-            clearStrokePreviewIfOwned(transaction, phase: .cancelling)
+            failStrokePreviewCancellationIfOwned(transaction)
             throw error
         }
     }
@@ -798,53 +832,76 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         strokePreview = nil
     }
 
-    private func clearStrokePreviewIfOwned(
-        _ transaction: StrokePreviewTransaction,
-        phase: StrokePreviewPhase
+    private func failStrokePreviewCancellationIfOwned(
+        _ transaction: StrokePreviewTransaction
     ) {
-        guard ownsStrokePreview(transaction, phase: phase) else { return }
-        strokePreview = nil
+        guard ownsStrokePreview(transaction, phase: .cancelling) else { return }
+        transaction.phase = .failed
     }
 
     private func cancelStrokePreview(_ transaction: StrokePreviewTransaction) throws {
-        guard strokePreview === transaction else {
+        guard strokePreview === transaction,
+              transaction.phase != .cancelling
+        else {
             throw RendererError.invalidStrokePreview
         }
         transaction.phase = .cancelling
         activeSimulationRegions = transaction.committedSimulationRegions
-        let snapshotState = transaction.resolveSnapshotCapture()
-        try resolveStrokePreview(transaction, phase: .cancelling)
-        guard let snapshotState else { return }
-        if transaction.replaysOnCancel {
+        do {
+            guard let snapshotState = transaction.snapshotStateForCancellation() else {
+                try resolveStrokePreview(transaction, phase: .cancelling)
+                return
+            }
+            if transaction.replaysOnCancel {
+                #if DEBUG
+                synchronousPreviewCancellationReplayCount += 1
+                #endif
+                guard ownsStrokePreview(transaction, phase: .cancelling) else {
+                    throw RendererError.invalidStrokePreview
+                }
+                try replay(project: project, admittingResources: true)
+                try resolveStrokePreview(transaction, phase: .cancelling)
+                return
+            }
+            switch snapshotState {
+            case .pending:
+                try resolveStrokePreview(transaction, phase: .cancelling)
+                return
+            case .submitted:
+                #if DEBUG
+                synchronousPreviewCancellationReplayCount += 1
+                #endif
+                guard ownsStrokePreview(transaction, phase: .cancelling) else {
+                    throw RendererError.invalidStrokePreview
+                }
+                try replay(project: project, admittingResources: true)
+                try resolveStrokePreview(transaction, phase: .cancelling)
+                return
+            case .committed:
+                break
+            }
+            guard ownsStrokePreview(transaction, phase: .cancelling) else {
+                throw RendererError.invalidStrokePreview
+            }
+            let commandBuffer = try makeCommandBuffer(label: "Cancel watercolor stroke preview")
+            try encodeStrokePreviewSnapshotRestore(transaction, with: commandBuffer)
+            guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                throw RendererError.allocation("a stroke preview cancellation encoder")
+            }
+            encodeComposite(with: encoder)
+            encoder.endEncoding()
+            guard ownsStrokePreview(transaction, phase: .cancelling) else {
+                throw RendererError.invalidStrokePreview
+            }
             #if DEBUG
-            synchronousPreviewCancellationReplayCount += 1
+            synchronousPreviewCancellationWaitCount += 1
             #endif
-            try replay(project: project)
-            return
+            try submit(commandBuffer, wait: true)
+            try resolveStrokePreview(transaction, phase: .cancelling)
+        } catch {
+            failStrokePreviewCancellationIfOwned(transaction)
+            throw error
         }
-        switch snapshotState {
-        case .pending:
-            return
-        case .submitted:
-            #if DEBUG
-            synchronousPreviewCancellationReplayCount += 1
-            #endif
-            try replay(project: project)
-            return
-        case .committed:
-            break
-        }
-        let commandBuffer = try makeCommandBuffer(label: "Cancel watercolor stroke preview")
-        try encodeStrokePreviewSnapshotRestore(transaction, with: commandBuffer)
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
-            throw RendererError.allocation("a stroke preview cancellation encoder")
-        }
-        encodeComposite(with: encoder)
-        encoder.endEncoding()
-        #if DEBUG
-        synchronousPreviewCancellationWaitCount += 1
-        #endif
-        try submit(commandBuffer, wait: true)
     }
 
     private func render(stroke: StrokeCommand, waitUntilCompleted: Bool) throws {
@@ -1082,6 +1139,30 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         try await synchronizeGPUAsynchronously(readback: false)
         await Task.yield()
         let commandBuffer = try encodeReplay(project: newProject, plan: replayPlan)
+        try await submitAndWait(commandBuffer)
+        readCanvasWetnessMeasurement()
+    }
+
+    private func replayStrokePreviewCancellation(
+        project newProject: PaintingProject,
+        transaction: StrokePreviewTransaction
+    ) async throws {
+        let replayPlan = try admittedReplayPlan(
+            for: newProject,
+            admittingResources: true
+        )
+        try await synchronizeGPUAsynchronously(readback: false)
+        await Task.yield()
+        #if DEBUG
+        await previewCancellationWillSubmit?()
+        #endif
+        guard ownsStrokePreview(transaction, phase: .cancelling) else {
+            throw RendererError.invalidStrokePreview
+        }
+        let commandBuffer = try encodeReplay(project: newProject, plan: replayPlan)
+        guard ownsStrokePreview(transaction, phase: .cancelling) else {
+            throw RendererError.invalidStrokePreview
+        }
         try await submitAndWait(commandBuffer)
         readCanvasWetnessMeasurement()
     }
@@ -2679,6 +2760,7 @@ private final class StrokePreviewTransaction: @unchecked Sendable {
     private let lock = NSLock()
     private var failure: String?
     private var snapshotCaptureState = StrokePreviewSnapshotState.pending
+    private var retainedCancellationSnapshotState: StrokePreviewSnapshotState?
     private var isResolved = false
     private var requiresReplayOnCancel = false
 
@@ -2761,6 +2843,18 @@ private final class StrokePreviewTransaction: @unchecked Sendable {
         defer { lock.unlock() }
         guard !isResolved else { return nil }
         isResolved = true
+        return snapshotCaptureState
+    }
+
+    func snapshotStateForCancellation() -> StrokePreviewSnapshotState? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let retainedCancellationSnapshotState {
+            return retainedCancellationSnapshotState
+        }
+        guard !isResolved else { return nil }
+        isResolved = true
+        retainedCancellationSnapshotState = snapshotCaptureState
         return snapshotCaptureState
     }
 

@@ -745,7 +745,7 @@ import WatercolorCore
             layers: [PaintLayer(name: "Layer")]
         )
         let append = CanvasPreviewSuspension()
-        let appendFailed = CanvasPreviewSignal()
+        let failureProcessed = CanvasPreviewSuspension()
         let cancellation = CanvasPreviewSuspension()
         let renderer = try WatercolorRenderer(
             project: project,
@@ -760,16 +760,11 @@ import WatercolorCore
             renderer: renderer,
             strokePreviewOperation: StrokePreviewRendererOperation(
                 update: { renderer, id, points, token in
-                    do {
-                        try await renderer.appendStrokePreview(
-                            id: id,
-                            points: points,
-                            token: token
-                        )
-                    } catch {
-                        await appendFailed.signal()
-                        throw error
-                    }
+                    try await renderer.appendStrokePreview(
+                        id: id,
+                        points: points,
+                        token: token
+                    )
                 },
                 finish: { renderer, stroke, token in
                     try await renderer.finishStrokePreview(stroke, token: token)
@@ -781,6 +776,9 @@ import WatercolorCore
                     if ordinal == 1 {
                         await cancellation.suspend()
                     }
+                },
+                didProcessUpdateFailure: { _ in
+                    await failureProcessed.suspend()
                 }
             ),
             maximumTotalStrokePointCount: 10
@@ -815,8 +813,11 @@ import WatercolorCore
         #expect(!model.capabilities.canPaint)
 
         await append.resume()
-        await appendFailed.wait()
-        await Task.yield()
+        await failureProcessed.waitUntilSuspended()
+        #expect(model.isStrokePreviewActive)
+        #expect(!model.capabilities.canPaint)
+        #expect(cancellationCount == 1)
+        await failureProcessed.resume()
         await cancellation.resume()
         await model.waitForStrokePreviewCancellation()
 

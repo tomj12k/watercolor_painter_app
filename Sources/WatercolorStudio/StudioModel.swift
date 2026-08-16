@@ -65,21 +65,25 @@ struct StrokePreviewRendererOperation {
         WatercolorRenderer,
         RendererStrokePreviewToken
     ) async throws -> Void
+    typealias DidProcessUpdateFailure = @MainActor (Error) async -> Void
 
     let update: Update
     let finish: Finish
     let cancel: Cancel
+    let didProcessUpdateFailure: DidProcessUpdateFailure
 
     init(
         update: @escaping Update,
         finish: @escaping Finish,
         cancel: @escaping Cancel = { renderer, token in
             try await renderer.restoreStrokePreviewCancellation(token)
-        }
+        },
+        didProcessUpdateFailure: @escaping DidProcessUpdateFailure = { _ in }
     ) {
         self.update = update
         self.finish = finish
         self.cancel = cancel
+        self.didProcessUpdateFailure = didProcessUpdateFailure
     }
 
     static let live = Self(
@@ -451,6 +455,7 @@ public final class StudioModel: ObservableObject {
             } catch {
                 guard isCurrentStrokePreview(token), renderer === token.renderer else { break }
                 failStrokePreview(error, token: token)
+                await strokePreviewOperation.didProcessUpdateFailure(error)
                 break
             }
         }
