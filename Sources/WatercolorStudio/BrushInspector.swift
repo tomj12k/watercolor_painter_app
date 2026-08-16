@@ -230,14 +230,27 @@ struct BrushInspector: View {
     @ObservedObject var model: StudioModel
 
     var body: some View {
+        // Each tool declares which controls change its output; the
+        // inspector shows exactly those, so a slider never appears for a
+        // tool that ignores it.
+        let options = model.selectedTool.inspectorOptions
         VStack(alignment: .leading, spacing: 10) {
-            identitySection
-            sectionDivider
-            colorSection
-            sectionDivider
-            paintSection
-            sectionDivider
-            dynamicsSection
+            if options.contains(.identity) {
+                identitySection
+                sectionDivider
+            }
+            if options.contains(.color) {
+                colorSection
+                sectionDivider
+            }
+            paintSection(options: options)
+            if options.contains(.fullDynamics) {
+                sectionDivider
+                dynamicsSection
+            } else if options.contains(.spacing) {
+                sectionDivider
+                spacingSection
+            }
         }
         .font(.system(size: 12))
         .tint(StudioPalette.cobalt)
@@ -362,9 +375,9 @@ struct BrushInspector: View {
         }
     }
 
-    private var paintSection: some View {
+    private func paintSection(options: [ToolInspectorOption]) -> some View {
         VStack(alignment: .leading, spacing: 9) {
-            StudioSectionTitle(title: BrushInspectorPresentation.sectionTitles[2])
+            StudioSectionTitle(title: model.selectedTool.optionsPaneTitle)
 
             NumericControl(
                 presentation: BrushNumericPresentation(
@@ -377,32 +390,69 @@ struct BrushInspector: View {
                 display: { "\(Int($0.rounded())) pt" }
             )
 
+            if options.contains(.strength), let strengthTitle = model.selectedTool.strengthTitle {
+                NumericControl(
+                    presentation: strengthPresentation(title: strengthTitle),
+                    value: brushBinding(\.opacity),
+                    display: Self.percent
+                )
+            }
+            if options.contains(.flow) {
+                NumericControl(
+                    presentation: paintPresentation(at: 2, title: "Flow"),
+                    value: brushBinding(\.flow),
+                    display: Self.percent
+                )
+            }
+            if options.contains(.waterLoad) {
+                NumericControl(
+                    presentation: paintPresentation(at: 3, title: "Water"),
+                    value: brushBinding(\.water),
+                    display: Self.percent
+                )
+            }
+            if options.contains(.granulation) {
+                NumericControl(
+                    presentation: paintPresentation(at: 4, title: "Granulation"),
+                    value: brushBinding(\.granulation),
+                    display: Self.percent
+                )
+            }
+            if options.contains(.edgeBloom) {
+                NumericControl(
+                    presentation: paintPresentation(at: 5, title: "Edge bloom"),
+                    value: brushBinding(\.edgeBloom),
+                    display: Self.percent
+                )
+            }
+        }
+    }
+
+    private var spacingSection: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            StudioSectionTitle(title: "Dynamics")
             NumericControl(
-                presentation: paintPresentation(at: 1, title: "Opacity"),
-                value: brushBinding(\.opacity),
-                display: Self.percent
-            )
-            NumericControl(
-                presentation: paintPresentation(at: 2, title: "Flow"),
-                value: brushBinding(\.flow),
-                display: Self.percent
-            )
-            NumericControl(
-                presentation: paintPresentation(at: 3, title: "Water"),
-                value: brushBinding(\.water),
-                display: Self.percent
-            )
-            NumericControl(
-                presentation: paintPresentation(at: 4, title: "Granulation"),
-                value: brushBinding(\.granulation),
-                display: Self.percent
-            )
-            NumericControl(
-                presentation: paintPresentation(at: 5, title: "Edge bloom"),
-                value: brushBinding(\.edgeBloom),
+                presentation: BrushInspectorPresentation.dynamics[0],
+                value: Binding(get: { model.brush.spacing }, set: { model.setBrushSpacing($0) }),
                 display: Self.percent
             )
         }
+    }
+
+    private func strengthPresentation(title: String) -> BrushNumericPresentation {
+        if model.selectedTool == .brush {
+            return paintPresentation(at: 1, title: title)
+        }
+        let toolName = model.selectedTool.displayName
+        return BrushNumericPresentation(
+            title: title,
+            range: 0...1,
+            step: 0.01,
+            accessibility: BrushAccessibilityPresentation(
+                label: "\(toolName) strength",
+                help: "Set how strongly the \(toolName.lowercased()) tool acts on the paint."
+            )
+        )
     }
 
     private var dynamicsSection: some View {

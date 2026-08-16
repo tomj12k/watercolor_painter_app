@@ -39,7 +39,7 @@ enum StudioHelp {
             """
         ),
         Section(
-            title: "Brush settings",
+            title: "Brush and tool settings",
             body: """
             The brush inspector sets the brush identity (style, shape, hair, \
             texture), the paint load (size, opacity, flow, water, \
@@ -47,6 +47,13 @@ enum StudioHelp {
             rotation, bristle and texture strength). Styles such as Wet on \
             wet or Dry brush apply a matched set of paint parameters while \
             keeping your color and dynamics.
+
+            Every tool keeps its own settings. The water tool sets its \
+            size, water amount, edge bloom, and spacing; the eraser, \
+            smudge, smear, and dry tools set their size, strength, and \
+            spacing. Strength controls how firmly a tool lifts, moves, or \
+            dries the paint, and each tool remembers its settings when you \
+            switch away and back.
             """
         ),
         Section(
