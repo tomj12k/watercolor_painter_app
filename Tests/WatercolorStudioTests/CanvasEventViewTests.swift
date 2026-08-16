@@ -554,7 +554,8 @@ import WatercolorCore
             location: CGPoint(x: 44, y: 64)
         )))
         await model.waitForStrokePreviewIdle()
-        #expect(submittedBatches.contains { $0.count > 8 })
+        #expect(!submittedBatches.isEmpty)
+        #expect(submittedBatches.allSatisfy { $0.count <= 8 })
         view.mouseUp(with: try #require(canvasMouseEvent(
             .leftMouseUp,
             timestamp: 2,

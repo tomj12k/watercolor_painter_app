@@ -375,6 +375,9 @@ actor StudioPNGExportCoordinator {
 public final class StudioModel: ObservableObject {
     public static let brushSizeRange = 1.0...300.0
     private static let dryStepCount = 24
+    // Keep each queued preview update within one renderer stamp batch. This
+    // bounds GPU work per submission when input arrives faster than Metal.
+    private static let previewPointBatchSize = 8
     private static let maximumRendererCheckpointCount = 2
     private static let defaultRendererCheckpointByteBudget = 256 * 1024 * 1024
 
@@ -456,6 +459,10 @@ public final class StudioModel: ObservableObject {
     private weak var attachedCanvas: MTKView?
     private var strokePreviewState: StudioStrokePreviewState
     private var pendingStrokePreviewPoints: [StrokePoint]
+    private var pendingStrokePreviewOffset: Int
+#if DEBUG
+    private(set) var pendingStrokePreviewCompactionCountForTesting = 0
+#endif
     private var strokePreviewDrainTask: Task<Void, Never>?
     private var strokePreviewDrainToken: StudioStrokePreviewToken?
     private var strokePreviewCancellationTask: Task<Void, Never>?
@@ -477,7 +484,7 @@ public final class StudioModel: ObservableObject {
     }
 
     var pendingStrokePreviewPointCountForTesting: Int {
-        pendingStrokePreviewPoints.count
+        pendingStrokePreviewPoints.count - pendingStrokePreviewOffset
     }
 
     private var canAppendCommand: Bool {
@@ -529,6 +536,7 @@ public final class StudioModel: ObservableObject {
         currentPNGExportFailureID = nil
         strokePreviewState = .idle
         pendingStrokePreviewPoints = []
+        pendingStrokePreviewOffset = 0
         strokePreviewDrainTask = nil
         strokePreviewDrainToken = nil
         strokePreviewCancellationTask = nil
@@ -575,6 +583,14 @@ public final class StudioModel: ObservableObject {
               renderer === token.renderer,
               !points.isEmpty
         else { return }
+        if pendingStrokePreviewOffset == pendingStrokePreviewPoints.count {
+            let hadConsumedStorage = pendingStrokePreviewOffset > 0
+            pendingStrokePreviewPoints.removeAll(keepingCapacity: true)
+            pendingStrokePreviewOffset = 0
+#if DEBUG
+            if hadConsumedStorage { pendingStrokePreviewCompactionCountForTesting += 1 }
+#endif
+        }
         pendingStrokePreviewPoints.append(contentsOf: points)
         startStrokePreviewDrainIfNeeded()
     }
@@ -601,7 +617,7 @@ public final class StudioModel: ObservableObject {
             canvasWetness = token.renderer.canvasWetness
             editor.append(.stroke(stroke))
             strokePreviewState = .idle
-            pendingStrokePreviewPoints = []
+            clearPendingStrokePreviewPoints()
             publishEditorProject()
             error = nil
         } catch {
@@ -665,7 +681,7 @@ public final class StudioModel: ObservableObject {
     private func startStrokePreviewDrainIfNeeded() {
         guard strokePreviewDrainTask == nil,
               let token = strokePreviewState.token,
-              !pendingStrokePreviewPoints.isEmpty
+              pendingStrokePreviewOffset < pendingStrokePreviewPoints.count
         else { return }
 
         strokePreviewDrainToken = token
@@ -678,9 +694,19 @@ public final class StudioModel: ObservableObject {
         while !Task.isCancelled,
               isCurrentStrokePreview(token),
               renderer === token.renderer,
-              !pendingStrokePreviewPoints.isEmpty {
-            let points = pendingStrokePreviewPoints
-            pendingStrokePreviewPoints = []
+              pendingStrokePreviewOffset < pendingStrokePreviewPoints.count {
+            let availablePointCount = pendingStrokePreviewPoints.count - pendingStrokePreviewOffset
+            let pointCount = min(Self.previewPointBatchSize, availablePointCount)
+            let end = pendingStrokePreviewOffset + pointCount
+            let points = Array(pendingStrokePreviewPoints[pendingStrokePreviewOffset..<end])
+            pendingStrokePreviewOffset = end
+            if pendingStrokePreviewOffset == pendingStrokePreviewPoints.count {
+                pendingStrokePreviewPoints.removeAll(keepingCapacity: true)
+                pendingStrokePreviewOffset = 0
+#if DEBUG
+                pendingStrokePreviewCompactionCountForTesting += 1
+#endif
+            }
             do {
                 try await strokePreviewOperation.update(
                     token.renderer,
@@ -750,7 +776,7 @@ public final class StudioModel: ObservableObject {
             return
         }
         strokePreviewState = .cancelling(token)
-        pendingStrokePreviewPoints = []
+        clearPendingStrokePreviewPoints()
         strokePreviewDrainTask?.cancel()
         strokePreviewDrainTask = nil
         strokePreviewDrainToken = nil
@@ -891,10 +917,18 @@ public final class StudioModel: ObservableObject {
     private func invalidateStrokePreview(_ token: StudioStrokePreviewToken) {
         guard isCurrentStrokePreview(token) else { return }
         strokePreviewState = .idle
-        pendingStrokePreviewPoints = []
+        clearPendingStrokePreviewPoints()
         strokePreviewDrainTask?.cancel()
         strokePreviewDrainTask = nil
         strokePreviewDrainToken = nil
+    }
+
+    private func clearPendingStrokePreviewPoints() {
+        pendingStrokePreviewPoints.removeAll(keepingCapacity: true)
+        pendingStrokePreviewOffset = 0
+#if DEBUG
+        pendingStrokePreviewCompactionCountForTesting += 1
+#endif
     }
 
     private func isCurrentStrokePreview(_ token: StudioStrokePreviewToken) -> Bool {
