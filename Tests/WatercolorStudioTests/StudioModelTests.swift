@@ -2177,7 +2177,7 @@ import WatercolorCore
         #expect(documentUpdates == [model.project])
     }
 
-    @Test func selectingPaperPublishesAndReplaysTheProject() throws {
+    @Test func selectingPaperPublishesAndReplaysTheProject() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
         let renderer = try WatercolorRenderer(project: project, device: device)
@@ -2189,6 +2189,7 @@ import WatercolorCore
         )
 
         model.selectPaper(.rough)
+        await model.waitForStructuralChanges()
 
         #expect(model.project.paper == .rough)
         #expect(model.selectedLayerID == project.layers[0].id)
@@ -2196,7 +2197,7 @@ import WatercolorCore
         #expect(documentUpdates == [model.project])
     }
 
-    @Test func changingPaperReplaysPaintedRasterExactlyAsTheSavedProjectReopens() throws {
+    @Test func changingPaperReplaysPaintedRasterExactlyAsTheSavedProjectReopens() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         var project = PaintingProject.studioTestProject()
         let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
@@ -2210,6 +2211,7 @@ import WatercolorCore
         )
 
         model.selectPaper(.rough)
+        await model.waitForStructuralChanges()
 
         let reopenedProject = try PaintingDocumentCodec.decode(
             PaintingDocumentCodec.encode(model.project)
@@ -2251,7 +2253,7 @@ import WatercolorCore
         #expect(!model.capabilities.canUndo)
     }
 
-    @Test func failedPaperReplayPreservesTheLiveModelRendererAndDocument() throws {
+    @Test func failedPaperReplayPreservesTheLiveModelRendererAndDocument() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         var project = PaintingProject.studioTestProject()
         project.commands = [
@@ -2289,6 +2291,7 @@ import WatercolorCore
         shouldFail = true
 
         model.selectPaper(.rough)
+        await model.waitForStructuralChanges()
 
         #expect(model.project == project)
         #expect(model.rendererProject == project)
@@ -2575,7 +2578,7 @@ import WatercolorCore
         #expect(model.rendererCheckpointCountForTesting <= 2)
     }
 
-    @Test func checkpointBudgetEvictsOldSnapshotsBeforeAllocatingCandidate() throws {
+    @Test func checkpointBudgetEvictsOldSnapshotsBeforeAllocatingCandidate() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
         var checkpointCountsDuringCandidateReplay: [Int] = []
@@ -2601,18 +2604,22 @@ import WatercolorCore
         observedModel = model
 
         model.selectPaper(.rough)
+        await model.waitForStructuralChanges()
         let roughRendererIdentity = model.rendererIdentity
         model.selectPaper(.hotPress)
+        await model.waitForStructuralChanges()
 
         #expect(model.rendererCheckpointCountForTesting == 1)
         #expect(model.rendererCheckpointBytesForTesting <= oneCheckpointBudget)
-        #expect(checkpointCountsDuringCandidateReplay == [0, 0])
+        // Each asynchronous paper change replays twice: once to initialize
+        // the blank candidate and once to replay the history through it.
+        #expect(checkpointCountsDuringCandidateReplay == [0, 0, 0, 0])
         model.undo()
         #expect(model.project.paper == .rough)
         #expect(model.rendererIdentity == roughRendererIdentity)
     }
 
-    @Test func devicePeakAdmissionEvictsRetainedCheckpointsBeforeCandidateAllocation() throws {
+    @Test func devicePeakAdmissionEvictsRetainedCheckpointsBeforeCandidateAllocation() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
         let renderer = try WatercolorRenderer(
@@ -2629,10 +2636,12 @@ import WatercolorCore
         )
 
         model.selectPaper(.rough)
+        await model.waitForStructuralChanges()
         #expect(model.project.paper == .rough)
         #expect(model.rendererCheckpointCountForTesting == 1)
 
         model.selectPaper(.hotPress)
+        await model.waitForStructuralChanges()
 
         #expect(model.project.paper == .hotPress)
         #expect(model.rendererCheckpointCountForTesting == 1)

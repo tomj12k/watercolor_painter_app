@@ -32,11 +32,33 @@ struct PaperChangeAfterLongStrokesTests {
         await model.commitStrokePreview(stroke)
         #expect(model.project.commands.count == 1)
 
-        // Change the paper surface while the canvas is still wet.
+        // Changing paper replays the painting, so it must not block the main
+        // thread: the call returns immediately with editing paused, and the
+        // new surface applies when the replay finishes.
         model.selectPaper(.rough)
+        #expect(model.project.paper == .coldPress)
+        #expect(!model.capabilities.canPaint)
+        #expect(!model.canModifyProject)
+
+        for _ in 0..<4_000 where model.project.paper != .rough {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
         #expect(model.project.paper == .rough)
-        model.selectPaper(.handmade)
-        #expect(model.project.paper == .handmade)
+        #expect(model.capabilities.canPaint)
+        #expect(model.canModifyProject)
+        #expect(model.capabilities.canUndo)
         #expect(model.rendererRecoveryError == nil)
+        #expect(model.error == nil)
+
+        // The asynchronously applied surface renders exactly what reopening
+        // the saved painting would.
+        let reopened = try WatercolorRenderer(project: model.project, device: device)
+        #expect(
+            try model.rendererForTesting.pixelChecksum() == reopened.pixelChecksum()
+        )
+
+        // Undo restores the previous surface through the same non-blocking flow.
+        model.undo()
+        #expect(model.project.paper == .coldPress)
     }
 }

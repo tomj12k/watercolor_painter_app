@@ -496,13 +496,15 @@ public final class StudioModel: ObservableObject {
     private var rendererCheckpoints: [RendererCheckpoint]
     private let rendererCheckpointByteBudget: Int
     private let projectAdmissionLimits: ProjectAdmissionLimits
+    private var isApplyingStructuralChange = false
+    private var structuralReplacementTask: Task<Void, Never>?
 
     public var isStrokePreviewActive: Bool {
         strokePreviewState.token != nil
     }
 
     public var canModifyProject: Bool {
-        strokePreviewState.token == nil
+        strokePreviewState.token == nil && !isApplyingStructuralChange
     }
 
     var isStrokePreviewFinalizing: Bool {
@@ -581,6 +583,7 @@ public final class StudioModel: ObservableObject {
 
     @discardableResult
     func beginStrokePreview(_ stroke: StrokeCommand) -> StrokePreviewAdmission {
+        guard !isApplyingStructuralChange else { return .busy }
         guard strokePreviewState.token == nil else { return .busy }
         guard rendererRecoveryError == nil,
               canAppendStroke(stroke),
@@ -1152,14 +1155,86 @@ public final class StudioModel: ObservableObject {
         )
     }
 
+    /// Applies a paper change without blocking the main thread. The change
+    /// requires a full deterministic replay under the new surface, so editing
+    /// pauses while the replay runs asynchronously and the project publishes
+    /// only when the replacement renderer is ready — a failure leaves the
+    /// painting untouched, exactly like the synchronous edit paths.
     public func selectPaper(_ paper: PaperTexture) {
+        guard canModifyProject else { return }
         let selectedLayerID = selectedLayerID
-        performProjectEdit(
-            { editor in editor.setPaper(paper) },
-            selecting: { project in
-                project.layers.first(where: { $0.id == selectedLayerID })?.id
+        var updatedEditor = editor
+        updatedEditor.setPaper(paper)
+        let updatedProject = updatedEditor.project
+        guard updatedProject != project else { return }
+
+        isApplyingStructuralChange = true
+        refreshCapabilities()
+        let preparedCheckpoint = rendererRecoveryError == nil
+            ? prepareCurrentRendererCheckpointForCandidateAllocation()
+            : nil
+        structuralReplacementTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let candidateRenderer = try await self.makeRendererCandidateAsynchronously(
+                    project: updatedProject
+                )
+                if let preparedCheckpoint {
+                    self.appendRendererCheckpoint(preparedCheckpoint)
+                }
+                self.isApplyingStructuralChange = false
+                self.replaceRenderer(with: candidateRenderer)
+                self.publishSuccessfulEdit(
+                    editor: updatedEditor,
+                    project: updatedProject,
+                    selectedLayerID: updatedProject.layers.first(
+                        where: { $0.id == selectedLayerID }
+                    )?.id
+                )
+            } catch {
+                self.isApplyingStructuralChange = false
+                self.error = StudioFailure.rendering(error: error, project: self.project)
+                self.refreshCapabilities()
             }
-        )
+            self.structuralReplacementTask = nil
+        }
+    }
+
+    func waitForStructuralChanges() async {
+        while let task = structuralReplacementTask {
+            await task.value
+            if structuralReplacementTask == nil { return }
+        }
+    }
+
+    /// Builds a replacement renderer for `project` while keeping the main
+    /// thread schedulable: the candidate starts from an empty command list
+    /// (cheap), then replays the full history through the renderer's
+    /// asynchronous replay, which waits on GPU completion without blocking.
+    private func makeRendererCandidateAsynchronously(
+        project candidateProject: PaintingProject
+    ) async throws -> WatercolorRenderer {
+        var blankProject = candidateProject
+        blankProject.commands = []
+        let retainedBytes = rendererCheckpoints.reduce(into: 0) { total, checkpoint in
+            let (updatedTotal, didOverflow) = total.addingReportingOverflow(
+                checkpoint.estimatedBytes
+            )
+            total = didOverflow ? .max : updatedTotal
+        }
+        do {
+            let candidateRenderer = try renderer.makeCandidate(
+                project: blankProject,
+                retainedCheckpointBytes: retainedBytes
+            )
+            try await candidateRenderer.replayAsynchronously(project: candidateProject)
+            return candidateRenderer
+        } catch RendererError.resourceBudgetExceeded where retainedBytes > 0 {
+            rendererCheckpoints.removeAll()
+            let candidateRenderer = try renderer.makeCandidate(project: blankProject)
+            try await candidateRenderer.replayAsynchronously(project: candidateProject)
+            return candidateRenderer
+        }
     }
 
     public func setBrushSize(_ size: Double) {
@@ -1595,6 +1670,7 @@ public final class StudioModel: ObservableObject {
     private func refreshCapabilities() {
         capabilities = StudioCapabilities(
             canPaint: rendererRecoveryError == nil
+                && !isApplyingStructuralChange
                 && !isStrokePreviewFinalizing
                 && !strokePreviewState.isCancelling
                 && project.layers.contains(where: { $0.id == selectedLayerID }),
