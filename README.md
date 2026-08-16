@@ -86,7 +86,7 @@ Missing credentials or any signing, notarization, stapling, or Gatekeeper failur
 
 ### Release qualification
 
-Run `make qualify` on the release Mac before distributing a build. It performs a clean serial correctness run, requires a real Metal device, enables Metal API and shader validation in a separate renderer lane, records 30-sample p50/p95 performance measurements, packages and validates the local app and icon, runs the packaged release executable's customer-input benchmark, performs an exact-process five-second liveness check, terminates that exact test process with bounded cleanup, and checks the Git diff. A terminal PASS or FAIL report is published atomically even when an early gate fails. Results and machine-readable `WATERCOLOR_QUALIFICATION` lines are written to:
+Run `make qualify` on the release Mac before distributing a build. It performs a clean correctness run with SwiftPM process-level test parallelism disabled, requires a real Metal device, enables Metal API and shader validation in a separate renderer lane, records 30-sample p50/p95 performance measurements, packages and validates the local app and icon, runs the packaged release executable's customer-input benchmark under a hard timeout, performs an exact-process five-second liveness check, terminates every exact test process with bounded cleanup, and checks the Git diff. A terminal PASS or FAIL report is published atomically even when an early gate fails. Results and machine-readable `WATERCOLOR_QUALIFICATION` lines are written to:
 
 ```text
 .build/qualification/report.txt

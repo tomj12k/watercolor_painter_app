@@ -13,12 +13,7 @@ qualification_pid=""
 cleanup_active=0
 liveness_seconds="${WATERCOLOR_LIVENESS_SECONDS:-5}"
 termination_grace_seconds="${WATERCOLOR_TERMINATION_GRACE_SECONDS:-2}"
-
-if [[ ! "${liveness_seconds}" =~ ^[1-9][0-9]*$ ]] \
-    || [[ ! "${termination_grace_seconds}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "Qualification timing values must be positive whole seconds." >&2
-    exit 2
-fi
+optimized_timeout_seconds="${WATERCOLOR_OPTIMIZED_TIMEOUT_SECONDS:-30}"
 
 record() {
     printf '%s\n' "$1" | tee -a "${working_report}"
@@ -29,10 +24,19 @@ run_logged() {
 }
 
 publish_report() {
-    mkdir -p "${qualification_directory}"
     local pending_report="${qualification_directory}/.report.txt.pending.$$"
-    cp "${working_report}" "${pending_report}"
-    mv "${pending_report}" "${qualification_report}"
+    if ! mkdir -p "${qualification_directory}"; then
+        return 1
+    fi
+    if ! cp "${working_report}" "${pending_report}"; then
+        rm -f "${pending_report}" 2>/dev/null || true
+        return 1
+    fi
+    if ! mv "${pending_report}" "${qualification_report}"; then
+        rm -f "${pending_report}" 2>/dev/null || true
+        return 1
+    fi
+    return 0
 }
 
 terminate_qualification_process() {
@@ -45,10 +49,11 @@ terminate_qualification_process() {
         return 0
     fi
     if ! kill -0 "${process_pid}" 2>/dev/null; then
-        set +e
-        wait "${process_pid}" 2>/dev/null
-        process_exit_status=$?
-        set -e
+        if wait "${process_pid}" 2>/dev/null; then
+            process_exit_status=0
+        else
+            process_exit_status=$?
+        fi
         qualification_pid=""
         if [[ "${process_exit_status}" -eq 0 || "${process_exit_status}" -eq 143 ]]; then
             return 0
@@ -74,10 +79,11 @@ terminate_qualification_process() {
         done
     fi
 
-    set +e
-    wait "${process_pid}" 2>/dev/null
-    process_exit_status=$?
-    set -e
+    if wait "${process_pid}" 2>/dev/null; then
+        process_exit_status=0
+    else
+        process_exit_status=$?
+    fi
     qualification_pid=""
     if kill -0 "${process_pid}" 2>/dev/null; then
         return 1
@@ -89,6 +95,41 @@ terminate_qualification_process() {
         return 3
     fi
     return 0
+}
+
+run_optimized_qualification() {
+    local optimized_log="${working_directory}/optimized-customer-input.log"
+    local process_exit_status=0
+    local termination_status=0
+    local poll_count=$((optimized_timeout_seconds * 10))
+
+    "${application_executable}" --qualify-customer-input \
+        > "${optimized_log}" 2>&1 &
+    qualification_pid=$!
+    for ((poll = 0; poll < poll_count; poll += 1)); do
+        if ! kill -0 "${qualification_pid}" 2>/dev/null; then
+            break
+        fi
+        /bin/sleep 0.1
+    done
+    if kill -0 "${qualification_pid}" 2>/dev/null; then
+        terminate_qualification_process || termination_status=$?
+        run_logged cat "${optimized_log}"
+        echo "The optimized customer-input qualification exceeded ${optimized_timeout_seconds} seconds." >&2
+        if [[ "${termination_status}" -eq 1 ]]; then
+            return 3
+        fi
+        return 124
+    fi
+
+    if wait "${qualification_pid}"; then
+        process_exit_status=0
+    else
+        process_exit_status=$?
+    fi
+    qualification_pid=""
+    run_logged cat "${optimized_log}"
+    return "${process_exit_status}"
 }
 
 cleanup() {
@@ -117,10 +158,11 @@ cleanup() {
     publish_report
     publish_status=$?
     if [[ "${publish_status}" -ne 0 ]]; then
-        echo "Watercolor qualification could not publish its report." >&2
+        echo "Watercolor qualification could not publish its report. Complete working report retained at ${working_report}." >&2
         exit_status=4
+    else
+        rm -rf "${working_directory}"
     fi
-    rm -rf "${working_directory}"
     exit "${exit_status}"
 }
 trap cleanup EXIT
@@ -130,6 +172,12 @@ trap 'exit 143' TERM
 
 cd "${repository_root}"
 record "WATERCOLOR_RELEASE_QUALIFICATION status=STARTED"
+if [[ ! "${liveness_seconds}" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "${termination_grace_seconds}" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "${optimized_timeout_seconds}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Qualification timing values must be positive whole seconds." >&2
+    exit 2
+fi
 record "WATERCOLOR_RELEASE_QUALIFICATION gate=clean_tests status=RUNNING"
 run_logged swift package clean
 run_logged swift test --no-parallel
@@ -171,7 +219,7 @@ fi
 record "WATERCOLOR_RELEASE_QUALIFICATION gate=local_package status=PASS"
 
 record "WATERCOLOR_RELEASE_QUALIFICATION gate=optimized_customer_input status=RUNNING"
-run_logged "${application_executable}" --qualify-customer-input
+run_optimized_qualification
 record "WATERCOLOR_RELEASE_QUALIFICATION gate=optimized_customer_input status=PASS"
 
 if [[ -n "${DEVELOPER_ID_APPLICATION:-}" && -n "${NOTARYTOOL_PROFILE:-}" ]]; then
@@ -195,10 +243,8 @@ for ((liveness_second = 1; liveness_second <= liveness_seconds; liveness_second 
         exit 3
     fi
 done
-set +e
-terminate_qualification_process
-termination_status=$?
-set -e
+termination_status=0
+terminate_qualification_process || termination_status=$?
 if [[ "${termination_status}" -ne 0 ]]; then
     echo "Watercolor Studio did not terminate cleanly after the liveness gate." >&2
     exit 3
