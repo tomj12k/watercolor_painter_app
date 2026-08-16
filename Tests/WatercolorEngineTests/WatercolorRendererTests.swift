@@ -63,6 +63,118 @@ import WatercolorCore
         #expect(mixed.blue > 0.1)
     }
 
+    // Fixed stroke identities keep the per-stroke noise seed constant, so
+    // comparison runs differ only by the parameter under test.
+    private static let strengthBaseStrokeID = UUID(
+        uuidString: "6E0D3E7A-4B21-4E5C-9A34-0F4F4B6E1A01"
+    )!
+    private static let strengthToolStrokeID = UUID(
+        uuidString: "6E0D3E7A-4B21-4E5C-9A34-0F4F4B6E1A02"
+    )!
+
+    private func strengthDot(
+        layerID: UUID,
+        tool: PaintTool,
+        opacity: Double,
+        behaviorVersion: Int
+    ) -> StrokeCommand {
+        var stroke = StrokeCommand.testDot(
+            id: Self.strengthToolStrokeID, layerID: layerID, tool: tool, pressure: 1
+        )
+        stroke.brush.opacity = opacity
+        stroke.brush.behaviorVersion = behaviorVersion
+        return stroke
+    }
+
+    private func alphaAfterErase(
+        device: MTLDevice,
+        opacity: Double,
+        behaviorVersion: Int
+    ) throws -> Double {
+        let project = PaintingProject.testCanvas(64)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let layerID = project.layers[0].id
+        try renderer.render(stroke: .testDot(
+            id: Self.strengthBaseStrokeID, layerID: layerID, tool: .brush, pressure: 1
+        ))
+        try renderer.render(stroke: strengthDot(
+            layerID: layerID, tool: .eraser, opacity: opacity, behaviorVersion: behaviorVersion
+        ))
+        return try renderer.debugPixel(x: 32, y: 32).alpha
+    }
+
+    // Saved paintings must not change: version-one tool strokes ignore
+    // opacity exactly as they always have.
+    @Test func legacyEraserStrokesIgnoreOpacity() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let low = try alphaAfterErase(device: device, opacity: 0.2, behaviorVersion: 1)
+        let full = try alphaAfterErase(device: device, opacity: 1.0, behaviorVersion: 1)
+        #expect(low == full)
+    }
+
+    @Test func versionTwoEraserStrengthControlsHowMuchPigmentLifts() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let gentle = try alphaAfterErase(device: device, opacity: 0.35, behaviorVersion: 2)
+        let full = try alphaAfterErase(device: device, opacity: 1.0, behaviorVersion: 2)
+        // A gentler eraser leaves noticeably more pigment behind.
+        #expect(gentle > full * 1.2)
+        // And full strength keeps the exact behavior version one produced.
+        let legacy = try alphaAfterErase(device: device, opacity: 1.0, behaviorVersion: 1)
+        #expect(full == legacy)
+    }
+
+    @Test func versionTwoDryStrengthControlsHowMuchWaterLifts() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        func wetnessAfterDry(opacity: Double, behaviorVersion: Int) throws -> Double {
+            let project = PaintingProject.testCanvas(64)
+            let renderer = try WatercolorRenderer(project: project, device: device)
+            let layerID = project.layers[0].id
+            try renderer.render(stroke: .testDot(
+                id: Self.strengthBaseStrokeID, layerID: layerID, tool: .water, pressure: 1
+            ))
+            try renderer.render(stroke: strengthDot(
+                layerID: layerID, tool: .dry, opacity: opacity, behaviorVersion: behaviorVersion
+            ))
+            return try renderer.debugWetness(x: 32, y: 32, layerID: layerID)
+        }
+        let gentle = try wetnessAfterDry(opacity: 0.3, behaviorVersion: 2)
+        let full = try wetnessAfterDry(opacity: 1.0, behaviorVersion: 2)
+        #expect(gentle > full * 1.2)
+        let legacy = try wetnessAfterDry(opacity: 1.0, behaviorVersion: 1)
+        #expect(full == legacy)
+    }
+
+    @Test func versionTwoSmudgeStrengthControlsPigmentMovement() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        func pigmentAfterSmudge(opacity: Double, behaviorVersion: Int) throws -> Double {
+            let project = PaintingProject.testCanvas(64)
+            let renderer = try WatercolorRenderer(project: project, device: device)
+            let layerID = project.layers[0].id
+            try renderer.render(stroke: .testDot(
+                id: Self.strengthBaseStrokeID, layerID: layerID, tool: .brush, pressure: 1
+            ))
+            var smudge = StrokeCommand.testLine(
+                id: Self.strengthToolStrokeID,
+                layerID: layerID,
+                color: PaintColor(red: 0, green: 0, blue: 0),
+                y: 32,
+                water: 0
+            )
+            smudge.tool = .smudge
+            smudge.brush.opacity = opacity
+            smudge.brush.behaviorVersion = behaviorVersion
+            try renderer.render(stroke: smudge)
+            // The trailing side of the drag: stronger smudges carry more
+            // pigment forward into this pixel.
+            return try renderer.debugPixel(x: 44, y: 32, layerID: layerID).alpha
+        }
+        let gentle = try pigmentAfterSmudge(opacity: 0.2, behaviorVersion: 2)
+        let full = try pigmentAfterSmudge(opacity: 1.0, behaviorVersion: 2)
+        #expect(gentle != full)
+        let legacy = try pigmentAfterSmudge(opacity: 1.0, behaviorVersion: 1)
+        #expect(full == legacy)
+    }
+
     @Test func eraserLowersConcentration() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)

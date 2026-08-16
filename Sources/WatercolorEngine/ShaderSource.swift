@@ -566,7 +566,13 @@ enum ShaderSource {
                 wetness.write(half4(min(float(existingWetness) + max(waterAmount, coverage * pressure * 0.5f), 1.0f)), position, slice);
                 break;
             case 2: {
-                float remaining = 1.0f - clamp(coverage * pressure * 0.92f, 0.0f, 0.96f);
+                // Version 2 strokes scale the lift by the tool's strength
+                // (carried in the opacity slot); earlier strokes keep the
+                // fixed strength they were painted with.
+                float strength = parameters.behavior.x >= 2u
+                    ? clamp(parameters.brush.y, 0.0f, 1.0f)
+                    : 1.0f;
+                float remaining = 1.0f - clamp(coverage * pressure * 0.92f * strength, 0.0f, 0.96f);
                 pigment.write(existingPigment * half(remaining), position, slice);
                 wetness.write(existingWetness * half(remaining), position, slice);
                 break;
@@ -592,7 +598,10 @@ enum ShaderSource {
                 break;
             }
             default: {
-                float remaining = 1.0f - clamp(coverage * pressure * 0.84f, 0.0f, 0.95f);
+                float strength = parameters.behavior.x >= 2u
+                    ? clamp(parameters.brush.y, 0.0f, 1.0f)
+                    : 1.0f;
+                float remaining = 1.0f - clamp(coverage * pressure * 0.84f * strength, 0.0f, 0.95f);
                 wetness.write(existingWetness * half(remaining), position, slice);
                 break;
             }

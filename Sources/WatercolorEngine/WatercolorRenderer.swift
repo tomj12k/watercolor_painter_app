@@ -2276,13 +2276,19 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             guard maxX > minX, maxY > minY else { continue }
             let region = CanvasRegion(minX: minX, minY: minY, maxX: maxX, maxY: maxY)
             let destination = 1 - frontTextureIndex
+            // Version 2 strokes scale the pull by the tool's strength
+            // (carried in the opacity slot); earlier strokes keep the fixed
+            // strength they were painted with.
+            let strengthScale = stroke.brush.behaviorVersion >= 2
+                ? Float(min(max(stroke.brush.opacity, 0), 1))
+                : 1
             var parameters = SmudgeParameters(
                 centerRadius: SIMD4(Float(point.x), Float(point.y), radius, radius),
                 directionStrength: SIMD4(
                     direction.x,
                     direction.y,
-                    stroke.tool == .smear ? 0.78 : 0.48,
-                    stroke.tool == .smear ? 1.05 : 0.62
+                    (stroke.tool == .smear ? 0.78 : 0.48) * strengthScale,
+                    (stroke.tool == .smear ? 1.05 : 0.62) * strengthScale
                 ),
                 extra: SIMD4(UInt32(slice), 0, 0, 0),
                 stampRect: SIMD4(UInt32(minX), UInt32(minY), UInt32(region.width), UInt32(region.height))
