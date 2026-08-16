@@ -270,7 +270,7 @@ struct StudioPNGImageSnapshot: @unchecked Sendable {
 }
 
 struct StudioPNGExportWorker: Sendable {
-    typealias Operation = @Sendable (StudioPNGImageSnapshot, URL) async throws -> Void
+    typealias Operation = @Sendable (StudioPNGImageSnapshot, URL, URL) async throws -> Void
 
     private let operation: Operation
 
@@ -278,11 +278,15 @@ struct StudioPNGExportWorker: Sendable {
         self.operation = operation
     }
 
-    func export(_ snapshot: StudioPNGImageSnapshot, to destinationURL: URL) async throws {
-        try await operation(snapshot, destinationURL)
+    func export(
+        _ snapshot: StudioPNGImageSnapshot,
+        to temporaryURL: URL,
+        for destinationURL: URL
+    ) async throws {
+        try await operation(snapshot, temporaryURL, destinationURL)
     }
 
-    static let live = Self { snapshot, destinationURL in
+    static let live = Self { snapshot, temporaryURL, _ in
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
             data,
@@ -296,7 +300,74 @@ struct StudioPNGExportWorker: Sendable {
         guard CGImageDestinationFinalize(destination) else {
             throw StudioCoordinationError.pngEncoding
         }
-        try (data as Data).write(to: destinationURL, options: .atomic)
+        try (data as Data).write(to: temporaryURL, options: .atomic)
+    }
+}
+
+struct StudioPNGExportTicket: Sendable {
+    let destinationURL: URL
+    let temporaryURL: URL
+    fileprivate let generation: UUID
+}
+
+actor StudioPNGExportCoordinator {
+    static let shared = StudioPNGExportCoordinator()
+
+    private var latestGenerationByDestination: [URL: UUID] = [:]
+
+    func beginExport(to destinationURL: URL) -> StudioPNGExportTicket {
+        let standardizedDestination = destinationURL.standardizedFileURL
+        let generation = UUID()
+        latestGenerationByDestination[standardizedDestination] = generation
+        let temporaryURL = standardizedDestination
+            .deletingLastPathComponent()
+            .appendingPathComponent(
+                ".\(standardizedDestination.lastPathComponent).watercolor-export-\(generation.uuidString).tmp"
+            )
+        return StudioPNGExportTicket(
+            destinationURL: standardizedDestination,
+            temporaryURL: temporaryURL,
+            generation: generation
+        )
+    }
+
+    func commit(_ ticket: StudioPNGExportTicket) throws -> Bool {
+        guard latestGenerationByDestination[ticket.destinationURL] == ticket.generation else {
+            removeTemporaryFile(for: ticket)
+            return false
+        }
+
+        do {
+            if FileManager.default.fileExists(atPath: ticket.destinationURL.path) {
+                _ = try FileManager.default.replaceItemAt(
+                    ticket.destinationURL,
+                    withItemAt: ticket.temporaryURL
+                )
+            } else {
+                try FileManager.default.moveItem(
+                    at: ticket.temporaryURL,
+                    to: ticket.destinationURL
+                )
+            }
+            latestGenerationByDestination.removeValue(forKey: ticket.destinationURL)
+            return true
+        } catch {
+            latestGenerationByDestination.removeValue(forKey: ticket.destinationURL)
+            removeTemporaryFile(for: ticket)
+            throw error
+        }
+    }
+
+    func discard(_ ticket: StudioPNGExportTicket) {
+        if latestGenerationByDestination[ticket.destinationURL] == ticket.generation {
+            latestGenerationByDestination.removeValue(forKey: ticket.destinationURL)
+        }
+        removeTemporaryFile(for: ticket)
+    }
+
+    private func removeTemporaryFile(for ticket: StudioPNGExportTicket) {
+        guard FileManager.default.fileExists(atPath: ticket.temporaryURL.path) else { return }
+        try? FileManager.default.removeItem(at: ticket.temporaryURL)
     }
 }
 
@@ -378,6 +449,7 @@ public final class StudioModel: ObservableObject {
     private let canvasDelegate: CanvasRendererDelegate
     private var editor: ProjectEditor
     private let pngExportWorker: StudioPNGExportWorker
+    private let pngExportCoordinator: StudioPNGExportCoordinator
     private let strokePreviewOperation: StrokePreviewRendererOperation
     private var latestPNGExportID: UUID?
     private var currentPNGExportFailureID: UUID?
@@ -429,6 +501,7 @@ public final class StudioModel: ObservableObject {
         renderer: WatercolorRenderer,
         onDocumentUpdate: ((PaintingProject) -> Void)? = nil,
         pngExportWorker: StudioPNGExportWorker = .live,
+        pngExportCoordinator: StudioPNGExportCoordinator = .shared,
         rendererCheckpointByteBudget: Int = StudioModel.defaultRendererCheckpointByteBudget,
         strokePreviewOperation: StrokePreviewRendererOperation = .live,
         maximumCommandCount: Int = PaintingProject.maximumCommandCount,
@@ -450,6 +523,7 @@ public final class StudioModel: ObservableObject {
         recentColors = []
         self.renderer = renderer
         self.pngExportWorker = pngExportWorker
+        self.pngExportCoordinator = pngExportCoordinator
         self.strokePreviewOperation = strokePreviewOperation
         latestPNGExportID = nil
         currentPNGExportFailureID = nil
@@ -1132,13 +1206,19 @@ public final class StudioModel: ObservableObject {
         latestPNGExportID = exportID
         let capturedFailureID = error?.id
         let capturedExportFailureID = currentPNGExportFailureID
+        let exportTicket = await pngExportCoordinator.beginExport(to: destinationURL)
 
         do {
             let snapshot = StudioPNGImageSnapshot(image: try renderer.makeCGImage())
             let worker = pngExportWorker
             try await Task.detached(priority: .userInitiated) {
-                try await worker.export(snapshot, to: destinationURL)
+                try await worker.export(
+                    snapshot,
+                    to: exportTicket.temporaryURL,
+                    for: exportTicket.destinationURL
+                )
             }.value
+            guard try await pngExportCoordinator.commit(exportTicket) else { return }
             guard latestPNGExportID == exportID,
                   error?.id == capturedFailureID
             else { return }
@@ -1148,6 +1228,7 @@ public final class StudioModel: ObservableObject {
                 currentPNGExportFailureID = nil
             }
         } catch {
+            await pngExportCoordinator.discard(exportTicket)
             guard latestPNGExportID == exportID,
                   self.error?.id == capturedFailureID
             else { return }

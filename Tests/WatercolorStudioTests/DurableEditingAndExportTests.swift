@@ -261,12 +261,183 @@ import WatercolorCore
         #expect(model.error?.id != nil)
     }
 
+    @Test func newerSameDestinationExportCannotBeOverwrittenByOlderWork() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.durableFixture()
+        let exports = SequencedDestinationExports()
+        let olderModel = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device),
+            pngExportWorker: StudioPNGExportWorker { _, temporaryURL, _ in
+                try await exports.run(to: temporaryURL)
+            }
+        )
+        let newerModel = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device),
+            pngExportWorker: StudioPNGExportWorker { _, temporaryURL, _ in
+                try await exports.run(to: temporaryURL)
+            }
+        )
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("shared.png")
+        let aliasDirectory = directory.appendingPathComponent("alias", isDirectory: true)
+        try FileManager.default.createDirectory(at: aliasDirectory, withIntermediateDirectories: true)
+        let aliasedDestination = aliasDirectory.appendingPathComponent("../shared.png")
+
+        let older = Task { @MainActor in await olderModel.exportPNG(to: aliasedDestination) }
+        await exports.waitUntilStarted(1)
+        let newer = Task { @MainActor in await newerModel.exportPNG(to: destination) }
+        await exports.waitUntilStarted(2)
+
+        await exports.complete(2)
+        await newer.value
+        #expect(try Data(contentsOf: destination) == Data("request-2".utf8))
+
+        await exports.complete(1)
+        await older.value
+        #expect(try Data(contentsOf: destination) == Data("request-2".utf8))
+        let remainingNames = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        #expect(!remainingNames.contains(where: { $0.contains("watercolor-export") }))
+    }
+
+    @Test func latestExportAtomicallyReplacesAnExistingDestination() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.durableFixture()
+        let replacement = Data("replacement export".utf8)
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device),
+            pngExportWorker: StudioPNGExportWorker { _, temporaryURL, _ in
+                try replacement.write(to: temporaryURL, options: .atomic)
+            }
+        )
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("existing.png")
+        try Data("old export".utf8).write(to: destination)
+
+        await model.exportPNG(to: destination)
+
+        #expect(try Data(contentsOf: destination) == replacement)
+        #expect(model.error == nil)
+        let remainingNames = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        #expect(remainingNames == [destination.lastPathComponent])
+    }
+
+    @Test func newerFailedRequestStillPreventsOlderWorkFromReplacingTheDestination() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.durableFixture()
+        let exports = SequencedDestinationExports()
+        let olderModel = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device),
+            pngExportWorker: StudioPNGExportWorker { _, temporaryURL, _ in
+                try await exports.run(to: temporaryURL)
+            }
+        )
+        let newerModel = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device),
+            pngExportWorker: StudioPNGExportWorker { _, temporaryURL, _ in
+                try await exports.run(to: temporaryURL)
+            }
+        )
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("shared.png")
+        let original = Data("last completed export".utf8)
+        try original.write(to: destination)
+
+        let older = Task { @MainActor in await olderModel.exportPNG(to: destination) }
+        await exports.waitUntilStarted(1)
+        let newer = Task { @MainActor in await newerModel.exportPNG(to: destination) }
+        await exports.waitUntilStarted(2)
+
+        await exports.complete(2, with: .failure)
+        await newer.value
+        #expect(newerModel.error?.code == .export)
+
+        await exports.complete(1)
+        await older.value
+        #expect(try Data(contentsOf: destination) == original)
+        let remainingNames = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        #expect(remainingNames == [destination.lastPathComponent])
+    }
+
+    @Test func failedWorkerRemovesStagingAndPreservesAnExistingDestination() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.durableFixture()
+        let original = Data("existing export".utf8)
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device),
+            pngExportWorker: StudioPNGExportWorker { _, temporaryURL, _ in
+                try Data("incomplete export".utf8).write(to: temporaryURL, options: .atomic)
+                throw ControlledExportError(message: "injected worker failure")
+            }
+        )
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("existing.png")
+        try original.write(to: destination)
+
+        await model.exportPNG(to: destination)
+
+        #expect(try Data(contentsOf: destination) == original)
+        #expect(model.error?.code == .export)
+        let remainingNames = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        #expect(remainingNames == [destination.lastPathComponent])
+    }
+
+    @Test func differentDestinationExportsDoNotBlockEachOther() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.durableFixture()
+        let exports = SequencedDestinationExports()
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device),
+            pngExportWorker: StudioPNGExportWorker { _, temporaryURL, _ in
+                try await exports.run(to: temporaryURL)
+            }
+        )
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let firstDestination = directory.appendingPathComponent("first.png")
+        let secondDestination = directory.appendingPathComponent("second.png")
+
+        let first = Task { @MainActor in await model.exportPNG(to: firstDestination) }
+        await exports.waitUntilStarted(1)
+        let second = Task { @MainActor in await model.exportPNG(to: secondDestination) }
+        await exports.waitUntilStarted(2)
+
+        await exports.complete(2)
+        await second.value
+        #expect(try Data(contentsOf: secondDestination) == Data("request-2".utf8))
+
+        await exports.complete(1)
+        await first.value
+        #expect(try Data(contentsOf: firstDestination) == Data("request-1".utf8))
+    }
+
     @Test func blockedPNGEncodingLeavesTheMainActorSchedulable() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.durableFixture()
         let blockingGate = BlockingExportGate()
-        let worker = StudioPNGExportWorker { _, _ in
+        let worker = StudioPNGExportWorker { _, temporaryURL, _ in
             blockingGate.block()
+            try Data("completed export".utf8).write(to: temporaryURL, options: .atomic)
         }
         let model = StudioModel(
             project: project,
@@ -277,8 +448,12 @@ import WatercolorCore
         DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
             blockingGate.failSafeRelease()
         }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
         let export = Task { @MainActor in
-            await model.exportPNG(to: URL(fileURLWithPath: "/tmp/blocked-export.png"))
+            await model.exportPNG(to: directory.appendingPathComponent("blocked-export.png"))
         }
         let startResult = await Task.detached {
             blockingGate.waitUntilBlocked()
@@ -314,11 +489,16 @@ import WatercolorCore
         let model = StudioModel(
             project: project,
             renderer: try WatercolorRenderer(project: project, device: device),
-            pngExportWorker: StudioPNGExportWorker { _, destinationURL in
+            pngExportWorker: StudioPNGExportWorker { _, temporaryURL, destinationURL in
                 try await exports.run(destinationURL.lastPathComponent)
+                try Data("controlled export".utf8).write(to: temporaryURL, options: .atomic)
             }
         )
-        let destination = URL(fileURLWithPath: "/tmp/old-success.png")
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("old-success.png")
         let export = Task { @MainActor in await model.exportPNG(to: destination) }
         await exports.waitUntilStarted("old-success.png")
 
@@ -340,11 +520,16 @@ import WatercolorCore
         let model = StudioModel(
             project: project,
             renderer: try WatercolorRenderer(project: project, device: device),
-            pngExportWorker: StudioPNGExportWorker { _, destinationURL in
+            pngExportWorker: StudioPNGExportWorker { _, temporaryURL, destinationURL in
                 try await exports.run(destinationURL.lastPathComponent)
+                try Data("controlled export".utf8).write(to: temporaryURL, options: .atomic)
             }
         )
-        let destination = URL(fileURLWithPath: "/tmp/old-failure.png")
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("old-failure.png")
         let export = Task { @MainActor in await model.exportPNG(to: destination) }
         await exports.waitUntilStarted("old-failure.png")
 
@@ -365,16 +550,21 @@ import WatercolorCore
         let model = StudioModel(
             project: project,
             renderer: try WatercolorRenderer(project: project, device: device),
-            pngExportWorker: StudioPNGExportWorker { _, destinationURL in
+            pngExportWorker: StudioPNGExportWorker { _, temporaryURL, destinationURL in
                 try await exports.run(destinationURL.lastPathComponent)
+                try Data("controlled export".utf8).write(to: temporaryURL, options: .atomic)
             }
         )
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
         let older = Task { @MainActor in
-            await model.exportPNG(to: URL(fileURLWithPath: "/tmp/older-success.png"))
+            await model.exportPNG(to: directory.appendingPathComponent("older-success.png"))
         }
         await exports.waitUntilStarted("older-success.png")
         let newest = Task { @MainActor in
-            await model.exportPNG(to: URL(fileURLWithPath: "/tmp/newest-failure.png"))
+            await model.exportPNG(to: directory.appendingPathComponent("newest-failure.png"))
         }
         await exports.waitUntilStarted("newest-failure.png")
 
@@ -397,16 +587,21 @@ import WatercolorCore
         let model = StudioModel(
             project: project,
             renderer: try WatercolorRenderer(project: project, device: device),
-            pngExportWorker: StudioPNGExportWorker { _, destinationURL in
+            pngExportWorker: StudioPNGExportWorker { _, temporaryURL, destinationURL in
                 try await exports.run(destinationURL.lastPathComponent)
+                try Data("controlled export".utf8).write(to: temporaryURL, options: .atomic)
             }
         )
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
         let older = Task { @MainActor in
-            await model.exportPNG(to: URL(fileURLWithPath: "/tmp/older-failure.png"))
+            await model.exportPNG(to: directory.appendingPathComponent("older-failure.png"))
         }
         await exports.waitUntilStarted("older-failure.png")
         let newest = Task { @MainActor in
-            await model.exportPNG(to: URL(fileURLWithPath: "/tmp/newest-success.png"))
+            await model.exportPNG(to: directory.appendingPathComponent("newest-success.png"))
         }
         await exports.waitUntilStarted("newest-success.png")
 
@@ -551,6 +746,55 @@ private actor ControlledPNGExports {
             continuation.resume(returning: outcome)
         } else {
             outcomes[name] = outcome
+        }
+    }
+}
+
+private actor SequencedDestinationExports {
+    enum Outcome: Sendable {
+        case success
+        case failure
+    }
+
+    private var nextRequest = 0
+    private var started: Set<Int> = []
+    private var startWaiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
+    private var completionWaiters: [Int: CheckedContinuation<Outcome, Never>] = [:]
+    private var completed: [Int: Outcome] = [:]
+
+    func run(to destinationURL: URL) async throws {
+        nextRequest += 1
+        let request = nextRequest
+        started.insert(request)
+        startWaiters.removeValue(forKey: request)?.forEach { $0.resume() }
+
+        let outcome = if let completedOutcome = completed.removeValue(forKey: request) {
+            completedOutcome
+        } else {
+            await withCheckedContinuation { continuation in
+                completionWaiters[request] = continuation
+            }
+        }
+
+        if outcome == .failure {
+            throw ControlledExportError(message: "injected request failure")
+        }
+
+        try Data("request-\(request)".utf8).write(to: destinationURL, options: .atomic)
+    }
+
+    func waitUntilStarted(_ request: Int) async {
+        guard !started.contains(request) else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters[request, default: []].append(continuation)
+        }
+    }
+
+    func complete(_ request: Int, with outcome: Outcome = .success) {
+        if let continuation = completionWaiters.removeValue(forKey: request) {
+            continuation.resume(returning: outcome)
+        } else {
+            completed[request] = outcome
         }
     }
 }
