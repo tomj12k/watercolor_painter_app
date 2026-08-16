@@ -1702,6 +1702,58 @@ import WatercolorCore
         #expect(try splitRenderer.compositeChecksum() == checksumBefore)
     }
 
+    @Test func repeatedStrokesSaturateEveryPixelToThePigmentColor() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(256)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var brush = BrushSettings.default
+        brush.size = 160
+        brush.opacity = 1
+        brush.flow = 1
+        brush.color = PaintColor(red: 0.02, green: 0.02, blue: 0.02)
+        for strokeIndex in 0..<12 {
+            let stroke = StrokeCommand(
+                layerID: project.layers[0].id,
+                tool: .brush,
+                brush: brush,
+                points: [StrokePoint(
+                    x: 128,
+                    y: 128,
+                    pressure: 1,
+                    tiltX: 0,
+                    tiltY: 0,
+                    time: Double(strokeIndex)
+                )]
+            )
+            try renderer.renderAndWait(stroke: stroke)
+        }
+
+        let image = try renderer.makeCGImage()
+        let data = try #require(image.dataProvider?.data)
+        let bytes = try #require(CFDataGetBytePtr(data))
+        let bytesPerRow = image.bytesPerRow
+        func luminance(_ x: Int, _ y: Int) -> Double {
+            let offset = y * bytesPerRow + x * 4
+            return (Double(bytes[offset]) + Double(bytes[offset + 1]) + Double(bytes[offset + 2]))
+                / (3 * 255)
+        }
+        var minimumLuminance = 1.0
+        var maximumLuminance = 0.0
+        for y in 100...156 {
+            for x in 100...156 {
+                let value = luminance(x, y)
+                minimumLuminance = min(minimumLuminance, value)
+                maximumLuminance = max(maximumLuminance, value)
+            }
+        }
+        // Paper tooth slows how fast pigment covers, but it must never cap
+        // coverage: enough passes saturate every pixel to the pigment color,
+        // with no fixed bright spots that paint can never conquer.
+        let saturatedPigment = PaintColor.sRGBComponent(fromLinear: 0.02)
+        #expect(maximumLuminance <= saturatedPigment + 0.03)
+        #expect(maximumLuminance - minimumLuminance <= 0.03)
+    }
+
     @Test func densePaintCompositesWithoutPerPixelWhiteSpeckle() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(256)

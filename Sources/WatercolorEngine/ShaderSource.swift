@@ -868,8 +868,13 @@ enum ShaderSource {
             float concentration = max(sample.a, 0.0f);
             if (concentration <= 0.0001f) continue;
             float3 pigmentColor = clamp(sample.rgb / max(concentration, 0.0001f), 0.0f, 1.0f);
+            // Paper tooth scales how quickly pigment covers, inside the
+            // exponential: valleys fill later, but enough pigment saturates
+            // every pixel. A ceiling here would leave fixed bright spots
+            // that no amount of paint could ever cover. Light washes match
+            // the previous look, since 1 - exp(-c*d) ~= c*d for small c.
             float paperDeposit = mix(0.90f, 1.08f, grain);
-            float alpha = clamp((1.0f - exp(-concentration)) * metadata.y * paperDeposit, 0.0f, 1.0f);
+            float alpha = clamp((1.0f - exp(-concentration * paperDeposit)) * metadata.y, 0.0f, 1.0f);
             color = mix(color, pigmentColor, alpha);
         }
 
