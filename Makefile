@@ -1,4 +1,4 @@
-.PHONY: test build app run
+.PHONY: test build app distribution run
 
 test:
 	swift test
@@ -8,6 +8,9 @@ build:
 
 app:
 	scripts/package_app.sh
+
+distribution:
+	scripts/package_distribution.sh
 
 run:
 	swift run WatercolorStudio

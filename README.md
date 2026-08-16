@@ -19,7 +19,8 @@ The other development commands are:
 ```sh
 make test    # run the Swift test suite
 make build   # build the debug executable
-make app     # build the release .app bundle
+make app     # build the unsigned, local-only release .app bundle
+make distribution # build a signed and notarized customer .app bundle
 ```
 
 ## Studio tools and shortcuts
@@ -48,18 +49,38 @@ Source targets live in `Sources/WatercolorCore`, `Sources/WatercolorEngine`, and
 
 ## Tests and release packaging
 
-Run `make test` before shipping a change. `make app` performs a release build and creates:
+Run `make test` before shipping a change. `make app` performs a release build and creates an unsigned, local-only bundle:
 
 ```text
 .build/release/Watercolor Studio.app
 ```
 
-The bundle is intentionally unsigned. For local use, launch it with:
+For local development use, launch it with:
 
 ```sh
 open '.build/release/Watercolor Studio.app'
 ```
 
-macOS may present its normal unsigned-app warning; use Finder’s Control-click **Open** flow or System Settings → Privacy & Security to allow this local build. This packaging does not include signing, notarization, or App Store distribution preparation.
+macOS may present its normal unsigned-app warning; use Finder’s Control-click **Open** flow or System Settings → Privacy & Security to allow this local build. Never distribute the `make app` output to customers: it does not include signing or notarization.
+
+### Signed customer distribution
+
+`make distribution` is the fail-closed customer packaging path. It requires an installed Developer ID Application signing identity and a notarytool keychain profile. Supply both explicitly:
+
+```sh
+export DEVELOPER_ID_APPLICATION='Developer ID Application: Your Company (TEAMID)'
+export NOTARYTOOL_PROFILE='watercolor-studio-notary'
+make distribution
+```
+
+Create the named keychain profile beforehand with `xcrun notarytool store-credentials`. The distribution command signs with the hardened runtime and a trusted timestamp, runs `codesign --verify --deep --strict`, archives the app, runs `xcrun notarytool submit --wait`, staples and checks the ticket with `xcrun stapler validate`, verifies the stapled signature again, and runs `spctl --assess --type execute`.
+
+Only after every gate succeeds does it publish:
+
+```text
+.build/distribution/Watercolor Studio.app
+```
+
+Missing credentials or any signing, notarization, stapling, or Gatekeeper failure exits nonzero and does not publish an incomplete replacement.
 
 The reference development platform is macOS 14 or later on Apple Silicon. The release bundle is built for the architecture of the Mac that runs `make app`.
