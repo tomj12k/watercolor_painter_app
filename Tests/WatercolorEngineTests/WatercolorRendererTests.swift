@@ -1624,7 +1624,7 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 32, y: 32).alpha > 0.1)
     }
 
-    @Test func previewWorkBudgetSpansEveryDeltaInOneSemanticStroke() async throws {
+    @Test func previewProjectBudgetSpansEveryDeltaInOneSemanticStroke() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
         let workPolicy = RendererWorkPolicy(
@@ -1683,7 +1683,10 @@ import WatercolorCore
         let singleRenderer = try WatercolorRenderer(
             project: project,
             device: device,
-            debugWorkPolicy: workPolicy,
+            debugWorkPolicy: RendererWorkPolicy(
+                maximumCommandThreads: 140_000,
+                maximumProjectThreads: 300_000
+            ),
             debugCommandBufferError: { commandBuffer in
                 if commandBuffer.label == "Watercolor stroke preview" {
                     singleSubmissionCount += 1
@@ -1692,7 +1695,9 @@ import WatercolorCore
             }
         )
         let singleToken = try singleRenderer.beginStrokePreview(initial)
-        await #expect(throws: RendererError.self) {
+        await #expect(
+            throws: RendererError.workBudgetExceeded(required: 262_144, available: 140_000)
+        ) {
             try await singleRenderer.appendStrokePreview(
                 id: complete.id,
                 points: Array(complete.points[1..<17]),
@@ -1707,7 +1712,10 @@ import WatercolorCore
         let finishRenderer = try WatercolorRenderer(
             project: project,
             device: device,
-            debugWorkPolicy: workPolicy,
+            debugWorkPolicy: RendererWorkPolicy(
+                maximumCommandThreads: 140_000,
+                maximumProjectThreads: 145_000
+            ),
             debugCommandBufferError: { commandBuffer in
                 if commandBuffer.label == "Commit watercolor stroke preview" {
                     finishSubmissionCount += 1
@@ -1727,12 +1735,107 @@ import WatercolorCore
         )
 
         await #expect(
-            throws: RendererError.workBudgetExceeded(required: 147_456, available: 140_000)
+            throws: RendererError.workBudgetExceeded(required: 147_456, available: 145_000)
         ) {
             try await finishRenderer.finishStrokePreview(prefixThenTail, token: finishToken)
         }
         #expect(finishSubmissionCount == 0)
         #expect(try finishRenderer.compositeChecksum() == checksumBefore)
+    }
+
+    @Test func previewCommandBudgetResetsBetweenAppendSubmissions() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        var previewSubmissions = 0
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugWorkPolicy: RendererWorkPolicy(
+                maximumCommandThreads: 140_000,
+                maximumProjectThreads: 300_000
+            ),
+            debugCommandBufferError: { commandBuffer in
+                if commandBuffer.label == "Watercolor stroke preview" {
+                    previewSubmissions += 1
+                }
+                return commandBuffer.error
+            }
+        )
+        var complete = StrokeCommand.testDot(layerID: project.layers[0].id)
+        complete.points = (0..<17).map { index in
+            StrokePoint(
+                x: 32,
+                y: 32,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
+            )
+        }
+        var initial = complete
+        initial.points = [complete.points[0]]
+        let token = try renderer.beginStrokePreview(initial)
+
+        try await renderer.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points[1..<9]),
+            token: token
+        )
+        try await renderer.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points[9..<17]),
+            token: token
+        )
+
+        #expect(previewSubmissions == 2)
+        try renderer.cancelStrokePreview(token)
+    }
+
+    @Test func previewCommandBudgetResetsForFinishSubmission() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        var finishSubmissions = 0
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugWorkPolicy: RendererWorkPolicy(
+                maximumCommandThreads: 140_000,
+                maximumProjectThreads: 160_000
+            ),
+            debugCommandBufferError: { commandBuffer in
+                if commandBuffer.label == "Commit watercolor stroke preview" {
+                    finishSubmissions += 1
+                }
+                return commandBuffer.error
+            }
+        )
+        var complete = StrokeCommand.testDot(layerID: project.layers[0].id)
+        complete.points = (0..<9).map { index in
+            StrokePoint(
+                x: 32,
+                y: 32,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
+            )
+        }
+        var initial = complete
+        initial.points = [complete.points[0]]
+        let token = try renderer.beginStrokePreview(initial)
+
+        try await renderer.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points.dropFirst()),
+            token: token
+        )
+        try await renderer.finishStrokePreview(complete, token: token)
+
+        #expect(finishSubmissions == 1)
+        var replayProject = project
+        replayProject.commands = [.stroke(complete)]
+        let replayRenderer = try WatercolorRenderer(project: replayProject, device: device)
+        #expect(try renderer.compositeChecksum() == replayRenderer.compositeChecksum())
     }
 
     @Test func overlappingAppendIsRejectedWithoutReusingTheInFlightBatchOffset() async throws {

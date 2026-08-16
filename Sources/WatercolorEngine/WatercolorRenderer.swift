@@ -731,6 +731,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         lastPreviewFinishEncodedPointCount = 0
         #endif
         var workBudget = transaction.workBudget
+        workBudget.beginCommand()
         let previousSimulationState = simulationStateSnapshot
         let commandBuffer = try makeCommandBuffer(label: "Commit watercolor stroke preview")
         #if DEBUG
@@ -1051,6 +1052,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         }
 
         var workBudget = initialWorkBudget
+        workBudget.beginCommand()
         let previousSimulationState = simulationStateSnapshot
         let commandBuffer = try makeCommandBuffer(label: "Watercolor stroke preview")
         if capturesCommittedState {
