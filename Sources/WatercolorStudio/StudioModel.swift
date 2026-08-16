@@ -423,6 +423,10 @@ public final class StudioModel: ObservableObject {
     /// Non-modal notice shown from 90% of any document limit, so the customer
     /// learns about the ceiling before a stroke is refused at the wall.
     @Published public private(set) var capacityWarning: String?
+    /// True while a structural change (such as a new paper surface) replays
+    /// the painting in the background with editing paused; the studio shows
+    /// why the pause is happening while this is set.
+    @Published public private(set) var isApplyingSurfaceChange = false
     @Published public private(set) var canvasWetness: Double
     @Published public private(set) var layerOpacityPreviews: [UUID: Double]
     @Published public private(set) var recentColors: [PaintColor]
@@ -496,7 +500,6 @@ public final class StudioModel: ObservableObject {
     private var rendererCheckpoints: [RendererCheckpoint]
     private let rendererCheckpointByteBudget: Int
     private let projectAdmissionLimits: ProjectAdmissionLimits
-    private var isApplyingStructuralChange = false
     private var structuralReplacementTask: Task<Void, Never>?
 
     public var isStrokePreviewActive: Bool {
@@ -504,7 +507,7 @@ public final class StudioModel: ObservableObject {
     }
 
     public var canModifyProject: Bool {
-        strokePreviewState.token == nil && !isApplyingStructuralChange
+        strokePreviewState.token == nil && !isApplyingSurfaceChange
     }
 
     var isStrokePreviewFinalizing: Bool {
@@ -583,7 +586,7 @@ public final class StudioModel: ObservableObject {
 
     @discardableResult
     func beginStrokePreview(_ stroke: StrokeCommand) -> StrokePreviewAdmission {
-        guard !isApplyingStructuralChange else { return .busy }
+        guard !isApplyingSurfaceChange else { return .busy }
         guard strokePreviewState.token == nil else { return .busy }
         guard rendererRecoveryError == nil,
               canAppendStroke(stroke),
@@ -1168,7 +1171,7 @@ public final class StudioModel: ObservableObject {
         let updatedProject = updatedEditor.project
         guard updatedProject != project else { return }
 
-        isApplyingStructuralChange = true
+        isApplyingSurfaceChange = true
         refreshCapabilities()
         let preparedCheckpoint = rendererRecoveryError == nil
             ? prepareCurrentRendererCheckpointForCandidateAllocation()
@@ -1182,7 +1185,7 @@ public final class StudioModel: ObservableObject {
                 if let preparedCheckpoint {
                     self.appendRendererCheckpoint(preparedCheckpoint)
                 }
-                self.isApplyingStructuralChange = false
+                self.isApplyingSurfaceChange = false
                 self.replaceRenderer(with: candidateRenderer)
                 self.publishSuccessfulEdit(
                     editor: updatedEditor,
@@ -1192,7 +1195,7 @@ public final class StudioModel: ObservableObject {
                     )?.id
                 )
             } catch {
-                self.isApplyingStructuralChange = false
+                self.isApplyingSurfaceChange = false
                 self.error = StudioFailure.rendering(error: error, project: self.project)
                 self.refreshCapabilities()
             }
@@ -1670,7 +1673,7 @@ public final class StudioModel: ObservableObject {
     private func refreshCapabilities() {
         capabilities = StudioCapabilities(
             canPaint: rendererRecoveryError == nil
-                && !isApplyingStructuralChange
+                && !isApplyingSurfaceChange
                 && !isStrokePreviewFinalizing
                 && !strokePreviewState.isCancelling
                 && project.layers.contains(where: { $0.id == selectedLayerID }),

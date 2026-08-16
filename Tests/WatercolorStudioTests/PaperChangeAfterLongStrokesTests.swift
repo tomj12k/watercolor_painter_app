@@ -39,6 +39,9 @@ struct PaperChangeAfterLongStrokesTests {
         #expect(model.project.paper == .coldPress)
         #expect(!model.capabilities.canPaint)
         #expect(!model.canModifyProject)
+        // The pause must be visible: the studio shows why editing is paused
+        // while the new surface prepares.
+        #expect(model.isApplyingSurfaceChange)
 
         for _ in 0..<4_000 where model.project.paper != .rough {
             try? await Task.sleep(for: .milliseconds(2))
@@ -46,6 +49,7 @@ struct PaperChangeAfterLongStrokesTests {
         #expect(model.project.paper == .rough)
         #expect(model.capabilities.canPaint)
         #expect(model.canModifyProject)
+        #expect(!model.isApplyingSurfaceChange)
         #expect(model.capabilities.canUndo)
         #expect(model.rendererRecoveryError == nil)
         #expect(model.error == nil)

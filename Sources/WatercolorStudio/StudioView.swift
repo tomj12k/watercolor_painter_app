@@ -151,6 +151,26 @@ public struct StudioView: View {
                     .accessibilityLabel("Canvas activity")
                     .accessibilityValue(activityLabel)
 
+                    if model.isApplyingSurfaceChange {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Preparing the paper surface…")
+                        }
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(StudioPalette.fiber)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(StudioPalette.carbon.opacity(0.88))
+                        .overlay(alignment: .leading) {
+                            Rectangle()
+                                .fill(StudioPalette.cobalt)
+                                .frame(width: 2)
+                        }
+                        .accessibilityLabel("Paper surface")
+                        .accessibilityValue("Preparing the paper surface")
+                    }
+
                     if let capacityWarning = model.capacityWarning {
                         HStack(spacing: 6) {
                             Image(systemName: "gauge.with.needle")
