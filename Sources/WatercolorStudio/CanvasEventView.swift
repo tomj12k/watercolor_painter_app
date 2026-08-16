@@ -280,7 +280,11 @@ public final class CanvasEventView: MTKView {
     func synchronize(with model: StudioModel) {
         guard self.model !== model else {
             updateInputAvailability()
-            requestCanvasDraw()
+            // synchronize runs inside a SwiftUI view update, where publishing
+            // a model change is undefined behavior. Redraw now; run the pan
+            // clamp (which may write model.pan) after the update completes.
+            model.updateCanvasDisplay(self)
+            scheduleDeferredPanClamp()
             return
         }
 
@@ -626,9 +630,15 @@ public final class CanvasEventView: MTKView {
         )
     }
 
+    /// Redraws from event-handler paths, where model writes are safe.
     private func requestCanvasDraw() {
-        // Keep a sliver of paper on screen no matter how far the customer
-        // pans or zooms, so the painting can always be found again.
+        clampPanIfNeeded()
+        model.updateCanvasDisplay(self)
+    }
+
+    /// Keeps a sliver of paper on screen no matter how far the customer
+    /// pans or zooms, so the painting can always be found again.
+    private func clampPanIfNeeded() {
         let clampedPan = canvasTransform.clampedPan(
             model.pan,
             minimumVisiblePaper: Self.minimumVisiblePaper
@@ -636,7 +646,21 @@ public final class CanvasEventView: MTKView {
         if clampedPan != model.pan {
             model.pan = clampedPan
         }
-        model.updateCanvasDisplay(self)
+    }
+
+    private func scheduleDeferredPanClamp() {
+        let model = model
+        Task { @MainActor [weak self] in
+            guard let self, self.model === model else { return }
+            let clampedPan = canvasTransform.clampedPan(
+                model.pan,
+                minimumVisiblePaper: Self.minimumVisiblePaper
+            )
+            if clampedPan != model.pan {
+                model.pan = clampedPan
+                model.updateCanvasDisplay(self)
+            }
+        }
     }
 
     private static let pressureEventTypes: Set<NSEvent.EventType> = [

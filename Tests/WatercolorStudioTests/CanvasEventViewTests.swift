@@ -929,7 +929,7 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 120, y: 128).alpha > 0.05)
     }
 
-    @Test func offscreenPanIsClampedSoThePaperStaysVisible() throws {
+    @Test func offscreenPanIsClampedSoThePaperStaysVisible() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject(
             canvas: CanvasSize(width: 256, height: 256),
@@ -947,12 +947,20 @@ import WatercolorCore
         model.pan = CGSize(width: 100_000, height: -100_000)
         view.synchronize(with: model)
 
-        // The 256-point paper fills the 256-point view, so panning stops once
-        // only the 48-point minimum sliver of paper would remain visible.
+        // synchronize runs inside a SwiftUI view update, where publishing a
+        // model change is undefined behavior — the clamp must not fire here.
+        #expect(model.pan == CGSize(width: 100_000, height: -100_000))
+
+        // The 256-point paper fills the 256-point view, so panning settles
+        // once only the 48-point minimum sliver of paper remains visible.
+        for _ in 0..<2_000 where model.pan.width > 208 {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
         #expect(model.pan == CGSize(width: 208, height: -208))
 
         model.pan = CGSize(width: 30, height: -12)
         view.synchronize(with: model)
+        try? await Task.sleep(for: .milliseconds(30))
         #expect(model.pan == CGSize(width: 30, height: -12))
     }
 
