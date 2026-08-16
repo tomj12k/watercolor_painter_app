@@ -132,6 +132,55 @@ import WatercolorCore
         #expect(!pointFailure.recoverySuggestion.contains("Try the operation again"))
     }
 
+    @Test @MainActor func capacityWarningAppearsAtNinetyPercentAndNamesTheAction() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let maximumCommandCount = 10
+        let limits = ProjectAdmissionLimits(
+            maximumCommandCount: maximumCommandCount,
+            maximumTotalStrokePointCount: 1_024,
+            maximumSerializedStorageBytes: 8_388_608
+        )
+        var project = PaintingProject.studioTestProject()
+        project.commands = (0..<8).map { _ in
+            .clearLayer(LayerCommand(layerID: project.layers[0].id))
+        }
+        func makeModel(_ project: PaintingProject) throws -> StudioModel {
+            StudioModel(
+                project: project,
+                renderer: try WatercolorRenderer(
+                    project: project,
+                    device: device,
+                    debugProjectAdmissionLimits: limits,
+                    debugCommandBufferError: { $0.error }
+                ),
+                maximumCommandCount: maximumCommandCount,
+                maximumTotalStrokePointCount: 1_024,
+                maximumSerializedStorageBytes: 8_388_608
+            )
+        }
+
+        // Below the threshold, no warning distracts from painting.
+        let model = try makeModel(project)
+        #expect(model.capacityWarning == nil)
+
+        // At nine of ten commands the indicator appears and names the action.
+        model.completeStroke(.studioTestStroke(layerID: project.layers[0].id))
+        let warning = try #require(model.capacityWarning)
+        #expect(warning.contains("90%"))
+        #expect(warning.contains("new document"))
+
+        // Painting the final command moves the indicator to one hundred percent.
+        model.completeStroke(.studioTestStroke(layerID: project.layers[0].id, x: 96))
+        #expect(model.project.commands.count == maximumCommandCount)
+        #expect(model.capacityWarning?.contains("100%") == true)
+
+        // Undoing history clears the warning again.
+        model.undo()
+        model.undo()
+        #expect(model.project.commands.count == 8)
+        #expect(model.capacityWarning == nil)
+    }
+
     @Test @MainActor func strokeExhaustionNoticeUsesTheCapacityCategoryWithItsOwnRecovery() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()

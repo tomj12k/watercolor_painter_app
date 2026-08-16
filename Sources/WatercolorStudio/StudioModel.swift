@@ -416,6 +416,9 @@ public final class StudioModel: ObservableObject {
     @Published public private(set) var error: StudioFailure?
     @Published public private(set) var rendererRecoveryError: StudioRendererRecoveryError?
     @Published public private(set) var capabilities: StudioCapabilities
+    /// Non-modal notice shown from 90% of any document limit, so the customer
+    /// learns about the ceiling before a stroke is refused at the wall.
+    @Published public private(set) var capacityWarning: String?
     @Published public private(set) var canvasWetness: Double
     @Published public private(set) var layerOpacityPreviews: [UUID: Double]
     @Published public private(set) var recentColors: [PaintColor]
@@ -545,6 +548,7 @@ public final class StudioModel: ObservableObject {
         error = nil
         rendererRecoveryError = nil
         capabilities = StudioCapabilities(canPaint: true, canUndo: false, canRedo: false)
+        capacityWarning = nil
         canvasWetness = renderer.canvasWetness
         layerOpacityPreviews = [:]
         recentColors = []
@@ -1583,6 +1587,37 @@ public final class StudioModel: ObservableObject {
             canUndo: canModifyProject && editor.canUndo,
             canRedo: canModifyProject && editor.canRedo
         )
+        capacityWarning = Self.capacityWarning(for: project, limits: projectAdmissionLimits)
+    }
+
+    private static func capacityWarning(
+        for project: PaintingProject,
+        limits: ProjectAdmissionLimits
+    ) -> String? {
+        func fraction(_ used: Int, of maximum: Int) -> Double {
+            guard maximum > 0 else { return 1 }
+            return Double(used) / Double(maximum)
+        }
+        var totalPointCount = 0
+        for command in project.commands {
+            guard case let .stroke(stroke) = command else { continue }
+            let (updatedTotal, didOverflow) = totalPointCount
+                .addingReportingOverflow(stroke.points.count)
+            guard !didOverflow else {
+                totalPointCount = .max
+                break
+            }
+            totalPointCount = updatedTotal
+        }
+        let storageCharge = (try? project.serializedStorageCharge()) ?? .max
+        let usage = max(
+            fraction(project.commands.count, of: limits.maximumCommandCount),
+            fraction(totalPointCount, of: limits.maximumTotalStrokePointCount),
+            fraction(storageCharge, of: limits.maximumSerializedStorageBytes)
+        )
+        guard usage >= 0.9 else { return nil }
+        let percent = min(Int((usage * 100).rounded(.down)), 100)
+        return "Painting history is \(percent)% full. Undo or remove history, or continue in a new document."
     }
 
 }

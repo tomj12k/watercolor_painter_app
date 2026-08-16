@@ -132,24 +132,46 @@ public struct StudioView: View {
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
 
-                HStack(spacing: 6) {
-                    Image(systemName: "drop.fill")
-                    Text(activityLabel)
-                        .monospacedDigit()
-                }
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .foregroundStyle(StudioPalette.fiber)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(StudioPalette.carbon.opacity(0.88))
-                .overlay(alignment: .leading) {
-                    Rectangle()
-                        .fill(StudioPalette.cobalt)
-                        .frame(width: 2)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "drop.fill")
+                        Text(activityLabel)
+                            .monospacedDigit()
+                    }
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(StudioPalette.fiber)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(StudioPalette.carbon.opacity(0.88))
+                    .overlay(alignment: .leading) {
+                        Rectangle()
+                            .fill(StudioPalette.cobalt)
+                            .frame(width: 2)
+                    }
+                    .accessibilityLabel("Canvas activity")
+                    .accessibilityValue(activityLabel)
+
+                    if let capacityWarning = model.capacityWarning {
+                        HStack(spacing: 6) {
+                            Image(systemName: "gauge.with.needle")
+                            Text(capacityWarning)
+                                .monospacedDigit()
+                        }
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(StudioPalette.fiber)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(StudioPalette.carbon.opacity(0.88))
+                        .overlay(alignment: .leading) {
+                            Rectangle()
+                                .fill(StudioPalette.pigment)
+                                .frame(width: 2)
+                        }
+                        .accessibilityLabel("Painting capacity")
+                        .accessibilityValue(capacityWarning)
+                    }
                 }
                 .padding(12)
-                .accessibilityLabel("Canvas activity")
-                .accessibilityValue(activityLabel)
             }
             .clipped()
         }
