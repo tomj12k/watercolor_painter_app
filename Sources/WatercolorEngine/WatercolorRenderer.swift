@@ -87,7 +87,12 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             width: compositeTexture.width,
             height: compositeTexture.height,
             layerCapacity: layerCapacity
-        ) + layerMetadataBuffer.length + wetnessTileMaximumBuffer.length + wetnessMaximumBuffer.length
+        )
+            + compositeTexture.width * compositeTexture.height
+                * RendererResourcePolicy.previewSnapshotBytesPerPixel
+            + layerMetadataBuffer.length
+            + wetnessTileMaximumBuffer.length
+            + wetnessMaximumBuffer.length
     }
 
     static func estimatedTextureBytes(width: Int, height: Int, layerCapacity: Int) -> Int {

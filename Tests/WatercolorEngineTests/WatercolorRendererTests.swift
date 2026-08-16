@@ -210,6 +210,21 @@ import WatercolorCore
         #expect(estimatedBytes > 256 * 1024 * 1024)
     }
 
+    @Test func checkpointEstimateIncludesReusablePreviewSnapshots() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let liveTextureBytes = WatercolorRenderer.estimatedTextureBytes(
+            width: project.canvas.width,
+            height: project.canvas.height,
+            layerCapacity: 1
+        )
+        let previewSnapshotBytes = project.canvas.width * project.canvas.height
+            * RendererResourcePolicy.previewSnapshotBytesPerPixel
+
+        #expect(renderer.estimatedResourceBytes >= liveTextureBytes + previewSnapshotBytes)
+    }
+
     @Test func benchmark1600By1200AtEightAndTwelveLayers() throws {
         guard ProcessInfo.processInfo.environment["WATERCOLOR_RUN_BENCHMARK"] == "1",
               let device = MTLCreateSystemDefaultDevice()

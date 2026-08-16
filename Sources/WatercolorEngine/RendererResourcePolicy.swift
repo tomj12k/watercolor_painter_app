@@ -11,6 +11,7 @@ struct RendererResourceEstimate: Equatable, Sendable {
 struct RendererResourcePolicy: Sendable {
     static let absoluteMaximumBytes = 2_147_483_648
     static let fallbackMaximumBytes = 536_870_912
+    static let previewSnapshotBytesPerPixel = 10
 
     let maximumWorkingSetBytes: Int
 
@@ -51,7 +52,7 @@ struct RendererResourcePolicy: Sendable {
 
         let pixelCount = try multiply(width, height)
         let liveBytes = try rendererBytes(pixelCount: pixelCount, layerCapacity: layerCapacity)
-        let previewBytes = try multiply(pixelCount, 10)
+        let previewBytes = try multiply(pixelCount, Self.previewSnapshotBytesPerPixel)
         let candidateRendererBytes = try rendererBytes(
             pixelCount: pixelCount,
             layerCapacity: structuralCandidateCapacity
