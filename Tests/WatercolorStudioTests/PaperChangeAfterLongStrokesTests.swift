@@ -119,13 +119,16 @@ struct PaperChangeAfterLongStrokesTests {
         #expect(!model.capabilities.canPaint)
         #expect(!model.canModifyProject)
         // The pause must be visible: the studio shows why editing is paused
-        // while the new surface prepares.
+        // while the new surface prepares, and the paper picker already
+        // reflects the choice the customer made.
         #expect(model.isApplyingSurfaceChange)
+        #expect(model.displayedPaper == .rough)
 
         for _ in 0..<4_000 where model.project.paper != .rough {
             try? await Task.sleep(for: .milliseconds(2))
         }
         #expect(model.project.paper == .rough)
+        #expect(model.displayedPaper == .rough)
         #expect(model.capabilities.canPaint)
         #expect(model.canModifyProject)
         #expect(!model.isApplyingSurfaceChange)

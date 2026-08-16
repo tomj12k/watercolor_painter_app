@@ -2305,6 +2305,9 @@ import WatercolorCore
         #expect(model.canvasWetness == canvasWetness)
         #expect(model.error?.code == .gpuExecution)
         #expect(failedReplayCount == 1)
+        // The failed change leaves the picker on the paper that is actually
+        // in use, never stuck showing a choice that did not apply.
+        #expect(model.displayedPaper == project.paper)
     }
 
     @Test func brushSizeAdjustmentsStayWithinThePaintableRange() throws {

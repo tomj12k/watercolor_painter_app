@@ -427,6 +427,15 @@ public final class StudioModel: ObservableObject {
     /// the painting in the background with editing paused; the studio shows
     /// why the pause is happening while this is set.
     @Published public private(set) var isApplyingSurfaceChange = false
+
+    /// The paper the customer chose, applied or still preparing. The picker
+    /// shows this value so a click is reflected immediately; it falls back
+    /// to the project's paper when a change fails or none is pending.
+    @Published private var pendingPaper: PaperTexture?
+
+    public var displayedPaper: PaperTexture {
+        pendingPaper ?? project.paper
+    }
     @Published public private(set) var canvasWetness: Double
     @Published public private(set) var layerOpacityPreviews: [UUID: Double]
     @Published public private(set) var recentColors: [PaintColor]
@@ -1172,6 +1181,7 @@ public final class StudioModel: ObservableObject {
         guard updatedProject != project else { return }
 
         isApplyingSurfaceChange = true
+        pendingPaper = paper
         refreshCapabilities()
         let preparedCheckpoint = rendererRecoveryError == nil
             ? prepareCurrentRendererCheckpointForCandidateAllocation()
@@ -1186,6 +1196,7 @@ public final class StudioModel: ObservableObject {
                     self.appendRendererCheckpoint(preparedCheckpoint)
                 }
                 self.isApplyingSurfaceChange = false
+                self.pendingPaper = nil
                 self.replaceRenderer(with: candidateRenderer)
                 self.publishSuccessfulEdit(
                     editor: updatedEditor,
@@ -1196,6 +1207,7 @@ public final class StudioModel: ObservableObject {
                 )
             } catch {
                 self.isApplyingSurfaceChange = false
+                self.pendingPaper = nil
                 self.error = StudioFailure.rendering(error: error, project: self.project)
                 self.refreshCapabilities()
             }

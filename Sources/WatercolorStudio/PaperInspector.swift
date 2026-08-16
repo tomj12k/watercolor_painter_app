@@ -23,7 +23,7 @@ struct PaperInspector: View {
 
     private var paperBinding: Binding<PaperTexture> {
         Binding(
-            get: { model.project.paper },
+            get: { model.displayedPaper },
             set: { model.selectPaper($0) }
         )
     }
