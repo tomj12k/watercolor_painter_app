@@ -418,8 +418,33 @@ public final class StudioModel: ObservableObject {
     @Published public var selectedLayerID: UUID {
         didSet { refreshCapabilities() }
     }
-    @Published public var selectedTool: PaintTool
+    @Published public var selectedTool: PaintTool {
+        didSet {
+            guard oldValue != selectedTool else { return }
+            storedToolSettings[oldValue] = brush
+            brush = storedToolSettings[selectedTool] ?? Self.defaultBrush(for: selectedTool)
+        }
+    }
     @Published public var brush: BrushSettings
+
+    /// Each tool keeps its own settings, so adjusting the eraser never
+    /// disturbs the brush. Settings for tools not yet visited come from
+    /// `defaultBrush(for:)`.
+    private var storedToolSettings: [PaintTool: BrushSettings] = [:]
+
+    /// Strength tools start at full strength — the exact behavior they had
+    /// while their strength was fixed — so nothing feels different until
+    /// the customer moves the slider.
+    static func defaultBrush(for tool: PaintTool) -> BrushSettings {
+        var settings = BrushSettings.default
+        switch tool {
+        case .brush, .water:
+            break
+        case .eraser, .smudge, .smear, .dry:
+            settings.opacity = 1
+        }
+        return settings
+    }
     @Published public var zoom: CGFloat
     @Published public var pan: CGSize
     @Published public private(set) var error: StudioFailure?

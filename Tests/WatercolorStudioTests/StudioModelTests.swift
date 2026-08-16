@@ -56,6 +56,42 @@ import WatercolorCore
         )
     }
 
+    @Test @MainActor func eachToolRemembersItsOwnSettings() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device)
+        )
+
+        // The brush keeps its pigment defaults.
+        #expect(model.brush.opacity == BrushSettings.default.opacity)
+        model.setBrushSize(120)
+
+        // Strength tools start at full strength, matching how they always
+        // behaved before strength became adjustable.
+        model.selectedTool = .eraser
+        #expect(model.brush.opacity == 1)
+        model.setBrushSize(60)
+
+        // Each tool's changes survive switching away and back.
+        model.selectedTool = .water
+        model.selectedTool = .eraser
+        #expect(model.brush.size == 60)
+        model.selectedTool = .brush
+        #expect(model.brush.size == 120)
+        #expect(model.brush.opacity == BrushSettings.default.opacity)
+
+        // Every non-brush tool carries full default strength.
+        for tool in [PaintTool.smudge, .smear, .dry] {
+            model.selectedTool = tool
+            #expect(model.brush.opacity == 1, "tool \(tool) should default to full strength")
+        }
+
+        // New strokes carry the strength-capable behavior version.
+        #expect(model.brush.behaviorVersion == 2)
+    }
+
     @Test @MainActor func previewDrainSizeAlignsWithTheRendererStampBatchStride() {
         // Wet simulation runs between stamp batches. A drain size off the
         // batch stride would shift batch boundaries between live preview
