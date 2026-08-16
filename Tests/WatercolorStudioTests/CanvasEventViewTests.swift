@@ -929,6 +929,86 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 120, y: 128).alpha > 0.05)
     }
 
+    @Test func deferredStrokeCommitsBeforeAStrokeDrawnAfterIt() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [PaintLayer(name: "Layer")]
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let finish = CanvasPreviewSuspension()
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, id, points, token in
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
+                },
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
+                    await finish.suspend()
+                }
+            )
+        )
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+        let first = StrokeCommand(
+            layerID: project.layers[0].id,
+            tool: .brush,
+            brush: .default,
+            points: [StrokePoint(x: 64, y: 64, pressure: 1, tiltX: 0, tiltY: 0, time: 0)]
+        )
+
+        #expect(model.beginStrokePreview(first) == .accepted)
+        let commit = Task { @MainActor in
+            await model.commitStrokePreview(first)
+        }
+        await finish.waitUntilSuspended()
+        view.synchronize(with: model)
+
+        // Stroke A begins and ends while the renderer is still finishing the
+        // first stroke, so it is deferred.
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown, timestamp: 1, eventNumber: 1, location: .init(x: 40, y: 128)
+        )))
+        view.mouseUp(with: try #require(canvasMouseEvent(
+            .leftMouseUp, timestamp: 2, eventNumber: 2, location: .init(x: 40, y: 128)
+        )))
+
+        await finish.resume()
+        await commit.value
+
+        // Stroke C is drawn after A, with the renderer now free. It must not
+        // overtake the deferred stroke in the painting's command order.
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown, timestamp: 3, eventNumber: 3, location: .init(x: 180, y: 128)
+        )))
+        view.mouseDragged(with: try #require(canvasMouseEvent(
+            .leftMouseDragged, timestamp: 4, eventNumber: 4, location: .init(x: 200, y: 128)
+        )))
+        view.mouseUp(with: try #require(canvasMouseEvent(
+            .leftMouseUp, timestamp: 5, eventNumber: 5, location: .init(x: 220, y: 128)
+        )))
+
+        for _ in 0..<2_000 where model.project.commands.count < 3 {
+            await finish.resume()
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+
+        #expect(model.project.commands.count == 3)
+        guard case let .stroke(second) = model.project.commands[1],
+              case let .stroke(third) = model.project.commands[2]
+        else {
+            Issue.record("expected three stroke commands")
+            return
+        }
+        #expect(second.points.first?.x == 40)
+        #expect(third.points.first?.x == 180)
+        #expect(model.error == nil)
+    }
+
     @Test func offscreenPanIsClampedSoThePaperStaysVisible() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject(

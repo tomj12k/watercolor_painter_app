@@ -231,6 +231,8 @@ public final class CanvasEventView: MTKView {
     private var model: StudioModel
     private var strokeBuilder: CanvasStrokeBuilder?
     private var strokePreviewStarted = false
+    private var deferredStrokeQueue: [(stroke: StrokeCommand, reason: StrokeExhaustionReason?)] = []
+    private var deferredStrokeDrainTask: Task<Void, Never>?
     private var panAnchor: CGPoint?
     private var spaceKeyDown = false
 
@@ -291,6 +293,7 @@ public final class CanvasEventView: MTKView {
         self.model.cancelStrokePreview()
         strokeBuilder = nil
         strokePreviewStarted = false
+        deferredStrokeQueue.removeAll()
         panAnchor = nil
         spaceKeyDown = false
         self.model = model
@@ -429,6 +432,10 @@ public final class CanvasEventView: MTKView {
     /// collecting points and the next input event retries, so quick
     /// successive strokes never silently drop.
     private func startPendingStrokePreviewIfNeeded() {
+        // Strokes waiting in the deferred queue were drawn earlier, so a new
+        // stroke must not obtain a live preview — and thereby commit — ahead
+        // of them. It stays in its builder and joins the queue on pointer up.
+        guard deferredStrokeQueue.isEmpty, deferredStrokeDrainTask == nil else { return }
         guard !strokePreviewStarted,
               let stroke = strokeBuilder?.currentStroke,
               let firstPoint = stroke.points.first
@@ -510,26 +517,46 @@ public final class CanvasEventView: MTKView {
         }
     }
 
-    /// Renders a stroke whose preview never obtained the renderer — the
+    /// Queues a stroke whose preview never obtained the renderer — the
     /// previous stroke was still finishing for its whole, brief lifetime —
-    /// as soon as the renderer frees up, so the quick stroke still lands.
+    /// so it renders as soon as the renderer frees up. A first-in-first-out
+    /// queue keeps deferred strokes in draw order: a later stroke can never
+    /// commit ahead of an earlier one that is still waiting.
     private func completeDeferredStroke(
         _ stroke: StrokeCommand?,
         reason: StrokeExhaustionReason?
     ) {
         guard let stroke else { return }
+        deferredStrokeQueue.append((stroke: stroke, reason: reason))
+        startDeferredStrokeDrainIfNeeded()
+    }
+
+    private func startDeferredStrokeDrainIfNeeded() {
+        guard deferredStrokeDrainTask == nil, !deferredStrokeQueue.isEmpty else { return }
         let model = model
-        Task { @MainActor [weak self] in
-            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-            while !model.canModifyProject, ContinuousClock.now < deadline {
-                try? await Task.sleep(for: .milliseconds(8))
+        deferredStrokeDrainTask = Task { @MainActor [weak self] in
+            while let self, self.model === model, !self.deferredStrokeQueue.isEmpty {
+                let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+                while !model.canModifyProject, ContinuousClock.now < deadline {
+                    try? await Task.sleep(for: .milliseconds(8))
+                }
+                guard model.canModifyProject else {
+                    // The renderer never freed up; dropping the queue keeps
+                    // new painting possible instead of blocking it forever.
+                    self.deferredStrokeQueue.removeAll()
+                    break
+                }
+                let entry = self.deferredStrokeQueue.removeFirst()
+                model.completeStroke(entry.stroke)
+                if let reason = entry.reason {
+                    model.noteStrokeExhaustion(reason)
+                }
             }
-            model.completeStroke(stroke)
-            if let reason {
-                model.noteStrokeExhaustion(reason)
-            }
-            self?.requestCanvasDraw()
-            self?.updateInputAvailability()
+            guard let self else { return }
+            self.deferredStrokeDrainTask = nil
+            self.requestCanvasDraw()
+            self.updateInputAvailability()
+            self.startDeferredStrokeDrainIfNeeded()
         }
     }
 

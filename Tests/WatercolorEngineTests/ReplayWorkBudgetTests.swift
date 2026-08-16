@@ -175,6 +175,44 @@ struct ReplayWorkBudgetTests {
         #expect(try renderer.pixelChecksum() == checksumBefore)
     }
 
+    @Test func replayLifetimeWorkMayExceedTheProjectBudgetAcrossSubmissions() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let original = Self.budgetTestCanvas(64)
+        var replaySubmissions = 0
+        let renderer = try WatercolorRenderer(
+            project: original,
+            device: device,
+            debugWorkPolicy: RendererWorkPolicy(
+                maximumCommandThreads: 100_000,
+                maximumProjectThreads: 120_000
+            ),
+            debugCommandBufferError: { commandBuffer in
+                if commandBuffer.label == "Watercolor replay" {
+                    replaySubmissions += 1
+                }
+                return commandBuffer.error
+            }
+        )
+        replaySubmissions = 0
+        var heavy = original
+        heavy.commands = (0..<12).map { index in
+            .stroke(Self.multiPointStroke(
+                layerID: original.layers[0].id,
+                pointCount: 9,
+                startTime: Double(index) * 100
+            ))
+        }
+
+        // Total replay work here is more than ten times maximumProjectThreads.
+        // Budgets bound one submission each, so the replay must still succeed
+        // by splitting — a cumulative replay-lifetime cap would make heavy
+        // documents impossible to reopen.
+        try renderer.replay(project: heavy)
+
+        #expect(replaySubmissions > 2)
+        #expect(renderer.project == heavy)
+    }
+
     @Test func productionBudgetAdmitsWorstCaseSingleDispatches() {
         // The irreducible replay dispatch — one simulation step over the
         // largest canvas at full layer depth — must always fit one fresh

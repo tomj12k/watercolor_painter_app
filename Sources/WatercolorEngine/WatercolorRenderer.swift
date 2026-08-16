@@ -1404,6 +1404,12 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             activeSimulationRegions = [:]
             updateLayerMetadata()
 
+            // Every rotated submission draws from a fresh, fully reset budget:
+            // the budget bounds one command buffer, which is the GPU-safety
+            // unit. Replay-lifetime work is deliberately uncapped here — a
+            // large painting replays across more submissions instead of
+            // failing — because document scale is already bounded by the
+            // project admission limits (commands, points, storage).
             var initialBudget = workPolicy.makeProjectBudget()
             initialBudget.beginCommand()
             let stream = RenderCommandStream(
