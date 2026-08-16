@@ -12,6 +12,26 @@ struct BrushMatrixExportResult {
     let nonemptySampleCount: Int
     let width: Int
     let height: Int
+    let samples: [BrushMatrixSampleResult]
+
+    func sample(category: BrushMatrixCategory, value: String) -> BrushMatrixSampleResult? {
+        samples.first { $0.category == category && $0.value == value }
+    }
+}
+
+enum BrushMatrixCategory: String {
+    case shape
+    case hair
+    case texture
+    case style
+}
+
+struct BrushMatrixSampleResult {
+    let category: BrushMatrixCategory
+    let value: String
+    let brush: BrushSettings
+    let metrics: BrushPhenotypeMetrics
+    let caption: String
 }
 
 @MainActor enum BrushMatrixExporter {
@@ -51,6 +71,7 @@ struct BrushMatrixExportResult {
 
         var sampleIndex = 0
         var nonemptySampleCount = 0
+        var sampleResults: [BrushMatrixSampleResult] = []
         for (sectionIndex, section) in sections.enumerated() {
             let rowTop = height - headerHeight - sectionIndex * rowHeight
             drawText(
@@ -73,6 +94,14 @@ struct BrushMatrixExportResult {
                 if sample.metrics.area > 0, sample.metrics.pigmentMass > 0 {
                     nonemptySampleCount += 1
                 }
+                let caption = metricCaption(sample.metrics, category: variant.category)
+                sampleResults.append(BrushMatrixSampleResult(
+                    category: variant.category,
+                    value: variant.rawValue,
+                    brush: sample.brush,
+                    metrics: sample.metrics,
+                    caption: caption
+                ))
                 let cellX = labelWidth + column * cellWidth
                 let imageY = rowTop - 151
                 drawText(
@@ -91,7 +120,7 @@ struct BrushMatrixExportResult {
                 )
                 context.restoreGState()
                 drawText(
-                    metricCaption(sample.metrics),
+                    caption,
                     at: CGPoint(x: cellX + 4, y: rowTop - 174),
                     fontSize: 9,
                     color: CGColor(srgbRed: 0.29, green: 0.27, blue: 0.23, alpha: 1),
@@ -127,7 +156,8 @@ struct BrushMatrixExportResult {
             sampleCount: sampleIndex,
             nonemptySampleCount: nonemptySampleCount,
             width: width,
-            height: height
+            height: height,
+            samples: sampleResults
         )
     }
 
@@ -161,6 +191,7 @@ struct BrushMatrixExportResult {
         brush.spacing = 0.18
         brush.bristleStrength = 1
         brush.textureStrength = 1
+        variant.tuneReferenceBrush(&brush)
         variant.apply(to: &brush)
 
         let stroke = StrokeCommand(
@@ -168,23 +199,17 @@ struct BrushMatrixExportResult {
             layerID: layer.id,
             tool: .brush,
             brush: brush,
-            points: (0..<9).map { index in
-                StrokePoint(
-                    x: Double(24 + index * 14),
-                    y: 60 + sin(Double(index) * .pi / 8) * 7,
-                    pressure: 0.9,
-                    tiltX: 0,
-                    tiltY: 0,
-                    time: Double(index) / 60
-                )
-            }
+            points: variant.points
         )
         let renderer = try WatercolorRenderer(project: project, device: device)
         try renderer.renderAndWait(stroke: stroke)
-        try renderer.dry(layerID: layer.id, steps: 4)
+        if variant.drySteps > 0 {
+            try renderer.dry(layerID: layer.id, steps: variant.drySteps)
+        }
         let fields = try renderer.debugLayerFields(layerID: layer.id)
         return BrushMatrixSample(
             image: try renderer.makeCGImage(),
+            brush: brush,
             metrics: BrushPhenotypeMetrics.measure(fields)
         )
     }
@@ -193,13 +218,40 @@ struct BrushMatrixExportResult {
         UUID(uuidString: String(format: "6B26065D-F18A-4000-8000-%012X", index + 1))!
     }
 
-    private static func metricCaption(_ metrics: BrushPhenotypeMetrics) -> String {
-        String(
-            format: "area %.0f · lanes %d · void %.2f",
-            metrics.area,
-            metrics.laneCount,
-            metrics.voidRatio
-        )
+    private static func metricCaption(
+        _ metrics: BrushPhenotypeMetrics,
+        category: BrushMatrixCategory
+    ) -> String {
+        switch category {
+        case .shape:
+            return String(
+                format: "aspect %.1f · lanes %d · area %.0f",
+                metrics.aspectRatio,
+                metrics.laneCount,
+                metrics.area
+            )
+        case .hair:
+            return String(
+                format: "pig %.0f · wet %.0f · lanes %d",
+                metrics.pigmentMass,
+                metrics.wetnessMass,
+                metrics.laneCount
+            )
+        case .texture:
+            return String(
+                format: "rough %.1f · void %.2f · pig %.0f",
+                metrics.edgeRoughness,
+                metrics.voidRatio,
+                metrics.pigmentMass
+            )
+        case .style:
+            return String(
+                format: "wet %.0f · spread %.1f · edge %.2f",
+                metrics.wetnessMass,
+                metrics.spreadRadius,
+                metrics.edgeConcentration
+            )
+        }
     }
 
     private static func drawText(
@@ -253,6 +305,7 @@ private struct BrushMatrixSection {
 
 private struct BrushMatrixSample {
     let image: CGImage
+    let brush: BrushSettings
     let metrics: BrushPhenotypeMetrics
 }
 
@@ -271,6 +324,24 @@ private enum BrushMatrixVariant {
         }
     }
 
+    var category: BrushMatrixCategory {
+        switch self {
+        case .shape: return .shape
+        case .hair: return .hair
+        case .texture: return .texture
+        case .style: return .style
+        }
+    }
+
+    var rawValue: String {
+        switch self {
+        case let .shape(value): return value.rawValue
+        case let .hair(value): return value.rawValue
+        case let .texture(value): return value.rawValue
+        case let .style(value): return value.rawValue
+        }
+    }
+
     var sectionColor: PaintColor {
         switch self {
         case .shape: return .fromSRGB(red: 0.12, green: 0.42, blue: 0.58)
@@ -280,12 +351,63 @@ private enum BrushMatrixVariant {
         }
     }
 
+    var points: [StrokePoint] {
+        if case .shape = self {
+            return [StrokePoint(
+                x: 80,
+                y: 60,
+                pressure: 0.9,
+                tiltX: 0.9,
+                tiltY: 0,
+                time: 0
+            )]
+        }
+        return (0..<9).map { index in
+            StrokePoint(
+                x: Double(24 + index * 14),
+                y: 60,
+                pressure: 0.9,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 60
+            )
+        }
+    }
+
+    var drySteps: Int {
+        switch self {
+        case .style, .texture: return 4
+        case .shape, .hair: return 0
+        }
+    }
+
+    func tuneReferenceBrush(_ brush: inout BrushSettings) {
+        switch self {
+        case .shape:
+            brush.size = 42
+            brush.opacity = 1
+            brush.flow = 1
+            brush.water = 0.1
+            brush.granulation = 0
+            brush.edgeBloom = 0
+        case .hair:
+            brush.size = 30
+            brush.opacity = 0.82
+            brush.flow = 0.78
+            brush.water = 0.72
+            brush.granulation = 0
+            brush.edgeBloom = 0
+        case .texture, .style:
+            break
+        }
+    }
+
     func apply(to brush: inout BrushSettings) {
         switch self {
         case let .shape(value): brush.shape = value
         case let .hair(value): brush.hair = value
         case let .texture(value): brush.texture = value
-        case let .style(value): brush.style = value
+        case let .style(value): brush = brush.applying(value)
         }
     }
 }

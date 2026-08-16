@@ -5097,34 +5097,6 @@ private actor RendererPreviewUpdateGate {
 }
 
 @MainActor
-private final class RendererPreviewCommandBufferMilestone {
-    private var reference: RendererPreviewCommandBufferReference?
-    private var waiters: [
-        CheckedContinuation<RendererPreviewCommandBufferReference, Never>
-    ] = []
-
-    func record(_ commandBuffer: MTLCommandBuffer) {
-        guard reference == nil else { return }
-        let reference = RendererPreviewCommandBufferReference(commandBuffer: commandBuffer)
-        self.reference = reference
-        let waiters = waiters
-        self.waiters.removeAll()
-        waiters.forEach { $0.resume(returning: reference) }
-    }
-
-    func waitForCommandBuffer() async -> RendererPreviewCommandBufferReference {
-        if let reference { return reference }
-        return await withCheckedContinuation { continuation in
-            waiters.append(continuation)
-        }
-    }
-}
-
-private struct RendererPreviewCommandBufferReference: @unchecked Sendable {
-    let commandBuffer: MTLCommandBuffer
-}
-
-@MainActor
 private final class RendererPreviewGPUOverlapProbe {
     struct Snapshot: Sendable {
         let status: MTLCommandBufferStatus
@@ -5181,27 +5153,6 @@ private final class RendererPreviewGPUOverlapProbe {
         if let cancellationSnapshot { return cancellationSnapshot }
         return await withCheckedContinuation { continuation in
             cancellationWaiters.append(continuation)
-        }
-    }
-}
-
-@MainActor
-private final class RendererPreviewMilestone {
-    private var wasRecorded = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    func record() {
-        guard !wasRecorded else { return }
-        wasRecorded = true
-        let waiters = waiters
-        self.waiters.removeAll()
-        waiters.forEach { $0.resume() }
-    }
-
-    func waitUntilRecorded() async {
-        guard !wasRecorded else { return }
-        await withCheckedContinuation { continuation in
-            waiters.append(continuation)
         }
     }
 }
