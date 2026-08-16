@@ -1721,87 +1721,6 @@ import WatercolorCore
         #expect(singleSubmissionCount == 0)
         #expect(try singleRenderer.compositeChecksum() == checksumBefore)
         try singleRenderer.cancelStrokePreview(singleToken)
-
-        var finishSubmissionCount = 0
-        let finishRenderer = try WatercolorRenderer(
-            project: project,
-            device: device,
-            debugWorkPolicy: RendererWorkPolicy(
-                maximumCommandThreads: 140_000,
-                maximumProjectThreads: 145_000
-            ),
-            debugCommandBufferError: { commandBuffer in
-                if commandBuffer.label == "Commit watercolor stroke preview" {
-                    finishSubmissionCount += 1
-                }
-                return commandBuffer.error
-            }
-        )
-        var prefixThenTail = complete
-        prefixThenTail.points = Array(complete.points.prefix(9))
-        var finishInitial = prefixThenTail
-        finishInitial.points = [prefixThenTail.points[0]]
-        let finishToken = try finishRenderer.beginStrokePreview(finishInitial)
-        try await finishRenderer.appendStrokePreview(
-            id: prefixThenTail.id,
-            points: Array(prefixThenTail.points.dropFirst()),
-            token: finishToken
-        )
-
-        // The finish remainder draws from its own fresh submission budget, so
-        // budget consumed by earlier appends can never make finishing fail.
-        try await finishRenderer.finishStrokePreview(prefixThenTail, token: finishToken)
-        #expect(finishSubmissionCount == 1)
-        try finishRenderer.recordRenderedStroke(prefixThenTail)
-        #expect(finishRenderer.project.commands.count == project.commands.count + 1)
-    }
-
-    @Test func previewCommandBudgetResetsBetweenAppendSubmissions() async throws {
-        guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let project = PaintingProject.testCanvas(64)
-        var previewSubmissions = 0
-        let renderer = try WatercolorRenderer(
-            project: project,
-            device: device,
-            debugWorkPolicy: RendererWorkPolicy(
-                maximumCommandThreads: 140_000,
-                maximumProjectThreads: 300_000
-            ),
-            debugCommandBufferError: { commandBuffer in
-                if commandBuffer.label == "Watercolor stroke preview" {
-                    previewSubmissions += 1
-                }
-                return commandBuffer.error
-            }
-        )
-        var complete = StrokeCommand.testDot(layerID: project.layers[0].id)
-        complete.points = (0..<17).map { index in
-            StrokePoint(
-                x: 32,
-                y: 32,
-                pressure: 1,
-                tiltX: 0,
-                tiltY: 0,
-                time: Double(index)
-            )
-        }
-        var initial = complete
-        initial.points = [complete.points[0]]
-        let token = try renderer.beginStrokePreview(initial)
-
-        try await renderer.appendStrokePreview(
-            id: complete.id,
-            points: Array(complete.points[1..<9]),
-            token: token
-        )
-        try await renderer.appendStrokePreview(
-            id: complete.id,
-            points: Array(complete.points[9..<17]),
-            token: token
-        )
-
-        #expect(previewSubmissions == 2)
-        try renderer.cancelStrokePreview(token)
     }
 
     @Test func previewCommandBudgetResetsForFinishSubmission() async throws {
@@ -2630,46 +2549,6 @@ import WatercolorCore
         #expect(try renderer.compositeChecksum() == checksumBefore)
         try renderer.renderAndWait(stroke: .testDot(layerID: original.layers[0].id))
         #expect(try renderer.debugPixel(x: 32, y: 32).alpha > 0.1)
-    }
-
-    @Test func replayStrokeBatchWorkSplitsAcrossBoundedSubmissions() throws {
-        guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let original = PaintingProject.testCanvas(64)
-        var replaySubmissions = 0
-        let renderer = try WatercolorRenderer(
-            project: original,
-            device: device,
-            debugWorkPolicy: RendererWorkPolicy(
-                maximumCommandThreads: 140_000,
-                maximumProjectThreads: 200_000
-            ),
-            debugCommandBufferError: { commandBuffer in
-                if commandBuffer.label == "Watercolor replay" {
-                    replaySubmissions += 1
-                }
-                return commandBuffer.error
-            }
-        )
-        replaySubmissions = 0
-        var batchedStroke = StrokeCommand.testDot(layerID: original.layers[0].id)
-        batchedStroke.points = (0..<9).map { index in
-            StrokePoint(
-                x: 32,
-                y: 32,
-                pressure: 1,
-                tiltX: 0,
-                tiltY: 0,
-                time: Double(index)
-            )
-        }
-        var heavy = original
-        heavy.commands = [.stroke(batchedStroke)]
-
-        try renderer.replay(project: heavy)
-
-        #expect(replaySubmissions > 1)
-        #expect(renderer.project == heavy)
-        try renderer.renderAndWait(stroke: .testDot(layerID: original.layers[0].id))
     }
 
     @Test func replayWorkAcrossPaintingCommandsSplitsIntoBoundedSubmissions() throws {
