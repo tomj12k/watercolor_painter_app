@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import SwiftUI
 import WatercolorCore
+import WatercolorEngine
 
 @main
 struct WatercolorStudioApp: App {
@@ -310,8 +311,21 @@ struct StudioDocumentView: View {
                         .font(.system(size: 26))
                     Text("Watercolor Studio could not open this painting")
                         .font(.system(size: 16, weight: .semibold, design: .serif))
-                    Text("The renderer is unavailable.")
+                    Text(host.failure?.message ?? "The renderer is unavailable.")
                         .foregroundStyle(StudioPalette.graphite)
+                    if let failure = host.failure {
+                        Text(failure.recoverySuggestion)
+                            .foregroundStyle(StudioPalette.graphite)
+                        HStack {
+                            Button("Try Again") {
+                                _ = host.retryRendererInitialization()
+                            }
+                            .keyboardShortcut(.defaultAction)
+                            Button("Copy Details") {
+                                host.copyDetails(for: failure)
+                            }
+                        }
+                    }
                 }
                 .foregroundStyle(StudioPalette.fiber)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -338,8 +352,14 @@ struct StudioDocumentView: View {
             } else {
                 Alert(
                     title: Text("Studio issue"),
-                    message: Text(failure.message),
-                    dismissButton: .default(Text("Dismiss")) { host.dismissFailure() }
+                    message: Text("\(failure.message)\n\n\(failure.recoverySuggestion)"),
+                    primaryButton: .default(Text("Copy Details")) {
+                        host.copyDetails(for: failure)
+                        host.dismissFailure()
+                    },
+                    secondaryButton: .cancel(Text("Dismiss")) {
+                        host.dismissFailure()
+                    }
                 )
             }
         }
@@ -347,6 +367,9 @@ struct StudioDocumentView: View {
             initialDocumentFlow.configurationSheetDidDismiss()
         }) {
             NewCanvasConfigurationView(
+                failure: host.model == nil ? nil : host.failure,
+                copyDetails: { failure in host.copyDetails(for: failure) },
+                dismissFailure: { host.dismissFailure() },
                 create: { configuration in
                     if host.configureNewDocument(configuration) {
                         initialDocumentFlow.configurationSucceeded()
@@ -374,7 +397,18 @@ struct StudioDocumentView: View {
 
     private var failureBinding: Binding<StudioFailure?> {
         Binding(
-            get: { initialDocumentFlow.initialSaveFailure ?? host.failure },
+            get: {
+                if let initialSaveFailure = initialDocumentFlow.initialSaveFailure {
+                    return initialSaveFailure
+                }
+                if initialDocumentFlow.presentsConfiguration, host.model != nil {
+                    return nil
+                }
+                if host.model == nil {
+                    return nil
+                }
+                return host.failure
+            },
             set: { value in
                 if value == nil {
                     if initialDocumentFlow.initialSaveFailure != nil {
@@ -394,26 +428,53 @@ final class StudioDocumentHost: ObservableObject {
         _ project: PaintingProject,
         _ onDocumentUpdate: @escaping (PaintingProject) -> Void
     ) throws -> StudioModel
+    typealias DiagnosticWriter = (String) -> Void
 
-    let model: StudioModel?
+    @Published private(set) var model: StudioModel?
     @Published private(set) var failure: StudioFailure?
     private var failureSubscription: AnyCancellable?
     private let document: Binding<PaintingDocument>
+    private let modelFactory: ModelFactory
+    private let diagnosticWriter: DiagnosticWriter
 
     init(
         document: Binding<PaintingDocument>,
-        modelFactory: ModelFactory = { project, onDocumentUpdate in
+        modelFactory: @escaping ModelFactory = { project, onDocumentUpdate in
             try StudioModel(project: project, onDocumentUpdate: onDocumentUpdate)
+        },
+        diagnosticWriter: @escaping DiagnosticWriter = { text in
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
         }
     ) {
         self.document = document
+        self.modelFactory = modelFactory
+        self.diagnosticWriter = diagnosticWriter
+        model = nil
+        failure = nil
         failureSubscription = nil
+        _ = initializeRenderer()
+    }
+
+    var canRetryRendererInitialization: Bool {
+        model == nil
+    }
+
+    @discardableResult
+    func retryRendererInitialization() -> Bool {
+        guard model == nil else { return false }
+        return initializeRenderer()
+    }
+
+    @discardableResult
+    private func initializeRenderer() -> Bool {
         do {
             let createdModel = try modelFactory(
                 document.wrappedValue.project,
                 { project in
-                    guard document.wrappedValue.project != project else { return }
-                    document.wrappedValue.project = project
+                    guard self.document.wrappedValue.project != project else { return }
+                    self.document.wrappedValue.project = project
                 }
             )
             model = createdModel
@@ -421,9 +482,15 @@ final class StudioDocumentHost: ObservableObject {
             failureSubscription = createdModel.$error.sink { [weak self] failure in
                 self?.failure = failure
             }
+            return true
         } catch {
             model = nil
-            failure = StudioFailure(message: error.localizedDescription)
+            failureSubscription = nil
+            failure = StudioFailure.rendererInitialization(
+                error: error,
+                project: document.wrappedValue.project
+            )
+            return false
         }
     }
 
@@ -438,7 +505,10 @@ final class StudioDocumentHost: ObservableObject {
             let project = try configuration.makeProject()
             guard let model, model.replaceProjectFromDocument(project) else {
                 if failure == nil {
-                    failure = StudioFailure(message: "The new canvas could not be allocated.")
+                    failure = StudioFailure(
+                        error: RendererError.allocation("new canvas"),
+                        project: document.wrappedValue.project
+                    )
                 }
                 return false
             }
@@ -449,7 +519,7 @@ final class StudioDocumentHost: ObservableObject {
             failure = nil
             return true
         } catch {
-            failure = StudioFailure(message: error.localizedDescription)
+            failure = StudioFailure(error: error, project: document.wrappedValue.project)
             return false
         }
     }
@@ -467,5 +537,9 @@ final class StudioDocumentHost: ObservableObject {
     func dismissFailure() {
         model?.dismissError()
         failure = nil
+    }
+
+    func copyDetails(for failure: StudioFailure) {
+        diagnosticWriter(failure.diagnostic.customerText)
     }
 }

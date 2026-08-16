@@ -87,7 +87,7 @@ import WatercolorCore
         #expect(!model.capabilities.canRedo)
         #expect(documentUpdates == [paintedProject])
         #expect(failedReplayCount == 2)
-        #expect(model.error?.message.contains("persistent undo replay failure") == true)
+        #expect(model.error?.code == .gpuExecution)
 
         shouldFailReplay = false
         model.undo()
@@ -255,7 +255,9 @@ import WatercolorCore
 
         #expect(try Data(contentsOf: destination) == original)
         #expect(model.project == project)
-        #expect(model.error?.message.contains("existing.png") == true)
+        #expect(model.error?.code == .export)
+        #expect(model.error?.recoverySuggestion.contains("writable location") == true)
+        #expect(model.error?.diagnostic.customerText.contains("existing.png") == false)
         #expect(model.error?.id != nil)
     }
 
@@ -327,7 +329,8 @@ import WatercolorCore
         await export.value
 
         #expect(model.error == laterFailure)
-        #expect(model.error?.message.contains(missingLayerID.uuidString) == true)
+        #expect(model.error?.message.contains(missingLayerID.uuidString) == false)
+        #expect(model.error?.message.contains("selected layer") == true)
     }
 
     @Test func olderExportFailureDoesNotOverwriteALaterActionFailure() async throws {
@@ -382,8 +385,9 @@ import WatercolorCore
         await older.value
 
         #expect(model.error == newestFailure)
-        #expect(model.error?.message.contains("newest-failure.png") == true)
-        #expect(model.error?.message.contains("newest export failure") == true)
+        #expect(model.error?.code == .export)
+        #expect(model.error?.diagnostic.customerText.contains("newest-failure.png") == false)
+        #expect(model.error?.diagnostic.customerText.contains("newest export failure") == false)
     }
 
     @Test func olderExportFailureDoesNotOverwriteTheNewestExportSuccess() async throws {

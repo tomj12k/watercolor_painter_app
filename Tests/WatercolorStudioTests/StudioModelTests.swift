@@ -6,6 +6,75 @@ import WatercolorCore
 @testable import WatercolorEngine
 @testable import WatercolorStudio
 
+@Suite struct StudioFailureTests {
+    @Test func resourceFailureExplainsRecoveryWithoutDocumentContent() {
+        let diagnostic = StudioDiagnostic(
+            appVersion: "1.2.3 (45)",
+            operatingSystem: "macOS Test",
+            gpuName: "Test GPU",
+            canvasWidth: 4_096,
+            canvasHeight: 2_048,
+            layerCount: 3,
+            commandCount: 9,
+            errorCode: StudioFailure.Code.resourceBudget.rawValue
+        )
+        let failure = StudioFailure.resourceBudget(
+            required: 3_000_000_000,
+            available: 1_000_000_000,
+            diagnostic: diagnostic
+        )
+
+        #expect(failure.code == .resourceBudget)
+        #expect(failure.message.contains("painting is unchanged"))
+        #expect(failure.recoverySuggestion.contains("Reduce the canvas size or layer count"))
+        #expect(failure.diagnostic.customerText.contains("Error code: WC-RESOURCE-001"))
+        #expect(failure.diagnostic.customerText.contains("Canvas: 4096 × 2048"))
+        #expect(!failure.diagnostic.customerText.contains("Secret Layer Name"))
+        #expect(!failure.diagnostic.customerText.contains("/Users/customer/Paintings"))
+        #expect(!failure.message.contains("3000000000"))
+        #expect(!failure.message.contains("1000000000"))
+    }
+
+    @Test func knownEngineAndDocumentFailuresHaveStableCustomerCategories() {
+        let project = PaintingProject.newDefault()
+
+        #expect(
+            StudioFailure(error: RendererError.workBudgetExceeded(required: 101, available: 100), project: project).code
+                == .workBudget
+        )
+        #expect(
+            StudioFailure(error: RendererError.metalUnavailable, project: project).code
+                == .metalUnavailable
+        )
+        #expect(
+            StudioFailure(error: DocumentCodecError.malformedData, project: project).code
+                == .malformedDocument
+        )
+        #expect(
+            StudioFailure(error: DocumentCodecError.unsupportedSchema(99), project: project).code
+                == .newerDocument
+        )
+    }
+
+    @Test func unknownFailureDoesNotExposeRawPathsOrIdentifiers() {
+        let raw = NSError(
+            domain: "SensitiveSubsystem",
+            code: 71,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "failed /Users/customer/Secret.watercolor layer 98A8D770-96B3-4E4C-987A-7915F093B583"
+            ]
+        )
+        let failure = StudioFailure(error: raw, project: PaintingProject.newDefault())
+
+        #expect(failure.code == .unknown)
+        #expect(!failure.message.contains("/Users/customer"))
+        #expect(!failure.message.contains("98A8D770"))
+        #expect(!failure.diagnostic.customerText.contains("/Users/customer"))
+        #expect(!failure.diagnostic.customerText.contains("98A8D770"))
+    }
+}
+
 @Suite @MainActor struct StudioModelTests {
     @Test func initialStateReflectsTheProjectAndStudioDefaults() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
@@ -184,7 +253,7 @@ import WatercolorCore
         #expect(model.project == project)
         #expect(model.rendererProject == project)
         #expect(try renderer.studioChecksum() == checksumBefore)
-        #expect(model.error?.message.contains("unsafe to render") == true)
+        #expect(model.error?.code == .malformedDocument)
     }
 
     @Test func previewCommitRechecksAggregatePointCapacityAfterAwaitingUpdates() async throws {
@@ -718,7 +787,7 @@ import WatercolorCore
         #expect(model.project.commands.isEmpty)
         #expect(model.rendererProject.commands.isEmpty)
         #expect(updates.isEmpty)
-        #expect(model.error?.message.contains("live preview failed") == true)
+        #expect(model.error?.code == .gpuExecution)
         #expect(try renderer.studioChecksum() == before)
     }
 
@@ -1105,7 +1174,7 @@ import WatercolorCore
         #expect(!model.isStrokePreviewActive)
         #expect(model.rendererRecoveryError == nil)
         #expect(model.capabilities.canPaint)
-        #expect(model.error?.message.contains("finish rejected before renderer commit") == true)
+        #expect(model.error?.code == .gpuExecution)
         #expect(try renderer.studioChecksum() == checksumBefore)
         #expect(
             renderer.debugSynchronousReplaySubmissionCount
@@ -1200,7 +1269,8 @@ import WatercolorCore
         await model.waitForStrokePreviewCancellation()
 
         #expect(!model.isStrokePreviewActive)
-        #expect(model.error?.message.contains("simulation threads") == true)
+        #expect(model.error?.code == .workBudget)
+        #expect(model.error?.recoverySuggestion.contains("smaller canvas") == true)
         #expect(previewSubmissions.count == 0)
         #expect(try renderer.studioChecksum() == checksumBefore)
 
@@ -1319,7 +1389,7 @@ import WatercolorCore
 
         #expect(model.project == project)
         #expect(documentUpdates.isEmpty)
-        #expect(model.error?.message.contains("deterministic GPU execution failure") == true)
+        #expect(model.error?.code == .gpuExecution)
         #expect(!model.capabilities.canUndo)
         #expect(try renderer.studioChecksum() == checksumBefore)
         #expect(try renderer.debugPixel(x: 64, y: 64).alpha == 0)
@@ -1424,7 +1494,8 @@ import WatercolorCore
 
         #expect(model.project == project)
         #expect(documentUpdateCount == 0)
-        #expect(model.error?.message.contains(missingLayerID.uuidString) == true)
+        #expect(model.error?.message.contains(missingLayerID.uuidString) == false)
+        #expect(model.error?.message.contains("selected layer") == true)
         #expect(!model.capabilities.canUndo)
     }
 
@@ -1703,7 +1774,7 @@ import WatercolorCore
         #expect(!model.capabilities.canUndo)
         #expect(try renderer.studioChecksum() == committedChecksum)
         #expect(failedMetadataCount == 1)
-        #expect(model.error?.message.contains("persistent opacity commit failure") == true)
+        #expect(model.error?.code == .gpuExecution)
     }
 
     @Test func changingLayerOpacityIgnoresANonfiniteValue() throws {
@@ -1900,7 +1971,7 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 128, y: 128, layerID: project.layers[0].id) == pigment)
         #expect(try renderer.debugWetness(x: 128, y: 128, layerID: project.layers[0].id) == wetness)
         #expect(model.canvasWetness == canvasWetness)
-        #expect(model.error?.message.contains("deterministic paper replay failure") == true)
+        #expect(model.error?.code == .gpuExecution)
         #expect(failedReplayCount == 1)
     }
 
@@ -2120,7 +2191,7 @@ import WatercolorCore
         #expect(model.selectedLayerID == project.layers[0].id)
         #expect(documentUpdates.isEmpty)
         #expect(!model.capabilities.canUndo)
-        #expect(model.error?.message.contains("deterministic structural replay failure") == true)
+        #expect(model.error?.code == .gpuExecution)
         #expect(failedReplayCount == 1)
     }
 

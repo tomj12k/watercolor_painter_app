@@ -20,12 +20,168 @@ public struct StudioCapabilities: Equatable, Sendable {
 }
 
 public struct StudioFailure: Identifiable, Equatable, Sendable {
+    public enum Code: String, Equatable, Sendable {
+        case resourceBudget = "WC-RESOURCE-001"
+        case workBudget = "WC-WORK-001"
+        case metalUnavailable = "WC-METAL-001"
+        case gpuExecution = "WC-GPU-001"
+        case malformedDocument = "WC-DOCUMENT-001"
+        case newerDocument = "WC-DOCUMENT-002"
+        case export = "WC-EXPORT-001"
+        case unknown = "WC-UNKNOWN-001"
+    }
+
     public let id: UUID
+    public let code: Code
     public let message: String
+    public let recoverySuggestion: String
+    public let diagnostic: StudioDiagnostic
 
     public init(id: UUID = UUID(), message: String) {
         self.id = id
+        code = .unknown
         self.message = message
+        recoverySuggestion = "Try the operation again. If it continues, copy the details for support."
+        diagnostic = .live(errorCode: Code.unknown.rawValue, project: nil)
+    }
+
+    public init(
+        id: UUID = UUID(),
+        code: Code,
+        message: String,
+        recoverySuggestion: String,
+        diagnostic: StudioDiagnostic
+    ) {
+        self.id = id
+        self.code = code
+        self.message = message
+        self.recoverySuggestion = recoverySuggestion
+        self.diagnostic = diagnostic
+    }
+
+    public init(error: Error, project: PaintingProject?) {
+        let code = Self.code(for: error)
+        let diagnostic = StudioDiagnostic.live(errorCode: code.rawValue, project: project)
+        self = Self.failure(for: error, code: code, diagnostic: diagnostic)
+    }
+
+    public static func resourceBudget(
+        required _: Int,
+        available _: Int,
+        diagnostic: StudioDiagnostic
+    ) -> Self {
+        Self(
+            code: .resourceBudget,
+            message: "This canvas is too large for safe rendering. Your painting is unchanged.",
+            recoverySuggestion: "Reduce the canvas size or layer count, then try again.",
+            diagnostic: diagnostic
+        )
+    }
+
+    public static func export(project: PaintingProject?) -> Self {
+        let code = Code.export
+        return Self(
+            code: code,
+            message: "Watercolor Studio could not export the image. Your painting is unchanged.",
+            recoverySuggestion: "Choose another writable location and try exporting again.",
+            diagnostic: .live(errorCode: code.rawValue, project: project)
+        )
+    }
+
+    public static func rendering(error: Error, project: PaintingProject?) -> Self {
+        let mappedCode = code(for: error)
+        let code = mappedCode == .unknown ? Code.gpuExecution : mappedCode
+        return failure(
+            for: error,
+            code: code,
+            diagnostic: .live(errorCode: code.rawValue, project: project)
+        )
+    }
+
+    public static func rendererInitialization(error: Error, project: PaintingProject?) -> Self {
+        let mappedCode = code(for: error)
+        let code = mappedCode == .unknown ? Code.metalUnavailable : mappedCode
+        return failure(
+            for: error,
+            code: code,
+            diagnostic: .live(errorCode: code.rawValue, project: project)
+        )
+    }
+
+    private static func code(for error: Error) -> Code {
+        if let rendererError = error as? RendererError {
+            switch rendererError {
+            case .resourceBudgetExceeded: return .resourceBudget
+            case .workBudgetExceeded: return .workBudget
+            case .metalUnavailable: return .metalUnavailable
+            case .invalidProject: return .malformedDocument
+            case .shaderCompilation, .allocation, .unknownLayer, .invalidStrokePreview,
+                 .strokePreviewRestoration, .invalidMetadataChange, .readback:
+                return .gpuExecution
+            }
+        }
+        if let codecError = error as? DocumentCodecError {
+            switch codecError {
+            case .malformedData, .validationFailed: return .malformedDocument
+            case .unsupportedSchema: return .newerDocument
+            }
+        }
+        return .unknown
+    }
+
+    private static func failure(
+        for error: Error,
+        code: Code,
+        diagnostic: StudioDiagnostic
+    ) -> Self {
+        switch code {
+        case .resourceBudget:
+            return resourceBudget(required: 0, available: 0, diagnostic: diagnostic)
+        case .workBudget:
+            return Self(
+                code: code,
+                message: "This painting needs more rendering work than Watercolor Studio can safely perform at once. Your painting is unchanged.",
+                recoverySuggestion: "Use a smaller canvas, shorter stroke, or fewer drying steps, then try again.",
+                diagnostic: diagnostic
+            )
+        case .metalUnavailable:
+            return Self(
+                code: code,
+                message: "Watercolor Studio could not start the watercolor renderer. Your painting is unchanged.",
+                recoverySuggestion: "Try again. If it continues, restart the app and check for macOS updates.",
+                diagnostic: diagnostic
+            )
+        case .gpuExecution:
+            return Self(
+                code: code,
+                message: "The watercolor renderer could not complete that change. Your painting is unchanged.",
+                recoverySuggestion: "Try the change again. If it continues, save and reopen the painting.",
+                diagnostic: diagnostic
+            )
+        case .malformedDocument:
+            return Self(
+                code: code,
+                message: "This file is not a valid Watercolor Studio painting and was not opened.",
+                recoverySuggestion: "Open a different copy or restore the file from a backup.",
+                diagnostic: diagnostic
+            )
+        case .newerDocument:
+            return Self(
+                code: code,
+                message: "This painting was created by a newer version of Watercolor Studio and was not opened.",
+                recoverySuggestion: "Update Watercolor Studio, then open the painting again.",
+                diagnostic: diagnostic
+            )
+        case .export:
+            return export(project: nil)
+        case .unknown:
+            return Self(
+                code: code,
+                message: "Watercolor Studio could not complete that operation. Your painting is unchanged.",
+                recoverySuggestion: "Try again. If it continues, copy the details for support.",
+                diagnostic: diagnostic
+            )
+        }
     }
 }
 
@@ -325,7 +481,7 @@ public final class StudioModel: ObservableObject {
             error = nil
             return .accepted
         } catch {
-            self.error = StudioFailure(message: error.localizedDescription)
+            self.error = StudioFailure.rendering(error: error, project: project)
             return .unavailable
         }
     }
@@ -367,7 +523,7 @@ public final class StudioModel: ObservableObject {
             error = nil
         } catch {
             guard isFinalizingStrokePreview(token), renderer === token.renderer else { return }
-            let failure = StudioFailure(message: error.localizedDescription)
+            let failure = StudioFailure.rendering(error: error, project: project)
             if case RendererError.strokePreviewRestoration = error {
                 invalidateStrokePreview(token)
                 enterRendererRecovery(error)
@@ -493,7 +649,7 @@ public final class StudioModel: ObservableObject {
         beginStrokePreviewCancellation(
             token: token,
             wasFinalizing: wasFinalizing,
-            failure: StudioFailure(message: previewError.localizedDescription)
+            failure: StudioFailure.rendering(error: previewError, project: project)
         )
         refreshCapabilities()
     }
@@ -546,7 +702,7 @@ public final class StudioModel: ObservableObject {
         guard canModifyProject, canAppendStroke(stroke) else { return }
         guard project.layers.contains(where: { $0.id == stroke.layerID }) else {
             error = StudioFailure(
-                message: StudioCoordinationError.strokeLayerUnavailable(stroke.layerID).localizedDescription
+                message: "The selected layer is no longer available. Choose another layer and try again."
             )
             return
         }
@@ -558,7 +714,7 @@ public final class StudioModel: ObservableObject {
             publishEditorProject()
             error = nil
         } catch {
-            let failure = StudioFailure(message: error.localizedDescription)
+            let failure = StudioFailure.rendering(error: error, project: project)
             do {
                 try renderer.replay(project: project)
                 self.error = failure
@@ -605,7 +761,7 @@ public final class StudioModel: ObservableObject {
             }
             return false
         } catch {
-            self.error = StudioFailure(message: error.localizedDescription)
+            self.error = StudioFailure.rendering(error: error, project: project)
             return false
         }
         return true
@@ -677,7 +833,7 @@ public final class StudioModel: ObservableObject {
         )
         rendererRecoveryError = recoveryError
         rendererCheckpoints.removeAll()
-        error = StudioFailure(message: recoveryError.localizedDescription)
+        error = StudioFailure.rendering(error: recoveryCause, project: project)
     }
 
     public func addLayer() {
@@ -790,7 +946,7 @@ public final class StudioModel: ObservableObject {
             layerOpacityPreviews[id] = clampedOpacity
             error = nil
         } catch {
-            self.error = StudioFailure(message: error.localizedDescription)
+            self.error = StudioFailure.rendering(error: error, project: project)
         }
     }
 
@@ -985,9 +1141,7 @@ public final class StudioModel: ObservableObject {
             guard latestPNGExportID == exportID,
                   self.error?.id == capturedFailureID
             else { return }
-            let failure = StudioFailure(
-                message: "Could not export PNG to \(destinationURL.lastPathComponent): \(error.localizedDescription)"
-            )
+            let failure = StudioFailure.export(project: project)
             self.error = failure
             currentPNGExportFailureID = failure.id
         }
@@ -1017,7 +1171,7 @@ public final class StudioModel: ObservableObject {
             error = nil
             return true
         } catch {
-            self.error = StudioFailure(message: error.localizedDescription)
+            self.error = StudioFailure.rendering(error: error, project: project)
             return false
         }
     }
@@ -1069,7 +1223,7 @@ public final class StudioModel: ObservableObject {
                 selectedLayerID: nextSelection
             )
         } catch {
-            self.error = StudioFailure(message: error.localizedDescription)
+            self.error = StudioFailure.rendering(error: error, project: project)
         }
     }
 
@@ -1101,7 +1255,7 @@ public final class StudioModel: ObservableObject {
             )
             return true
         } catch {
-            let failure = StudioFailure(message: error.localizedDescription)
+            let failure = StudioFailure.rendering(error: error, project: project)
             self.error = failure
             return false
         }
@@ -1137,7 +1291,7 @@ public final class StudioModel: ObservableObject {
             }
             return true
         } catch {
-            self.error = StudioFailure(message: error.localizedDescription)
+            self.error = StudioFailure.rendering(error: error, project: project)
             return false
         }
     }
@@ -1336,13 +1490,10 @@ private final class CanvasRendererDelegate: NSObject, MTKViewDelegate {
 }
 
 private enum StudioCoordinationError: LocalizedError {
-    case strokeLayerUnavailable(UUID)
     case pngEncoding
 
     var errorDescription: String? {
         switch self {
-        case let .strokeLayerUnavailable(identifier):
-            "Stroke layer \(identifier.uuidString) is not part of this project."
         case .pngEncoding:
             "Image I/O could not encode the composited canvas."
         }

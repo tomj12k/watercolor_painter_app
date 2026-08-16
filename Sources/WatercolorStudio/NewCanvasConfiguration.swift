@@ -78,6 +78,9 @@ struct NewCanvasConfiguration: Equatable, Sendable {
 }
 
 struct NewCanvasConfigurationView: View {
+    var failure: StudioFailure? = nil
+    var copyDetails: (StudioFailure) -> Void = { _ in }
+    var dismissFailure: () -> Void = {}
     let create: (NewCanvasConfiguration) -> Void
     let useDefault: () -> Void
 
@@ -144,6 +147,23 @@ struct NewCanvasConfigurationView: View {
                     .labelsHidden()
                     .gridCellColumns(2)
                 }
+            }
+
+            if let failure {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(failure.message, systemImage: "exclamationmark.triangle")
+                        .font(.callout.weight(.semibold))
+                    Text(failure.recoverySuggestion)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        Button("Copy Details") { copyDetails(failure) }
+                        Button("Dismiss", action: dismissFailure)
+                    }
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Canvas creation issue")
+                .accessibilityIdentifier("new-watercolor-failure")
             }
 
             HStack {

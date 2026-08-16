@@ -51,10 +51,77 @@ import WatercolorCore
         )
 
         #expect(host.model == nil)
-        #expect(host.failure?.message == "renderer initialization failed")
+        #expect(host.failure?.code == .metalUnavailable)
+        #expect(host.failure?.message.contains("renderer initialization failed") == false)
 
         host.dismissFailure()
         #expect(host.failure == nil)
+    }
+
+    @Test func rendererInitializationRetryPreservesThenAttachesTheOriginalDocumentExactlyOnce() throws {
+        let project = PaintingProject.studioHostTestProject(layerName: "Original")
+        let document = StudioDocumentBox(PaintingDocument(project: project))
+        let binding = Binding(
+            get: { document.value },
+            set: { document.value = $0 }
+        )
+        var attempts = 0
+        var successfulModels = 0
+        let host = StudioDocumentHost(
+            document: binding,
+            modelFactory: { project, update in
+                attempts += 1
+                if attempts == 1 {
+                    throw RendererError.metalUnavailable
+                }
+                successfulModels += 1
+                return try StudioModel(project: project, onDocumentUpdate: update)
+            }
+        )
+
+        #expect(host.model == nil)
+        #expect(host.failure?.code == .metalUnavailable)
+        #expect(host.canRetryRendererInitialization)
+        #expect(document.value.project == project)
+
+        #expect(host.retryRendererInitialization())
+        #expect(host.model?.project == project)
+        #expect(document.value.project == project)
+        #expect(host.failure == nil)
+        #expect(attempts == 2)
+        #expect(successfulModels == 1)
+
+        #expect(!host.retryRendererInitialization())
+        #expect(attempts == 2)
+        #expect(successfulModels == 1)
+    }
+
+    @Test func copyDetailsWritesOnlyThePrivacySafeDiagnosticText() {
+        let project = PaintingProject.studioHostTestProject(layerName: "Private Layer")
+        let document = StudioDocumentBox(PaintingDocument(project: project))
+        let binding = Binding(
+            get: { document.value },
+            set: { document.value = $0 }
+        )
+        var copiedText: String?
+        let host = StudioDocumentHost(
+            document: binding,
+            diagnosticWriter: { copiedText = $0 }
+        )
+        let failure = StudioFailure(
+            error: NSError(
+                domain: "Sensitive",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "/Users/customer/Secret.watercolor"]
+            ),
+            project: project
+        )
+
+        host.copyDetails(for: failure)
+
+        #expect(copiedText == failure.diagnostic.customerText)
+        #expect(copiedText?.contains("Private Layer") == false)
+        #expect(copiedText?.contains("/Users/customer") == false)
     }
 
     @Test func replacementReplayFailureFlowsThroughTheSameHostFailure() throws {
@@ -116,7 +183,60 @@ import WatercolorCore
         #expect(!configured)
         #expect(document.value.project == project)
         #expect(host.model?.project == project)
-        #expect(host.failure?.message.contains("canvas texture allocation failed") == true)
+        #expect(host.failure?.code == .gpuExecution)
+        #expect(host.failure?.message.contains("canvas texture allocation failed") == false)
+    }
+
+    @Test func retryingNewCanvasAfterResourceFailureReplacesTheDocumentExactlyOnce() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let original = PaintingProject.studioHostTestProject(layerName: "Original")
+        var initialDocument = PaintingDocument(project: original)
+        initialDocument.needsInitialConfiguration = true
+        let document = StudioDocumentBox(initialDocument)
+        var documentWrites = 0
+        let binding = Binding(
+            get: { document.value },
+            set: { (updatedDocument: PaintingDocument) in
+                documentWrites += 1
+                document.value = updatedDocument
+            }
+        )
+        let expected = NSError(
+            domain: "StudioDocumentHostTests",
+            code: 41,
+            userInfo: [NSLocalizedDescriptionKey: "private allocation detail"]
+        )
+        var shouldFail = false
+        let renderer = try WatercolorRenderer(
+            project: original,
+            device: device,
+            debugCommandBufferError: { commandBuffer in
+                shouldFail && commandBuffer.label == "Watercolor replay"
+                    ? expected
+                    : commandBuffer.error
+            }
+        )
+        let host = StudioDocumentHost(
+            document: binding,
+            modelFactory: { project, update in
+                StudioModel(project: project, renderer: renderer, onDocumentUpdate: update)
+            }
+        )
+        let configuration = NewCanvasConfiguration(width: 256, height: 320, paper: .handmade)
+
+        shouldFail = true
+        #expect(!host.configureNewDocument(configuration))
+        #expect(document.value.project == original)
+        #expect(document.value.needsInitialConfiguration)
+        #expect(documentWrites == 0)
+
+        shouldFail = false
+        #expect(host.configureNewDocument(configuration))
+        #expect(document.value.project.canvas == configuration.canvas)
+        #expect(document.value.project.paper == PaperTexture.handmade)
+        #expect(!document.value.needsInitialConfiguration)
+        #expect(documentWrites == 1)
+        #expect(host.failure == nil)
     }
 
     @Test func useDefaultCompletesInitialConfigurationOnlyWhenTheRendererIsAvailable() {
@@ -154,7 +274,8 @@ import WatercolorCore
 
         #expect(!configured)
         #expect(document.value.needsInitialConfiguration)
-        #expect(host.failure?.message == "default canvas allocation failed")
+        #expect(host.failure?.code == .metalUnavailable)
+        #expect(host.failure?.message.contains("default canvas allocation failed") == false)
     }
 
     @Test func resourceRejectionKeepsTheExistingDocumentAndRendererUsable() throws {
@@ -190,8 +311,9 @@ import WatercolorCore
         #expect(model.project == project)
         #expect(model.rendererIdentity == rendererIdentity)
         #expect(try renderer.hostChecksum() == checksumBefore)
+        #expect(host.failure?.code == .resourceBudget)
         #expect(
-            host.failure?.message.contains("Reduce the canvas size or layer count.") == true
+            host.failure?.recoverySuggestion.contains("Reduce the canvas size or layer count") == true
         )
 
         let stroke = StrokeCommand(
