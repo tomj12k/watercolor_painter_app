@@ -217,6 +217,207 @@ enum ShaderSource {
         }
     }
 
+    struct VersionOneProfile {
+        float coverage;
+        float pigment;
+        float water;
+    };
+
+    float2 normalizedBrushAxis(float4 orientation) {
+        float2 axis = orientation.xy;
+        if (!all(isfinite(axis)) || length_squared(axis) < 0.000001f) {
+            return float2(1.0f, 0.0f);
+        }
+        return normalize(axis);
+    }
+
+    VersionOneProfile versionOneHairProfile(
+        float coverage,
+        float2 normalized,
+        float4 orientation,
+        uint hair,
+        uint strokeSeed,
+        float strength
+    ) {
+        float clampedStrength = clamp(strength, 0.0f, 1.0f);
+        float shapedCoverage = coverage;
+        float pigment = 1.0f;
+        float water = 1.0f;
+        switch (hair) {
+            case 0:
+                shapedCoverage = pow(coverage, 0.84f);
+                pigment = 1.0f;
+                water = 1.0f;
+                break;
+            case 1:
+                shapedCoverage = pow(coverage, 0.52f) * 0.97f;
+                pigment = 0.68f;
+                water = 1.42f;
+                break;
+            case 2:
+                shapedCoverage = smoothstep(0.10f, 0.46f, coverage);
+                pigment = 1.28f;
+                water = 0.58f;
+                break;
+            case 3: {
+                float2 axis = normalizedBrushAxis(orientation);
+                float2 local = float2(
+                    dot(normalized, axis),
+                    dot(normalized, float2(-axis.y, axis.x))
+                );
+                float phase = (float(hashValue(strokeSeed ^ 0x81f16f39u)) / 4294967295.0f - 0.5f) * 0.12f;
+                float laneWave = 0.5f + 0.5f * cos((local.y + phase) * 5.0f * M_PI_F);
+                float lanes = smoothstep(0.46f, 0.74f, laneWave);
+                shapedCoverage = coverage * lanes;
+                pigment = 0.92f;
+                water = 0.34f;
+                break;
+            }
+            default:
+                shapedCoverage = pow(coverage, 0.10f) * 0.98f;
+                pigment = 0.58f * smoothstep(0.05f, 0.58f, coverage);
+                water = 1.95f;
+                break;
+        }
+        return VersionOneProfile {
+            mix(coverage, shapedCoverage, clampedStrength),
+            mix(1.0f, pigment, clampedStrength),
+            mix(1.0f, water, clampedStrength)
+        };
+    }
+
+    float stableMottle(uint2 position, uint strokeSeed) {
+        float phaseX = float(hashValue(strokeSeed ^ 0x3c6ef372u) & 0xffffu) / 65535.0f * M_PI_F * 2.0f;
+        float phaseY = float(hashValue(strokeSeed ^ 0xa54ff53au) & 0xffffu) / 65535.0f * M_PI_F * 2.0f;
+        float2 coordinate = float2(position);
+        float first = 0.5f + 0.5f * sin(coordinate.x * 0.105f + phaseX);
+        float second = 0.5f + 0.5f * sin(coordinate.y * 0.083f + coordinate.x * 0.027f + phaseY);
+        return mix(first, second, 0.45f);
+    }
+
+    float stableSaltCoverage(uint2 position, uint strokeSeed) {
+        constexpr float cellSize = 18.0f;
+        uint2 cell = uint2(floor(float2(position) / cellSize));
+        float activation = randomValue(cell, strokeSeed ^ 0x510e527fu);
+        if (activation > 0.55f) {
+            return 1.0f;
+        }
+        float2 centerOffset = float2(
+            randomValue(cell, strokeSeed ^ 0x9b05688cu),
+            randomValue(cell, strokeSeed ^ 0x1f83d9abu)
+        );
+        float2 center = (float2(cell) + 0.18f + centerOffset * 0.64f) * cellSize;
+        float distance = length(float2(position) + 0.5f - center);
+        float brightCenter = smoothstep(2.4f, 5.4f, distance);
+        float ring = 1.0f - smoothstep(0.0f, 1.6f, abs(distance - 5.4f));
+        return clamp(brightCenter * (0.78f + 0.52f * ring), 0.0f, 1.30f);
+    }
+
+    VersionOneProfile versionOneTextureProfile(
+        float coverage,
+        uint2 position,
+        uint paper,
+        uint texture,
+        uint strokeSeed,
+        float strength
+    ) {
+        float clampedStrength = clamp(strength, 0.0f, 1.0f);
+        float texturedCoverage = coverage;
+        float pigment = 1.0f;
+        float water = 1.0f;
+        switch (texture) {
+            case 0:
+                break;
+            case 1: {
+                float valley = paperNoise(position, paper, strokeSeed ^ 0x243f6a88u);
+                texturedCoverage = coverage * mix(0.30f, 1.24f, valley);
+                pigment = mix(0.72f, 1.32f, valley);
+                water = 0.92f;
+                break;
+            }
+            case 2: {
+                uint2 connectedCoordinate = position / 4u;
+                float skip = paperNoise(connectedCoordinate, paper, strokeSeed ^ 0x85a308d3u);
+                float interior = smoothstep(0.18f, 0.52f, coverage);
+                float skipCoverage = smoothstep(0.48f, 0.70f, skip);
+                texturedCoverage = coverage * mix(1.0f, skipCoverage, interior);
+                pigment = 0.94f;
+                water = 0.40f;
+                break;
+            }
+            case 3: {
+                float mottle = stableMottle(position, strokeSeed);
+                texturedCoverage = coverage * mix(0.28f, 1.18f, mottle);
+                pigment = mix(0.82f, 1.16f, mottle);
+                water = 0.88f;
+                break;
+            }
+            default:
+                texturedCoverage = coverage * mix(
+                    1.0f,
+                    stableSaltCoverage(position, strokeSeed),
+                    smoothstep(0.18f, 0.52f, coverage)
+                );
+                pigment = 0.90f;
+                water = 1.08f;
+                break;
+        }
+        return VersionOneProfile {
+            mix(coverage, texturedCoverage, clampedStrength),
+            mix(1.0f, pigment, clampedStrength),
+            mix(1.0f, water, clampedStrength)
+        };
+    }
+
+    VersionOneProfile versionOneStyleProfile(
+        float coverage,
+        uint2 position,
+        uint paper,
+        uint style,
+        uint strokeSeed
+    ) {
+        float styledCoverage = coverage;
+        float pigment = 1.0f;
+        float water = 1.0f;
+        switch (style) {
+            case 0:
+                styledCoverage = pow(coverage, 1.40f);
+                pigment = 0.82f;
+                water = 0.25f;
+                break;
+            case 1:
+                styledCoverage = pow(coverage, 0.55f);
+                pigment = 0.62f;
+                water = 1.92f;
+                break;
+            case 2: {
+                float skip = paperNoise(position / 4u, paper, strokeSeed ^ 0x13198a2eu);
+                float interior = smoothstep(0.18f, 0.52f, coverage);
+                styledCoverage = coverage * mix(
+                    1.0f,
+                    smoothstep(0.48f, 0.72f, skip),
+                    interior
+                );
+                pigment = 1.22f;
+                water = 0.14f;
+                break;
+            }
+            case 3:
+                styledCoverage = smoothstep(0.38f, 0.90f, coverage);
+                pigment = 0.32f;
+                water = 0.32f;
+                break;
+            default: {
+                float edgeBand = 4.0f * coverage * (1.0f - coverage);
+                styledCoverage = clamp(pow(coverage, 0.70f) * edgeBand * 2.50f, 0.0f, 1.0f);
+                pigment = 0.92f;
+                water = 1.72f;
+                break;
+            }
+        }
+        return VersionOneProfile { styledCoverage, pigment, water };
+    }
+
     kernel void stampKernel(
         texture2d_array<half, access::read_write> pigment [[texture(0)]],
         texture2d_array<half, access::read_write> wetness [[texture(1)]],
@@ -246,26 +447,70 @@ enum ShaderSource {
             return;
         }
 
-        float grain = paperNoise(position, parameters.extra.y, parameters.extra.w);
-        float detail = randomValue(position, parameters.extra.w ^ 0x6d2b79f5u);
-        coverage = hairCoverage(coverage, parameters.modes.z, detail);
-        coverage = textureCoverage(coverage, parameters.modes.w, grain, detail);
-        coverage *= mix(0.86f, 1.08f, grain);
-        float edgeBand = 4.0f * coverage * (1.0f - coverage);
-        coverage = clamp(
-            coverage + parameters.effects.y * edgeBand * 0.16f * mix(0.65f, 1.2f, grain),
-            0.0f,
-            1.0f
-        );
-
+        float grain;
         float stylePaint = 1.0f;
         float styleWater = 1.0f;
-        switch (parameters.extra.x) {
-            case 0: stylePaint = 0.78f; styleWater = 1.0f; break;
-            case 1: stylePaint = 0.72f; styleWater = 1.28f; break;
-            case 2: stylePaint = 1.18f; styleWater = 0.34f; break;
-            case 3: stylePaint = 0.62f; styleWater = 0.68f; break;
-            default: stylePaint = 0.88f; styleWater = 1.42f; break;
+        if (parameters.behavior.x == 0u) {
+            grain = paperNoise(position, parameters.extra.y, parameters.extra.w);
+            float detail = randomValue(position, parameters.extra.w ^ 0x6d2b79f5u);
+            coverage = hairCoverage(coverage, parameters.modes.z, detail);
+            coverage = textureCoverage(coverage, parameters.modes.w, grain, detail);
+            coverage *= mix(0.86f, 1.08f, grain);
+            float edgeBand = 4.0f * coverage * (1.0f - coverage);
+            coverage = clamp(
+                coverage + parameters.effects.y * edgeBand * 0.16f * mix(0.65f, 1.2f, grain),
+                0.0f,
+                1.0f
+            );
+            switch (parameters.extra.x) {
+                case 0: stylePaint = 0.78f; styleWater = 1.0f; break;
+                case 1: stylePaint = 0.72f; styleWater = 1.28f; break;
+                case 2: stylePaint = 1.18f; styleWater = 0.34f; break;
+                case 3: stylePaint = 0.62f; styleWater = 0.68f; break;
+                default: stylePaint = 0.88f; styleWater = 1.42f; break;
+            }
+        } else {
+            uint strokeSeed = parameters.behavior.y;
+            grain = paperNoise(position, parameters.extra.y, strokeSeed);
+            VersionOneProfile hair = versionOneHairProfile(
+                coverage,
+                normalized,
+                parameters.orientation,
+                parameters.modes.z,
+                strokeSeed,
+                parameters.dynamics.y
+            );
+            coverage = hair.coverage;
+            stylePaint *= hair.pigment;
+            styleWater *= hair.water;
+            VersionOneProfile texture = versionOneTextureProfile(
+                coverage,
+                position,
+                parameters.extra.y,
+                parameters.modes.w,
+                strokeSeed,
+                parameters.dynamics.z
+            );
+            coverage = texture.coverage;
+            stylePaint *= texture.pigment;
+            styleWater *= texture.water;
+            coverage *= mix(0.90f, 1.06f, grain);
+            float edgeBand = 4.0f * coverage * (1.0f - coverage);
+            coverage = clamp(
+                coverage + parameters.effects.y * edgeBand * 0.16f * mix(0.65f, 1.2f, grain),
+                0.0f,
+                1.0f
+            );
+            VersionOneProfile style = versionOneStyleProfile(
+                coverage,
+                position,
+                parameters.extra.y,
+                parameters.extra.x,
+                strokeSeed
+            );
+            coverage = style.coverage;
+            stylePaint *= style.pigment;
+            styleWater *= style.water;
         }
 
         float pressure = clamp(parameters.brush.x, 0.0f, 1.0f);

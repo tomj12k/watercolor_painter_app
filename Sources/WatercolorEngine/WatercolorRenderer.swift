@@ -2101,7 +2101,9 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                     UInt32(slice),
                     baseSeed ^ (UInt32(truncatingIfNeeded: index + pointIndexOffset) &* 0x9e3779b9)
                 ),
-                behavior: SIMD4(UInt32(stroke.brush.behaviorVersion), 0, 0, 0),
+                // The stroke-stable seed is deliberately separate from extra.w,
+                // whose absolute-point seed remains unchanged for replay parity.
+                behavior: SIMD4(UInt32(stroke.brush.behaviorVersion), baseSeed, 0, 0),
                 stampRect: SIMD4(UInt32(minX), UInt32(minY), UInt32(maxX - minX), UInt32(maxY - minY))
             )
             encoder.setBytes(&parameters, length: MemoryLayout<StampParameters>.stride, index: 0)

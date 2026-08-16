@@ -771,6 +771,13 @@ import WatercolorCore
         var stroke = StrokeCommand.testDot(layerID: project.layers[0].id)
         stroke.tool = tool
         stroke.brush.size = 4
+        if tool == .brush {
+            stroke.brush.behaviorVersion = 1
+            stroke.brush.hair = .bristle
+            stroke.brush.texture = .dry
+            stroke.brush.bristleStrength = 1
+            stroke.brush.textureStrength = 1
+        }
         stroke.points = (0..<configuredMaximumPointCount).map { index in
             let progress = Double(index) / Double(configuredMaximumPointCount - 1)
             return StrokePoint(
@@ -3065,6 +3072,7 @@ import WatercolorCore
             device: device
         )
 
+        #expect(first.checksum == 5_282_729_424_302_453_969)
         #expect(first.checksum == second.checksum)
         #expect(first.metrics == second.metrics)
     }
@@ -3172,6 +3180,312 @@ import WatercolorCore
         #expect(
             versionOneCoverage.ranges(of: "1.0f - smoothstep(-antialias, antialias").count == 2
         )
+    }
+
+    @Test func versionOneBristleLanesPersistAcrossAdjacentStampWindows() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let sample = try renderDynamicsSample(
+            hair: .bristle,
+            bristleStrength: 1,
+            points: dynamicsLinePoints(),
+            device: device
+        )
+        let correlation = adjacentCrossSectionCorrelation(
+            fields: sample.fields,
+            xCoordinates: [44, 56, 68, 80, 92, 104, 116],
+            yRange: 62...98
+        )
+
+        print("Bristle persistence characterization: \(phenotypeDiagnostics(sample.metrics)), correlation=\(correlation)")
+        #expect(sample.metrics.laneCount == 5)
+        #expect(sample.metrics.edgeRoughness > 2.2)
+        #expect(correlation >= 0.92)
+    }
+
+    @Test func versionOneBristleStrengthInterpolatesFromSolidToSeparatedHair() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let points = dynamicsLinePoints()
+        let solidBristle = try renderDynamicsSample(
+            hair: .bristle,
+            bristleStrength: 0,
+            points: points,
+            device: device
+        )
+        let solidSable = try renderDynamicsSample(
+            hair: .sable,
+            bristleStrength: 0,
+            points: points,
+            device: device
+        )
+        let separated = try renderDynamicsSample(
+            hair: .bristle,
+            bristleStrength: 1,
+            points: points,
+            device: device
+        )
+
+        #expect(solidBristle.metrics == solidSable.metrics)
+        #expect(solidBristle.fields == solidSable.fields)
+        #expect(separated.metrics.laneCount >= 3)
+        #expect(separated.metrics.edgeRoughness > solidBristle.metrics.edgeRoughness * 1.15)
+        #expect(separated.metrics.area < solidBristle.metrics.area * 0.90)
+
+        let smooth = try renderDynamicsSample(
+            hair: .bristle,
+            texture: .smooth,
+            bristleStrength: 1,
+            textureStrength: 1,
+            points: points,
+            device: device
+        )
+        let granulating = try renderDynamicsSample(
+            hair: .bristle,
+            texture: .granulating,
+            bristleStrength: 1,
+            textureStrength: 1,
+            points: points,
+            device: device
+        )
+        #expect(
+            pigmentCoefficientOfVariation(granulating.fields)
+                > pigmentCoefficientOfVariation(smooth.fields) * 1.05
+        )
+    }
+
+    @Test func textureStrengthZeroMatchesSmoothAndFullStrengthExposesEveryTexture() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let points = dynamicsLinePoints()
+        let smoothZero = try renderDynamicsSample(
+            texture: .smooth,
+            textureStrength: 0,
+            points: points,
+            device: device
+        )
+        for texture in BrushTexture.allCases where texture != .smooth {
+            let zero = try renderDynamicsSample(
+                texture: texture,
+                textureStrength: 0,
+                points: points,
+                device: device
+            )
+            #expect(zero.fields == smoothZero.fields, "\(texture.rawValue) did not interpolate to smooth")
+            #expect(zero.metrics == smoothZero.metrics, "\(texture.rawValue) changed semantic output at zero strength")
+        }
+
+        let smooth = try renderDynamicsSample(
+            texture: .smooth,
+            textureStrength: 1,
+            points: points,
+            device: device
+        )
+        let granulating = try renderDynamicsSample(
+            texture: .granulating,
+            textureStrength: 1,
+            points: points,
+            device: device
+        )
+        let dry = try renderDynamicsSample(
+            texture: .dry,
+            textureStrength: 1,
+            points: points,
+            device: device
+        )
+        let mottled = try renderDynamicsSample(
+            texture: .mottled,
+            textureStrength: 1,
+            points: points,
+            device: device
+        )
+        let salt = try renderDynamicsSample(
+            texture: .salt,
+            textureStrength: 1,
+            points: points,
+            device: device
+        )
+
+        print("Texture characterization smooth=\(phenotypeDiagnostics(smooth.metrics))")
+        print("Texture characterization granulating=\(phenotypeDiagnostics(granulating.metrics))")
+        print("Texture characterization dry=\(phenotypeDiagnostics(dry.metrics))")
+        print("Texture characterization mottled=\(phenotypeDiagnostics(mottled.metrics))")
+        print("Texture characterization salt=\(phenotypeDiagnostics(salt.metrics))")
+        #expect(pigmentCoefficientOfVariation(granulating.fields) > pigmentCoefficientOfVariation(smooth.fields) * 1.12)
+        #expect(dry.metrics.voidRatio > smooth.metrics.voidRatio + 0.02)
+        #expect(dry.metrics.wetnessMass < smooth.metrics.wetnessMass * 0.78)
+        #expect(pigmentCoefficientOfVariation(mottled.fields) > pigmentCoefficientOfVariation(smooth.fields) * 1.08)
+        #expect(salt.metrics.edgeRoughness > smooth.metrics.edgeRoughness * 1.12)
+        #expect(salt.metrics.voidRatio > smooth.metrics.voidRatio + 0.01)
+    }
+
+    @Test func versionOneHairFamiliesHavePairwiseArtistVisiblePhenotypes() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let points = dynamicsLinePoints()
+        let samples = try BrushHair.allCases.map { hair in
+            (
+                hair,
+                try renderDynamicsSample(
+                    hair: hair,
+                    bristleStrength: 1,
+                    points: points,
+                    device: device
+                )
+            )
+        }
+        for (hair, sample) in samples {
+            print("Hair characterization [\(hair.rawValue)]: \(phenotypeDiagnostics(sample.metrics))")
+        }
+        for firstIndex in samples.indices {
+            for secondIndex in samples.indices where secondIndex > firstIndex {
+                #expect(
+                    phenotypeDistance(samples[firstIndex].1.metrics, samples[secondIndex].1.metrics) > 0.075,
+                    "\(samples[firstIndex].0.rawValue) and \(samples[secondIndex].0.rawValue) remain too similar"
+                )
+            }
+        }
+
+        let squirrel = try #require(samples.first { $0.0 == .squirrel }?.1.metrics)
+        let synthetic = try #require(samples.first { $0.0 == .synthetic }?.1.metrics)
+        let bristle = try #require(samples.first { $0.0 == .bristle }?.1.metrics)
+        let mop = try #require(samples.first { $0.0 == .mop }?.1.metrics)
+        #expect(wetnessToPigmentRatio(squirrel) > wetnessToPigmentRatio(synthetic) * 1.35)
+        #expect(synthetic.pigmentMass > squirrel.pigmentMass * 1.12)
+        #expect(bristle.laneCount >= 3)
+        #expect(bristle.edgeRoughness > mop.edgeRoughness * 1.15)
+        #expect(wetnessToPigmentRatio(mop) > wetnessToPigmentRatio(bristle) * 1.8)
+        #expect(mop.area > synthetic.area * 1.005)
+        #expect(mop.edgeConcentration < synthetic.edgeConcentration)
+    }
+
+    @Test func versionOneTextureFieldDoesNotRegenerateForEveryPoint() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let repeatedPoints = (0..<9).map { index in
+            shapePoint(x: 80, y: 80, time: Double(index) / 60)
+        }
+        let salt = try renderDynamicsSample(
+            texture: .salt,
+            textureStrength: 1,
+            points: repeatedPoints,
+            device: device
+        )
+
+        print("Salt stability characterization: \(phenotypeDiagnostics(salt.metrics))")
+        #expect(salt.metrics.voidRatio >= 0.015)
+        #expect(salt.metrics.edgeRoughness >= 1.55)
+    }
+
+    @Test func versionOneStableFieldsRemainFiniteForTinyRotatedEdgeStampsOnEveryPaper() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        for paper in PaperTexture.allCases {
+            for texture in BrushTexture.allCases {
+                let project = PaintingProject.testCanvas(64, paper: paper)
+                var brush = BrushSettings.default
+                brush.shape = .flat
+                brush.hair = .bristle
+                brush.texture = texture
+                brush.style = .bloom
+                brush.size = 1
+                brush.rotation = 137
+                brush.bristleStrength = 1
+                brush.textureStrength = 1
+                let stroke = StrokeCommand(
+                    id: UUID(uuidString: "5B25AD1E-DAA5-45E2-A886-9F62BA545927")!,
+                    layerID: project.layers[0].id,
+                    tool: .brush,
+                    brush: brush,
+                    points: [
+                        shapePoint(x: 0.25, y: 0.25, tiltX: 0.4, tiltY: 0.7),
+                        shapePoint(x: 0.25, y: 0.25, tiltX: 0.4, tiltY: 0.7, time: 0.1)
+                    ]
+                )
+                let renderer = try WatercolorRenderer(project: project, device: device)
+                try renderer.renderAndWait(stroke: stroke)
+                let fields = try renderer.debugLayerFields(layerID: project.layers[0].id)
+
+                #expect(fields.pigment.allSatisfy {
+                    $0.x.isFinite && $0.y.isFinite && $0.z.isFinite && $0.w.isFinite
+                }, "\(paper.rawValue)/\(texture.rawValue) produced non-finite pigment")
+                #expect(fields.wetness.allSatisfy { $0.isFinite }, "\(paper.rawValue)/\(texture.rawValue) produced non-finite wetness")
+            }
+        }
+    }
+
+    @Test func versionOneStylesOrderDepositionWetnessSpreadVoidsAndEdges() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        // Repeated dot stamps give spread meaningful weight; on a long line the
+        // path length dominates the RMS radius and hides diffusion differences.
+        let points = (0..<3).map { index in
+            shapePoint(x: 80, y: 80, time: Double(index) / 60)
+        }
+        let samples = try WatercolorStyle.allCases.map { style in
+            (
+                style,
+                try renderDynamicsSample(
+                    style: style,
+                    points: points,
+                    device: device
+                ).metrics
+            )
+        }
+        for (style, metrics) in samples {
+            print("Style characterization [\(style.rawValue)]: \(phenotypeDiagnostics(metrics))")
+        }
+        let wash = try #require(samples.first { $0.0 == .transparentWash }?.1)
+        let wet = try #require(samples.first { $0.0 == .wetOnWet }?.1)
+        let dry = try #require(samples.first { $0.0 == .dryBrush }?.1)
+        let glaze = try #require(samples.first { $0.0 == .glazing }?.1)
+        let bloom = try #require(samples.first { $0.0 == .bloom }?.1)
+
+        #expect(wet.wetnessMass > wash.wetnessMass * 1.22)
+        #expect(wet.spreadRadius > glaze.spreadRadius * 1.04)
+        #expect(dry.voidRatio > wash.voidRatio + 0.015)
+        #expect(dry.wetnessMass < glaze.wetnessMass * 0.72)
+        #expect(glaze.pigmentMass < wash.pigmentMass * 0.78)
+        #expect(bloom.edgeConcentration > wash.edgeConcentration * 1.08)
+        #expect(bloom.spreadRadius > wash.spreadRadius * 1.02)
+    }
+
+    @Test func versionOneStableFieldsMatchPreviewFreshReplayAndReopenAcrossBoundary() async throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let project = PaintingProject.testCanvas(256, paper: .rough)
+        let complete = dynamicsStroke(
+            layerID: project.layers[0].id,
+            hair: .bristle,
+            texture: .salt,
+            style: .bloom,
+            bristleStrength: 1,
+            textureStrength: 1,
+            rotation: 31,
+            points: dynamicsLinePoints()
+        )
+        var initial = complete
+        initial.points = [complete.points[0]]
+        let preview = try WatercolorRenderer(project: project, device: device)
+        let token = try preview.beginStrokePreview(initial)
+        try await preview.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points[1...8]),
+            token: token
+        )
+        try await preview.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points[9...]),
+            token: token
+        )
+        try await preview.finishStrokePreview(complete, token: token)
+
+        var replayProject = project
+        replayProject.commands = [.stroke(complete)]
+        let fresh = try WatercolorRenderer(project: replayProject, device: device)
+        let reopenedProject = try PaintingDocumentCodec.decode(PaintingDocumentCodec.encode(replayProject))
+        let reopened = try WatercolorRenderer(project: reopenedProject, device: device)
+        let previewFields = try preview.debugLayerFields(layerID: project.layers[0].id)
+        let freshFields = try fresh.debugLayerFields(layerID: project.layers[0].id)
+        let reopenedFields = try reopened.debugLayerFields(layerID: project.layers[0].id)
+
+        #expect(previewFields == freshFields)
+        #expect(previewFields == reopenedFields)
+        #expect(BrushPhenotypeMetrics.measure(previewFields) == BrushPhenotypeMetrics.measure(freshFields))
+        #expect(try preview.compositeChecksum() == fresh.compositeChecksum())
+        #expect(try preview.compositeChecksum() == reopened.compositeChecksum())
     }
 
     @Test func layerVisibilityOpacityAndOrderAffectComposite() throws {
@@ -3549,6 +3863,7 @@ import WatercolorCore
         let expectedChecksum = try expectedRenderer.compositeChecksum()
         let migratedRenderer = try WatercolorRenderer(project: migrated, device: device)
 
+        #expect(expectedChecksum == 16_775_380_187_958_906_391)
         #expect(migrated == expected)
         #expect(try migratedRenderer.compositeChecksum() == expectedChecksum)
 
@@ -4037,6 +4352,131 @@ import WatercolorCore
         )
     }
 
+    private func dynamicsLinePoints() -> [StrokePoint] {
+        (0..<9).map { index in
+            shapePoint(
+                x: Double(32 + index * 12),
+                y: 80,
+                time: Double(index) / 60
+            )
+        }
+    }
+
+    private func dynamicsStroke(
+        layerID: UUID,
+        hair: BrushHair = .sable,
+        texture: BrushTexture = .smooth,
+        style: WatercolorStyle = .transparentWash,
+        bristleStrength: Double = 1,
+        textureStrength: Double = 1,
+        rotation: Double = 0,
+        points: [StrokePoint]
+    ) -> StrokeCommand {
+        var brush = BrushSettings.default
+        brush.shape = .round
+        brush.hair = hair
+        brush.texture = texture
+        brush.style = style
+        brush.color = PaintColor(red: 0.72, green: 0.18, blue: 0.08, alpha: 1)
+        brush.size = 30
+        brush.opacity = 0.82
+        brush.flow = 0.78
+        brush.water = 0.72
+        brush.granulation = 0
+        brush.edgeBloom = 0
+        brush.behaviorVersion = 1
+        brush.rotation = rotation
+        brush.bristleStrength = bristleStrength
+        brush.textureStrength = textureStrength
+        return StrokeCommand(
+            id: UUID(uuidString: "BA40A46D-6605-46F6-8341-A75978E4FF50")!,
+            layerID: layerID,
+            tool: .brush,
+            brush: brush,
+            points: points
+        )
+    }
+
+    private func renderDynamicsSample(
+        hair: BrushHair = .sable,
+        texture: BrushTexture = .smooth,
+        style: WatercolorStyle = .transparentWash,
+        bristleStrength: Double = 1,
+        textureStrength: Double = 1,
+        points: [StrokePoint],
+        device: MTLDevice
+    ) throws -> DynamicsRenderSample {
+        let project = PaintingProject.testCanvas(160, paper: .rough)
+        let stroke = dynamicsStroke(
+            layerID: project.layers[0].id,
+            hair: hair,
+            texture: texture,
+            style: style,
+            bristleStrength: bristleStrength,
+            textureStrength: textureStrength,
+            points: points
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        try renderer.renderAndWait(stroke: stroke)
+        let fields = try renderer.debugLayerFields(layerID: project.layers[0].id)
+        return DynamicsRenderSample(
+            checksum: try renderer.compositeChecksum(),
+            metrics: BrushPhenotypeMetrics.measure(fields),
+            fields: fields
+        )
+    }
+
+    private func adjacentCrossSectionCorrelation(
+        fields: RendererDebugLayerFields,
+        xCoordinates: [Int],
+        yRange: ClosedRange<Int>
+    ) -> Double {
+        let sections = xCoordinates.map { x in
+            yRange.map { y in
+                fields.pigment[y * fields.width + x].w >= Float(1.0 / 256.0)
+            }
+        }
+        guard sections.count > 1 else { return 1 }
+        let agreements = zip(sections, sections.dropFirst()).map { first, second in
+            let occupied = zip(first, second).filter { $0.0 || $0.1 }
+            guard !occupied.isEmpty else { return 1.0 }
+            return Double(occupied.filter { $0.0 && $0.1 }.count) / Double(occupied.count)
+        }
+        return agreements.reduce(0, +) / Double(agreements.count)
+    }
+
+    private func pigmentCoefficientOfVariation(_ fields: RendererDebugLayerFields) -> Double {
+        let values = fields.pigment.map { Double($0.w) }.filter { $0 >= 1.0 / 256.0 }
+        guard !values.isEmpty else { return 0 }
+        let mean = values.reduce(0, +) / Double(values.count)
+        guard mean > 0 else { return 0 }
+        let variance = values.reduce(0) { partial, value in
+            partial + (value - mean) * (value - mean)
+        } / Double(values.count)
+        return sqrt(variance) / mean
+    }
+
+    private func wetnessToPigmentRatio(_ metrics: BrushPhenotypeMetrics) -> Double {
+        metrics.wetnessMass / max(metrics.pigmentMass, 0.000_001)
+    }
+
+    private func phenotypeDistance(
+        _ lhs: BrushPhenotypeMetrics,
+        _ rhs: BrushPhenotypeMetrics
+    ) -> Double {
+        let pairs = [
+            (lhs.area, rhs.area),
+            (lhs.edgeRoughness, rhs.edgeRoughness),
+            (lhs.voidRatio + 0.05, rhs.voidRatio + 0.05),
+            (lhs.pigmentMass, rhs.pigmentMass),
+            (lhs.wetnessMass, rhs.wetnessMass),
+            (lhs.edgeConcentration, rhs.edgeConcentration)
+        ]
+        return pairs.map { first, second in
+            abs(first - second) / max(abs(first), abs(second), 0.000_001)
+        }.reduce(0, +) / Double(pairs.count)
+    }
+
     private func orientationDistance(_ lhs: Double, _ rhs: Double) -> Double {
         abs(atan2(sin(2 * (lhs - rhs)), cos(2 * (lhs - rhs)))) / 2
     }
@@ -4133,6 +4573,12 @@ private struct CanonicalPhenotypeFixture {
 }
 
 private struct ShapeRenderSample {
+    let checksum: UInt64
+    let metrics: BrushPhenotypeMetrics
+    let fields: RendererDebugLayerFields
+}
+
+private struct DynamicsRenderSample {
     let checksum: UInt64
     let metrics: BrushPhenotypeMetrics
     let fields: RendererDebugLayerFields
