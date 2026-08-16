@@ -84,6 +84,30 @@ run_distribution() {
         "${fixture_repository}/scripts/package_distribution.sh"
 }
 
+install_publication_failure_mv() {
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -euo pipefail' \
+        'destination_path="${2:-}"' \
+        'if [[ "${destination_path}" == *"/Failed Watercolor Studio.app" && "${FAIL_QUARANTINE:-}" == "1" ]]; then exit 74; fi' \
+        'if [[ "${destination_path}" == "${TEST_FINAL_BUNDLE}" ]]; then' \
+        '  count_file="${COMMAND_LOG}.publication-count"' \
+        '  publication_count=0' \
+        '  if [[ -f "${count_file}" ]]; then publication_count="$(cat "${count_file}")"; fi' \
+        '  publication_count=$((publication_count + 1))' \
+        '  printf "%s\n" "${publication_count}" > "${count_file}"' \
+        '  if [[ "${publication_count}" -eq 1 ]]; then' \
+        '    mkdir -p "${destination_path}/Contents"' \
+        '    printf "incomplete replacement\n" > "${destination_path}/Contents/INCOMPLETE"' \
+        '    exit 72' \
+        '  fi' \
+        '  if [[ "${FAIL_RESTORE:-}" == "1" ]]; then exit 73; fi' \
+        'fi' \
+        'exec /bin/mv "$@"' \
+        > "${fixture_bin}/mv"
+    chmod +x "${fixture_bin}/mv"
+}
+
 make_fixture "missing-credentials"
 if env \
     -u DEVELOPER_ID_APPLICATION \
@@ -136,21 +160,7 @@ published_entries="$(find "${fixture_repository}/.build/distribution" -mindepth 
 make_fixture "failed-publication-restores-existing"
 mkdir -p "${fixture_final}/Contents"
 printf 'known-good-distribution\n' > "${fixture_final}/Contents/SENTINEL"
-printf '%s\n' \
-    '#!/usr/bin/env bash' \
-    'set -euo pipefail' \
-    'destination_path="${2:-}"' \
-    'if [[ "${destination_path}" == "${TEST_FINAL_BUNDLE}" ]]; then' \
-    '  count_file="${COMMAND_LOG}.publication-count"' \
-    '  publication_count=0' \
-    '  if [[ -f "${count_file}" ]]; then publication_count="$(cat "${count_file}")"; fi' \
-    '  publication_count=$((publication_count + 1))' \
-    '  printf "%s\n" "${publication_count}" > "${count_file}"' \
-    '  if [[ "${publication_count}" -eq 1 ]]; then exit 72; fi' \
-    'fi' \
-    'exec /bin/mv "$@"' \
-    > "${fixture_bin}/mv"
-chmod +x "${fixture_bin}/mv"
+install_publication_failure_mv
 if run_distribution \
     DEVELOPER_ID_APPLICATION="Developer ID Application: Watercolor Test (ABCDE12345)" \
     NOTARYTOOL_PROFILE="watercolor-test-profile" \
@@ -187,6 +197,59 @@ fi
 published_entries="$(find "${fixture_repository}/.build/distribution" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')"
 if [[ "${published_entries}" != "1" ]]; then
     echo "Successful replacement left publication residue" >&2
+    exit 1
+fi
+
+make_fixture "failed-quarantine-preserves-backup"
+mkdir -p "${fixture_final}/Contents"
+printf 'known-good-distribution\n' > "${fixture_final}/Contents/SENTINEL"
+install_publication_failure_mv
+if run_distribution \
+    DEVELOPER_ID_APPLICATION="Developer ID Application: Watercolor Test (ABCDE12345)" \
+    NOTARYTOOL_PROFILE="watercolor-test-profile" \
+    ALLOW_EXISTING_FINAL="1" \
+    FAIL_QUARANTINE="1";
+then
+    echo "Distribution unexpectedly survived failed quarantine" >&2
+    exit 1
+fi
+if [[ ! -f "${fixture_final}/Contents/INCOMPLETE" ]]; then
+    echo "Quarantine failure did not retain the incomplete output for diagnosis" >&2
+    exit 1
+fi
+if find "${fixture_final}" -type d -name 'Previous Watercolor Studio.app' -print -quit | grep -q .; then
+    echo "Known-good distribution was nested inside the damaged replacement" >&2
+    exit 1
+fi
+backup_sentinel="$(find "${fixture_repository}/.build/distribution" -path '*/Previous Watercolor Studio.app/Contents/SENTINEL' -print -quit)"
+if [[ -z "${backup_sentinel}" ]] || [[ "$(cat "${backup_sentinel}")" != "known-good-distribution" ]]; then
+    echo "Quarantine failure did not preserve the known-good backup" >&2
+    exit 1
+fi
+
+make_fixture "failed-restore-preserves-backup"
+mkdir -p "${fixture_final}/Contents"
+printf 'known-good-distribution\n' > "${fixture_final}/Contents/SENTINEL"
+install_publication_failure_mv
+if run_distribution \
+    DEVELOPER_ID_APPLICATION="Developer ID Application: Watercolor Test (ABCDE12345)" \
+    NOTARYTOOL_PROFILE="watercolor-test-profile" \
+    ALLOW_EXISTING_FINAL="1" \
+    FAIL_RESTORE="1";
+then
+    echo "Distribution unexpectedly survived failed restoration" >&2
+    exit 1
+fi
+if [[ -e "${fixture_final}" ]]; then
+    echo "Failed restoration left an incomplete bundle at the final path" >&2
+    exit 1
+fi
+backup_sentinel="$(find "${fixture_repository}/.build/distribution" -path '*/Previous Watercolor Studio.app/Contents/SENTINEL' -print -quit)"
+failed_marker="$(find "${fixture_repository}/.build/distribution" -path '*/Failed Watercolor Studio.app/Contents/INCOMPLETE' -print -quit)"
+if [[ -z "${backup_sentinel}" ]] || [[ "$(cat "${backup_sentinel}")" != "known-good-distribution" ]] || \
+   [[ -z "${failed_marker}" ]];
+then
+    echo "Failed restoration did not preserve both recoverable bundles" >&2
     exit 1
 fi
 

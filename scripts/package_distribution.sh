@@ -25,6 +25,7 @@ distribution_directory="${repository_root}/.build/distribution"
 final_application="${distribution_directory}/Watercolor Studio.app"
 working_directory=""
 previous_application=""
+failed_application=""
 publication_started=false
 publication_complete=false
 had_previous_application=false
@@ -36,18 +37,31 @@ cleanup() {
     set +e
 
     if [[ "${publication_started}" == true && "${publication_complete}" != true ]]; then
-        if [[ "${had_previous_application}" == true ]]; then
-            if [[ -e "${previous_application}" ]]; then
-                if [[ -e "${final_application}" ]]; then
-                    rm -rf "${final_application}"
+        if [[ "${had_previous_application}" == true && ! -e "${previous_application}" ]]; then
+            if [[ ! -e "${final_application}" ]]; then
+                echo "The previous verified distribution could not be located after publication failed." >&2
+                restoration_failed=true
+            fi
+        else
+            if [[ -e "${final_application}" ]]; then
+                if ! mv "${final_application}" "${failed_application}" || \
+                   [[ -e "${final_application}" ]] || \
+                   [[ ! -e "${failed_application}" ]];
+                then
+                    echo "Failed to quarantine the incomplete distribution at: ${final_application}" >&2
+                    restoration_failed=true
                 fi
-                if ! mv "${previous_application}" "${final_application}"; then
+            fi
+
+            if [[ "${had_previous_application}" == true && "${restoration_failed}" != true ]]; then
+                if ! mv "${previous_application}" "${final_application}" || \
+                   [[ ! -e "${final_application}" ]] || \
+                   [[ -e "${previous_application}" ]];
+                then
                     echo "Failed to restore the previous verified distribution at: ${previous_application}" >&2
                     restoration_failed=true
                 fi
             fi
-        elif [[ -e "${final_application}" ]]; then
-            rm -rf "${final_application}"
         fi
     fi
 
@@ -100,6 +114,7 @@ codesign --verify --deep --strict --verbose=2 "${staged_application}"
 spctl --assess --type execute --verbose=4 "${staged_application}"
 
 previous_application="${working_directory}/Previous Watercolor Studio.app"
+failed_application="${working_directory}/Failed Watercolor Studio.app"
 if [[ -e "${final_application}" ]]; then
     had_previous_application=true
     publication_started=true
