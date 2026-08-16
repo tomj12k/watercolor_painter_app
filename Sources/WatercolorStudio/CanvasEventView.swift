@@ -6,11 +6,29 @@ import WatercolorCore
 enum StrokeExhaustionReason: Equatable, Sendable {
     case pointCapacity(maximumPointCount: Int)
 
+    /// Notice for a stroke whose paint was committed up to the limit.
     var message: String {
         switch self {
         case let .pointCapacity(maximumPointCount):
-            "This stroke reached its \(maximumPointCount)-point limit, so Watercolor Studio ended and saved it there. Start a new stroke to keep painting."
+            "This stroke reached its \(maximumPointCount)-point limit, so Watercolor Studio ended and saved it there."
         }
+    }
+
+    var recoverySuggestion: String {
+        "Start a new stroke to keep painting."
+    }
+
+    /// Notice for a stroke whose preview had to be discarded instead of
+    /// committed, so it must not claim the paint was saved.
+    var cancellationMessage: String {
+        switch self {
+        case let .pointCapacity(maximumPointCount):
+            "This stroke reached its \(maximumPointCount)-point limit and could not be kept."
+        }
+    }
+
+    var cancellationRecoverySuggestion: String {
+        "Use a shorter stroke or a larger brush for wider spacing."
     }
 }
 

@@ -56,6 +56,99 @@ import WatercolorCore
         )
     }
 
+    @Test @MainActor func capacityLimitsCarryTheCapacityCategoryAndAccurateRecovery() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let maximumCommandCount = 2
+        var project = PaintingProject.studioTestProject()
+        project.commands = (0..<maximumCommandCount).map { _ in
+            .clearLayer(LayerCommand(layerID: UUID()))
+        }
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugProjectAdmissionLimits: ProjectAdmissionLimits(
+                maximumCommandCount: maximumCommandCount,
+                maximumTotalStrokePointCount: 128,
+                maximumSerializedStorageBytes: 1_048_576
+            ),
+            debugCommandBufferError: { $0.error }
+        )
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            maximumCommandCount: maximumCommandCount,
+            maximumTotalStrokePointCount: 128,
+            maximumSerializedStorageBytes: 1_048_576
+        )
+
+        model.completeStroke(.studioTestStroke(layerID: project.layers[0].id))
+
+        let failure = try #require(model.error)
+        #expect(failure.message.contains("command capacity"))
+        #expect(failure.code.rawValue == "WC-CAPACITY-001")
+        #expect(!failure.recoverySuggestion.contains("Try the operation again"))
+        #expect(failure.recoverySuggestion.contains("Undo"))
+        #expect(failure.diagnostic.errorCode == "WC-CAPACITY-001")
+        #expect(failure.diagnostic.canvasWidth == project.canvas.width)
+        #expect(failure.diagnostic.commandCount == project.commands.count)
+
+        let storageProject = PaintingProject.studioTestProject()
+        let storageModel = StudioModel(
+            project: storageProject,
+            renderer: try WatercolorRenderer(project: storageProject, device: device),
+            maximumSerializedStorageBytes: 6_000
+        )
+        storageModel.completeStroke(.studioTestStroke(layerID: storageProject.layers[0].id))
+        let storageFailure = try #require(storageModel.error)
+        #expect(storageFailure.message.contains("document storage capacity"))
+        #expect(storageFailure.code.rawValue == "WC-CAPACITY-001")
+        #expect(!storageFailure.recoverySuggestion.contains("Try the operation again"))
+
+        let pointProject = PaintingProject.studioPointCapacityProject(pointCount: 3)
+        let pointModel = StudioModel(
+            project: pointProject,
+            renderer: try WatercolorRenderer(
+                project: pointProject,
+                device: device,
+                debugProjectAdmissionLimits: ProjectAdmissionLimits(
+                    maximumCommandCount: 8,
+                    maximumTotalStrokePointCount: 4,
+                    maximumSerializedStorageBytes: 1_048_576
+                ),
+                debugCommandBufferError: { $0.error }
+            ),
+            maximumCommandCount: 8,
+            maximumTotalStrokePointCount: 4,
+            maximumSerializedStorageBytes: 1_048_576
+        )
+        var pointStroke = StrokeCommand.studioTestStroke(layerID: pointProject.layers[0].id)
+        pointStroke.points.append(
+            StrokePoint(x: 129, y: 128, pressure: 1, tiltX: 0, tiltY: 0, time: 1)
+        )
+        pointModel.completeStroke(pointStroke)
+        let pointFailure = try #require(pointModel.error)
+        #expect(pointFailure.message.contains("point capacity"))
+        #expect(pointFailure.code.rawValue == "WC-CAPACITY-001")
+        #expect(!pointFailure.recoverySuggestion.contains("Try the operation again"))
+    }
+
+    @Test @MainActor func strokeExhaustionNoticeUsesTheCapacityCategoryWithItsOwnRecovery() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device)
+        )
+
+        model.noteStrokeExhaustion(.pointCapacity(maximumPointCount: 12))
+
+        let failure = try #require(model.error)
+        #expect(failure.message == "This stroke reached its 12-point limit, so Watercolor Studio ended and saved it there.")
+        #expect(failure.recoverySuggestion == "Start a new stroke to keep painting.")
+        #expect(failure.code.rawValue == "WC-CAPACITY-001")
+        #expect(failure.diagnostic.canvasWidth == project.canvas.width)
+    }
+
     @Test func unknownFailureDoesNotExposeRawPathsOrIdentifiers() {
         let raw = NSError(
             domain: "SensitiveSubsystem",

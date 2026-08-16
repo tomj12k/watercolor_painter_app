@@ -23,6 +23,7 @@ public struct StudioFailure: Identifiable, Equatable, Sendable {
     public enum Code: String, Equatable, Sendable {
         case resourceBudget = "WC-RESOURCE-001"
         case workBudget = "WC-WORK-001"
+        case capacity = "WC-CAPACITY-001"
         case metalUnavailable = "WC-METAL-001"
         case gpuExecution = "WC-GPU-001"
         case malformedDocument = "WC-DOCUMENT-001"
@@ -63,6 +64,22 @@ public struct StudioFailure: Identifiable, Equatable, Sendable {
         let code = Self.code(for: error)
         let diagnostic = StudioDiagnostic.live(errorCode: code.rawValue, project: project)
         self = Self.failure(for: error, code: code, diagnostic: diagnostic)
+    }
+
+    /// A deliberate document limit was reached. Unlike unknown failures, the
+    /// operation will keep failing on retry, so the recovery guidance must
+    /// name the action that actually frees capacity.
+    public static func capacity(
+        message: String,
+        recoverySuggestion: String,
+        project: PaintingProject?
+    ) -> Self {
+        Self(
+            code: .capacity,
+            message: message,
+            recoverySuggestion: recoverySuggestion,
+            diagnostic: .live(errorCode: Code.capacity.rawValue, project: project)
+        )
     }
 
     public static func resourceBudget(
@@ -146,6 +163,13 @@ public struct StudioFailure: Identifiable, Equatable, Sendable {
         switch code {
         case .resourceBudget:
             return resourceBudget(required: 0, available: 0, diagnostic: diagnostic)
+        case .capacity:
+            return Self(
+                code: code,
+                message: "The project has reached one of its capacity limits. Your painting is unchanged.",
+                recoverySuggestion: "Undo or remove painting history, or continue in a new document.",
+                diagnostic: diagnostic
+            )
         case .workBudget:
             return Self(
                 code: code,
@@ -644,7 +668,11 @@ public final class StudioModel: ObservableObject {
     /// failure that the commit itself already reported.
     func noteStrokeExhaustion(_ reason: StrokeExhaustionReason) {
         guard error == nil else { return }
-        error = StudioFailure(message: reason.message)
+        error = StudioFailure.capacity(
+            message: reason.message,
+            recoverySuggestion: reason.recoverySuggestion,
+            project: project
+        )
     }
 
     func cancelStrokePreview(reason: StrokeExhaustionReason? = nil) {
@@ -654,7 +682,13 @@ public final class StudioModel: ObservableObject {
         beginStrokePreviewCancellation(
             token: token,
             wasFinalizing: wasFinalizing,
-            failure: reason.map { StudioFailure(message: $0.message) }
+            failure: reason.map {
+                StudioFailure.capacity(
+                    message: $0.cancellationMessage,
+                    recoverySuggestion: $0.cancellationRecoverySuggestion,
+                    project: project
+                )
+            }
         )
         refreshCapabilities()
         if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
@@ -820,8 +854,10 @@ public final class StudioModel: ObservableObject {
     }
 
     private func reportCommandCapacityFailure() {
-        error = StudioFailure(
-            message: "The project has reached its command capacity of \(projectAdmissionLimits.maximumCommandCount)."
+        error = StudioFailure.capacity(
+            message: "The project has reached its command capacity of \(projectAdmissionLimits.maximumCommandCount).",
+            recoverySuggestion: "Undo or remove painting history, or continue in a new document.",
+            project: project
         )
     }
 
@@ -841,12 +877,16 @@ public final class StudioModel: ObservableObject {
             case .commandLimitExceeded:
                 reportCommandCapacityFailure()
             case .totalStrokePointLimitExceeded:
-                error = StudioFailure(
-                    message: "The project has reached its point capacity of \(projectAdmissionLimits.maximumTotalStrokePointCount)."
+                error = StudioFailure.capacity(
+                    message: "The project has reached its point capacity of \(projectAdmissionLimits.maximumTotalStrokePointCount).",
+                    recoverySuggestion: "Undo or remove painting history, or continue in a new document.",
+                    project: project
                 )
             case .documentByteLimitExceeded:
-                error = StudioFailure(
-                    message: "The project has reached its document storage capacity. Use a shorter stroke or remove painting history before continuing."
+                error = StudioFailure.capacity(
+                    message: "The project has reached its document storage capacity.",
+                    recoverySuggestion: "Use a shorter stroke, or undo and remove painting history before continuing.",
+                    project: project
                 )
             default:
                 error = StudioFailure.rendering(

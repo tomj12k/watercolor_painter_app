@@ -1005,7 +1005,7 @@ import WatercolorCore
         #expect(model.project.commands.count == 2)
         #expect(
             model.error?.message
-                == "This stroke reached its 1-point limit, so Watercolor Studio ended and saved it there. Start a new stroke to keep painting."
+                == "This stroke reached its 1-point limit, so Watercolor Studio ended and saved it there."
         )
         #expect(try renderer.debugPixel(x: 64, y: 192, layerID: layer.id).alpha > 0.05)
 
@@ -1093,7 +1093,7 @@ import WatercolorCore
         #expect(model.project.commands.count == 1)
         #expect(
             model.error?.message
-                == "This stroke reached its 10-point limit, so Watercolor Studio ended and saved it there. Start a new stroke to keep painting."
+                == "This stroke reached its 10-point limit, so Watercolor Studio ended and saved it there."
         )
         #expect(!model.isStrokePreviewActive)
         #expect(model.capabilities.canPaint)
@@ -1135,7 +1135,7 @@ import WatercolorCore
         #expect(model.project.commands.count == 2)
         #expect(
             model.error?.message
-                == "This stroke reached its 1-point limit, so Watercolor Studio ended and saved it there. Start a new stroke to keep painting."
+                == "This stroke reached its 1-point limit, so Watercolor Studio ended and saved it there."
         )
         #expect(try renderer.debugPixel(x: 64, y: 192, layerID: layer.id).alpha > 0.05)
 
