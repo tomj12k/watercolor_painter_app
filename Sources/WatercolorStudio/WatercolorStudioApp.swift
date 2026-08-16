@@ -4,7 +4,6 @@ import SwiftUI
 import WatercolorCore
 import WatercolorEngine
 
-@main
 struct WatercolorStudioApp: App {
     @NSApplicationDelegateAdaptor(WatercolorStudioApplicationDelegate.self)
     private var applicationDelegate
@@ -17,6 +16,25 @@ struct WatercolorStudioApp: App {
         .commands {
             StudioAppCommands()
         }
+    }
+}
+
+@main
+enum WatercolorStudioMain {
+    @MainActor
+    static func main() async {
+        if CommandLine.arguments.contains("--qualify-customer-input") {
+            do {
+                try await ReleasePerformanceQualification.run()
+            } catch {
+                FileHandle.standardError.write(
+                    Data("Watercolor qualification failed: \(error)\n".utf8)
+                )
+                Foundation.exit(EXIT_FAILURE)
+            }
+            return
+        }
+        WatercolorStudioApp.main()
     }
 }
 

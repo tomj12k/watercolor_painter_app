@@ -157,8 +157,8 @@ import WatercolorCore
         let gpuP50 = percentile(gpuMilliseconds, 0.50)
         let gpuP95 = percentile(gpuMilliseconds, 0.95)
         print(
-            "WATERCOLOR_QUALIFICATION metric=stroke layers=\(layerCount) "
-                + "samples=\(sampleCount) input_hz=120 "
+            "WATERCOLOR_QUALIFICATION metric=gpu_batch layers=\(layerCount) "
+                + "samples=\(sampleCount) batch_points=8 "
                 + "preview_p50_ms=\(format(previewP50)) "
                 + "preview_p95_ms=\(format(previewP95)) "
                 + "commit_p50_ms=\(format(commitP50)) "

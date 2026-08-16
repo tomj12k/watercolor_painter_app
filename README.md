@@ -86,13 +86,13 @@ Missing credentials or any signing, notarization, stapling, or Gatekeeper failur
 
 ### Release qualification
 
-Run `make qualify` on the release Mac before distributing a build. It performs a clean test run, requires a real Metal device, enables Metal API and shader validation, records 30-sample p50/p95 performance measurements, packages and validates the local app, runs an exact-process five-second liveness check, terminates that exact test process, and checks the Git diff. Results and machine-readable `WATERCOLOR_QUALIFICATION` lines are written to:
+Run `make qualify` on the release Mac before distributing a build. It performs a clean serial correctness run, requires a real Metal device, enables Metal API and shader validation in a separate renderer lane, records 30-sample p50/p95 performance measurements, packages and validates the local app and icon, runs the packaged release executable's customer-input benchmark, performs an exact-process five-second liveness check, terminates that exact test process with bounded cleanup, and checks the Git diff. A terminal PASS or FAIL report is published atomically even when an early gate fails. Results and machine-readable `WATERCOLOR_QUALIFICATION` lines are written to:
 
 ```text
 .build/qualification/report.txt
 ```
 
-The measured release thresholds are preview p95 at or below 16.7 ms, pointer-up commit p95 at or below 33.3 ms, and main-actor heartbeat gaps at or below 100 ms. The benchmark covers 1600×1200 canvases with 1, 8, and 12 layers.
+The debug Metal lane requires batched preview p95 at or below 16.7 ms, pointer-up commit p95 at or below 33.3 ms, and main-actor heartbeat gaps at or below 100 ms. The packaged release lane independently delivers eight mouse events per stroke at 120 Hz through the real coalescing path; it requires input-handler p95 at or below 8.33 ms, scheduling lateness p95 at or below 16.7 ms, final-event backlog p95 at or below 25 ms, and commit p95 at or below 33.3 ms. Both lanes cover 1600×1200 canvases with 1, 8, and 12 layers and report 30 measured samples per layer count.
 
 Signing and notarization are reported as `NOT_RUN` unless both `DEVELOPER_ID_APPLICATION` and `NOTARYTOOL_PROFILE` are supplied. The qualification report never treats missing signing credentials as a pass.
 
