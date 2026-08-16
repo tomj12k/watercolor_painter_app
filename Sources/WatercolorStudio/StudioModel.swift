@@ -476,10 +476,18 @@ public final class StudioModel: ObservableObject {
         _ previewError: Error,
         token: StudioStrokePreviewToken
     ) {
-        guard isCurrentStrokePreview(token) else { return }
+        let wasFinalizing: Bool
+        switch strokePreviewState {
+        case let .active(current) where current == token:
+            wasFinalizing = false
+        case let .finalizing(current) where current == token:
+            wasFinalizing = true
+        default:
+            return
+        }
         beginStrokePreviewCancellation(
             token: token,
-            wasFinalizing: false,
+            wasFinalizing: wasFinalizing,
             failure: StudioFailure(message: previewError.localizedDescription)
         )
         refreshCapabilities()
@@ -490,7 +498,13 @@ public final class StudioModel: ObservableObject {
         wasFinalizing: Bool,
         failure: StudioFailure?
     ) {
-        guard isCurrentStrokePreview(token) else { return }
+        switch strokePreviewState {
+        case let .active(current) where current == token,
+             let .finalizing(current) where current == token:
+            break
+        default:
+            return
+        }
         strokePreviewState = .cancelling(token)
         pendingStrokePreviewPoints = []
         strokePreviewDrainTask?.cancel()

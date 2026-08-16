@@ -180,6 +180,61 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 48, y: 48).alpha > 0.1)
     }
 
+    @Test func actualGPUFinishCancelOverlapLeavesTheLaterTransactionUsable() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        let terminal = RendererPreviewTerminalCompletionGate(labels: ["finish", "cancel"])
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugPreviewTerminalDidComplete: { label in
+                await terminal.suspend(label: label)
+            }
+        )
+        let first = StrokeCommand.testDot(
+            id: UUID(uuidString: "A20E398B-E36C-46CB-868E-54A0BD84AD65")!,
+            layerID: project.layers[0].id,
+            x: 16,
+            y: 16
+        )
+        let firstToken = try renderer.beginStrokePreview(first)
+        let finishing = Task { @MainActor in
+            try await renderer.finishStrokePreview(first, token: firstToken)
+        }
+        await terminal.waitUntilSuspended(label: "finish")
+
+        let cancelling = Task { @MainActor in
+            try await renderer.restoreStrokePreviewCancellation(firstToken)
+        }
+        await terminal.waitUntilSuspended(label: "cancel")
+        await terminal.resume(label: "finish")
+
+        await #expect(throws: RendererError.invalidStrokePreview) {
+            try await finishing.value
+        }
+        #expect(throws: RendererError.invalidStrokePreview) {
+            _ = try renderer.beginStrokePreview(
+                StrokeCommand.testDot(layerID: project.layers[0].id, x: 32, y: 32)
+            )
+        }
+
+        await terminal.resume(label: "cancel")
+        try await cancelling.value
+        let later = StrokeCommand.testDot(
+            id: UUID(uuidString: "05228DF2-F510-44E2-881F-896B2DD1E6D5")!,
+            layerID: project.layers[0].id,
+            x: 48,
+            y: 48
+        )
+        let laterToken = try renderer.beginStrokePreview(later)
+        try await renderer.finishStrokePreview(later, token: laterToken)
+
+        var replayProject = project
+        replayProject.commands = [.stroke(later)]
+        let replayed = try WatercolorRenderer(project: replayProject, device: device)
+        #expect(try renderer.compositeChecksum() == replayed.compositeChecksum())
+    }
+
     @Test func activePreviewRejectsEveryPublicNontransactionalMutation() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
@@ -502,6 +557,7 @@ import WatercolorCore
         let encodeMilliseconds = (ProcessInfo.processInfo.systemUptime - encodeStart) * 1_000
         let commitStart = ProcessInfo.processInfo.systemUptime
         try await commitRenderer.finishStrokePreview(stroke, token: commitToken)
+        let terminalPointCount = commitRenderer.debugLastPreviewFinishEncodedPointCount
         try commitRenderer.recordRenderedStroke(stroke)
         let commitMilliseconds = (ProcessInfo.processInfo.systemUptime - commitStart) * 1_000
 
@@ -525,11 +581,13 @@ import WatercolorCore
         print(
             "WATERCOLOR_RESOURCE_LATENCY phase=preview_transaction "
                 + "configured_max_points=\(configuredMaximumPointCount) "
+                + "terminal_points=\(terminalPointCount) "
                 + "encode_ms=\(String(format: "%.3f", encodeMilliseconds)) "
                 + "commit_ms=\(String(format: "%.3f", commitMilliseconds)) "
                 + "cancel_ms=\(String(format: "%.3f", cancelMilliseconds))"
         )
         #expect(commitRenderer.project.commands == [.stroke(stroke)])
+        #expect((1...8).contains(terminalPointCount))
         #expect(try cancelRenderer.compositeChecksum() == checksumBeforeCancel)
         #expect(encodeMilliseconds < 2_000)
         #expect(commitMilliseconds < 2_000)
@@ -707,6 +765,60 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 52, y: 48).alpha > 0.05)
     }
 
+    @Test(arguments: [8, 16])
+    func exactCanonicalBatchEndpointFieldsMatchFreshAndReopenedReplay(
+        pointCount: Int
+    ) async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(256)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var sampled = StrokeCommand.testDot(
+            id: UUID(uuidString: "E9240BED-AB21-42D0-A18F-F75A12206AB9")!,
+            layerID: project.layers[0].id
+        )
+        sampled.points = (0..<pointCount).map { index in
+            StrokePoint(
+                x: Double(32 + index * 10),
+                y: 128,
+                pressure: index == pointCount - 1 ? 0.1 : 0.65,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
+            )
+        }
+        var pointerUp = sampled
+        pointerUp.points[pointCount - 1] = StrokePoint(
+            x: sampled.points[pointCount - 1].x,
+            y: sampled.points[pointCount - 1].y,
+            pressure: 1,
+            tiltX: 0.75,
+            tiltY: -0.5,
+            time: Double(pointCount) + 0.5
+        )
+        var initial = sampled
+        initial.points = [sampled.points[0]]
+
+        let token = try renderer.beginStrokePreview(initial)
+        try await renderer.appendStrokePreview(
+            id: sampled.id,
+            points: Array(sampled.points.dropFirst()),
+            token: token
+        )
+        try await renderer.finishStrokePreview(pointerUp, token: token)
+        let liveChecksum = try renderer.compositeChecksum()
+
+        var replayProject = project
+        replayProject.commands = [.stroke(pointerUp)]
+        let fresh = try WatercolorRenderer(project: replayProject, device: device)
+        let reopenedProject = try PaintingDocumentCodec.decode(
+            PaintingDocumentCodec.encode(replayProject)
+        )
+        let reopened = try WatercolorRenderer(project: reopenedProject, device: device)
+
+        #expect(liveChecksum == (try fresh.compositeChecksum()))
+        #expect(liveChecksum == (try reopened.compositeChecksum()))
+    }
+
     @Test func incrementalPreviewBatchesMatchPreFinishFinishAndFreshReplay() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(256)
@@ -748,12 +860,15 @@ import WatercolorCore
         let preFinishChecksum = try renderer.compositeChecksum()
 
         var replayProject = project
-        replayProject.commands = [.stroke(complete)]
-        let replayed = try WatercolorRenderer(project: replayProject, device: device)
-        #expect(preFinishChecksum == (try replayed.compositeChecksum()))
+        var prefix = complete
+        prefix.points = Array(complete.points.prefix(16))
+        replayProject.commands = [.stroke(prefix)]
+        let replayedPrefix = try WatercolorRenderer(project: replayProject, device: device)
+        #expect(preFinishChecksum == (try replayedPrefix.compositeChecksum()))
 
         try await renderer.finishStrokePreview(complete, token: token)
-        #expect(try renderer.compositeChecksum() == preFinishChecksum)
+        replayProject.commands = [.stroke(complete)]
+        let replayed = try WatercolorRenderer(project: replayProject, device: device)
         #expect(try renderer.compositeChecksum() == replayed.compositeChecksum())
     }
 
@@ -824,12 +939,16 @@ import WatercolorCore
         let previewChecksum = try renderer.compositeChecksum()
 
         var replayProject = project
-        replayProject.commands.append(.stroke(complete))
-        let replayed = try WatercolorRenderer(project: replayProject, device: device)
-        #expect(previewChecksum == (try replayed.compositeChecksum()))
+        var prefix = complete
+        prefix.points = Array(complete.points.prefix(8))
+        replayProject.commands.append(.stroke(prefix))
+        let replayedPrefix = try WatercolorRenderer(project: replayProject, device: device)
+        #expect(previewChecksum == (try replayedPrefix.compositeChecksum()))
 
         try await renderer.finishStrokePreview(complete, token: token)
-        #expect(try renderer.compositeChecksum() == previewChecksum)
+        replayProject.commands[replayProject.commands.count - 1] = .stroke(complete)
+        let replayed = try WatercolorRenderer(project: replayProject, device: device)
+        #expect(try renderer.compositeChecksum() == replayed.compositeChecksum())
     }
 
     @Test(arguments: [
@@ -879,10 +998,13 @@ import WatercolorCore
             token: token
         )
 
+        let trailingPointCount = pointCount - ((pointCount - 1) / 8) * 8
         var prefixProject = project
         var prefix = complete
-        prefix.points = Array(complete.points.prefix(pointCount - pointCount % 8))
-        prefixProject.commands.append(.stroke(prefix))
+        prefix.points = Array(complete.points.prefix(pointCount - trailingPointCount))
+        if !prefix.points.isEmpty {
+            prefixProject.commands.append(.stroke(prefix))
+        }
         let freshPrefix = try WatercolorRenderer(project: prefixProject, device: device)
         let preFinishChecksum = try renderer.compositeChecksum()
         #expect(preFinishChecksum == (try freshPrefix.compositeChecksum()))
@@ -892,11 +1014,8 @@ import WatercolorCore
         var completedProject = project
         completedProject.commands.append(.stroke(complete))
         let freshCompleted = try WatercolorRenderer(project: completedProject, device: device)
-        #expect(renderer.debugLastPreviewFinishEncodedPointCount == pointCount % 8)
+        #expect(renderer.debugLastPreviewFinishEncodedPointCount == trailingPointCount)
         #expect(try renderer.compositeChecksum() == freshCompleted.compositeChecksum())
-        if pointCount % 8 == 0 {
-            #expect(try renderer.compositeChecksum() == preFinishChecksum)
-        }
     }
 
     @Test func emptyIncrementalPreviewDeltaDoesNotSubmitGPUWork() async throws {
@@ -936,7 +1055,7 @@ import WatercolorCore
         let checksumBefore = try renderer.compositeChecksum()
         var failedStroke = StrokeCommand.testDot(layerID: project.layers[0].id)
         failedStroke.brush.size = 24
-        failedStroke.points = (0..<8).map { index in
+        failedStroke.points = (0..<9).map { index in
             StrokePoint(
                 x: 8 + Double(index) * (48.0 / 7.0),
                 y: 32,
@@ -991,7 +1110,7 @@ import WatercolorCore
             }
         )
         var complete = StrokeCommand.testDot(layerID: project.layers[0].id)
-        complete.points = (0..<16).map { index in
+        complete.points = (0..<17).map { index in
             StrokePoint(
                 x: 32,
                 y: 32,
@@ -1008,7 +1127,7 @@ import WatercolorCore
 
         try await splitRenderer.appendStrokePreview(
             id: complete.id,
-            points: Array(complete.points[1..<8]),
+            points: Array(complete.points[1..<9]),
             token: splitToken
         )
         let admittedPrefixChecksum = try splitRenderer.compositeChecksum()
@@ -1017,7 +1136,7 @@ import WatercolorCore
         await #expect(throws: RendererError.self) {
             try await splitRenderer.appendStrokePreview(
                 id: complete.id,
-                points: Array(complete.points[8..<16]),
+                points: Array(complete.points[9..<17]),
                 token: splitToken
             )
         }
@@ -1042,7 +1161,7 @@ import WatercolorCore
         await #expect(throws: RendererError.self) {
             try await singleRenderer.appendStrokePreview(
                 id: complete.id,
-                points: Array(complete.points[1..<16]),
+                points: Array(complete.points[1..<17]),
                 token: singleToken
             )
         }
@@ -1063,7 +1182,7 @@ import WatercolorCore
             }
         )
         var complete = StrokeCommand.testDot(layerID: project.layers[0].id)
-        complete.points = (0..<16).map { index in
+        complete.points = (0..<17).map { index in
             StrokePoint(
                 x: Double(16 + index * 6),
                 y: 64,
@@ -1079,7 +1198,7 @@ import WatercolorCore
         let firstAppend = Task { @MainActor in
             try await renderer.appendStrokePreview(
                 id: complete.id,
-                points: Array(complete.points[1..<8]),
+                points: Array(complete.points[1..<9]),
                 token: token
             )
         }
@@ -1088,7 +1207,7 @@ import WatercolorCore
         await #expect(throws: RendererError.invalidStrokePreview) {
             try await renderer.appendStrokePreview(
                 id: complete.id,
-                points: Array(complete.points[8..<16]),
+                points: Array(complete.points[9..<17]),
                 token: token
             )
         }
@@ -1096,7 +1215,7 @@ import WatercolorCore
         try await firstAppend.value
         try await renderer.appendStrokePreview(
             id: complete.id,
-            points: Array(complete.points[8..<16]),
+            points: Array(complete.points[9..<17]),
             token: token
         )
         try await renderer.finishStrokePreview(complete, token: token)
@@ -1119,7 +1238,7 @@ import WatercolorCore
             }
         )
         var complete = StrokeCommand.testDot(layerID: project.layers[0].id)
-        complete.points = (0..<8).map { index in
+        complete.points = (0..<9).map { index in
             StrokePoint(
                 x: Double(24 + index * 8),
                 y: 64,
@@ -1235,6 +1354,7 @@ import WatercolorCore
         var initial = stroke
         initial.points = [stroke.points[0]]
         let token = try renderer.beginStrokePreview(initial)
+        let checksumBefore = try renderer.compositeChecksum()
         try await renderer.appendStrokePreview(
             id: stroke.id,
             points: Array(stroke.points[1...]),
@@ -1247,7 +1367,8 @@ import WatercolorCore
         replayProject.commands = [.stroke(stroke)]
         let replayed = try WatercolorRenderer(project: replayProject, device: device)
 
-        #expect(finishedChecksum == previewChecksum)
+        #expect(previewChecksum == checksumBefore)
+        #expect(finishedChecksum != previewChecksum)
         #expect(finishedChecksum == (try replayed.compositeChecksum()))
     }
 
@@ -1268,7 +1389,7 @@ import WatercolorCore
         let checksumBefore = try renderer.compositeChecksum()
         let wetnessBefore = try renderer.debugWetness(x: 16, y: 16, layerID: first.id)
         var preview = StrokeCommand.testDot(layerID: second.id)
-        preview.points = (0..<8).map { index in
+        preview.points = (0..<9).map { index in
             StrokePoint(
                 x: Double(32 + index * 3),
                 y: 40,
@@ -2866,6 +2987,38 @@ private actor RendererPreviewUpdateGate {
         isSuspended = false
         continuation?.resume()
         continuation = nil
+    }
+}
+
+private actor RendererPreviewTerminalCompletionGate {
+    private let labels: Set<String>
+    private var suspendedLabels: Set<String> = []
+    private var suspensionWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var completions: [String: CheckedContinuation<Void, Never>] = [:]
+
+    init(labels: Set<String>) {
+        self.labels = labels
+    }
+
+    func suspend(label: String) async {
+        guard labels.contains(label), !suspendedLabels.contains(label) else { return }
+        suspendedLabels.insert(label)
+        let waiters = suspensionWaiters.removeValue(forKey: label) ?? []
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { continuation in
+            completions[label] = continuation
+        }
+    }
+
+    func waitUntilSuspended(label: String) async {
+        guard !suspendedLabels.contains(label) else { return }
+        await withCheckedContinuation { continuation in
+            suspensionWaiters[label, default: []].append(continuation)
+        }
+    }
+
+    func resume(label: String) {
+        completions.removeValue(forKey: label)?.resume()
     }
 }
 

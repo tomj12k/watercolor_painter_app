@@ -737,6 +737,98 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 96, y: 160, layerID: layer.id).alpha > 0.05)
     }
 
+    @Test func inFlightAppendCannotDuplicateCapacityCancellationOrReplaceItsReason() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [PaintLayer(name: "Layer")]
+        )
+        let append = CanvasPreviewSuspension()
+        let appendFailed = CanvasPreviewSignal()
+        let cancellation = CanvasPreviewSuspension()
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugPreviewAppendWillCommit: {
+                await append.suspend()
+            }
+        )
+        var cancellationCount = 0
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, id, points, token in
+                    do {
+                        try await renderer.appendStrokePreview(
+                            id: id,
+                            points: points,
+                            token: token
+                        )
+                    } catch {
+                        await appendFailed.signal()
+                        throw error
+                    }
+                },
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
+                },
+                cancel: { renderer, token in
+                    cancellationCount += 1
+                    let ordinal = cancellationCount
+                    try await renderer.restoreStrokePreviewCancellation(token)
+                    if ordinal == 1 {
+                        await cancellation.suspend()
+                    }
+                }
+            ),
+            maximumTotalStrokePointCount: 10
+        )
+        model.brush.size = 100
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown,
+            timestamp: 0,
+            eventNumber: 0,
+            location: CGPoint(x: 32, y: 64)
+        )))
+        view.mouseDragged(with: try #require(canvasMouseEvent(
+            .leftMouseDragged,
+            timestamp: 1,
+            eventNumber: 1,
+            location: CGPoint(x: 194, y: 64)
+        )))
+        await append.waitUntilSuspended()
+
+        view.mouseDragged(with: try #require(canvasMouseEvent(
+            .leftMouseDragged,
+            timestamp: 2,
+            eventNumber: 2,
+            location: CGPoint(x: 220, y: 64)
+        )))
+        await cancellation.waitUntilSuspended()
+        #expect(model.isStrokePreviewActive)
+        #expect(!model.capabilities.canPaint)
+
+        await append.resume()
+        await appendFailed.wait()
+        await Task.yield()
+        await cancellation.resume()
+        await model.waitForStrokePreviewCancellation()
+
+        #expect(cancellationCount == 1)
+        #expect(
+            model.error?.message
+                == "This stroke reached its 10-point limit. Try a shorter stroke or use a larger brush for wider spacing."
+        )
+        #expect(!model.isStrokePreviewActive)
+        #expect(model.capabilities.canPaint)
+    }
+
     @Test func pointerUpPointExhaustionRestoresAndReportsBeforeContinuedPainting() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let layer = PaintLayer(name: "Layer")
@@ -823,6 +915,24 @@ private actor CanvasPreviewUpdateCounter {
 
     func recordUpdate() {
         count += 1
+    }
+}
+
+private actor CanvasPreviewSignal {
+    private var hasSignalled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        hasSignalled = true
+        waiters.forEach { $0.resume() }
+        waiters.removeAll()
+    }
+
+    func wait() async {
+        guard !hasSignalled else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
     }
 }
 

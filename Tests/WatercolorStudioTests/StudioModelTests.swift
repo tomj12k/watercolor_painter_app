@@ -265,7 +265,7 @@ import WatercolorCore
             onDocumentUpdate: { updates.append($0) }
         )
         var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id, x: 64, y: 64)
-        stroke.points = (0..<8).map { index in
+        stroke.points = (0..<9).map { index in
             StrokePoint(
                 x: Double(64 + index * 2),
                 y: 64,
@@ -285,7 +285,7 @@ import WatercolorCore
         #expect(model.project.commands.isEmpty)
         #expect(try renderer.debugPixel(x: 64, y: 64).alpha > 0.05)
 
-        let secondBatch: [StrokePoint] = (8..<16).map { index in
+        let secondBatch: [StrokePoint] = (9..<17).map { index in
             let x = Double(index * 4 + 48)
             let time = Double(index) / 60
             return StrokePoint(
@@ -374,7 +374,7 @@ import WatercolorCore
         #expect(try renderer.studioChecksum() == replayed.studioChecksum())
     }
 
-    @Test func wetNonSelectedLayerDoesNotSnapAtPreviewCommit() async throws {
+    @Test func wetNonSelectedLayerEvolutionMatchesReplayAcrossPreviewCommit() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let wet = PaintLayer(name: "Wet")
         let selected = PaintLayer(name: "Selected")
@@ -389,7 +389,7 @@ import WatercolorCore
         model.selectedLayerID = selected.id
         let wetnessBefore = try renderer.debugWetness(x: 64, y: 64, layerID: wet.id)
         var preview = StrokeCommand.studioTestStroke(layerID: selected.id, x: 112, y: 160)
-        preview.points = (0..<8).map { index in
+        preview.points = (0..<9).map { index in
             StrokePoint(
                 x: Double(112 + index * 8),
                 y: 160,
@@ -411,9 +411,14 @@ import WatercolorCore
         #expect(previewWetness < wetnessBefore)
         await model.commitStrokePreview(preview)
         let replayed = try WatercolorRenderer(project: model.project, device: device)
+        let finishedWetness = try renderer.debugWetness(x: 64, y: 64, layerID: wet.id)
 
-        #expect(try renderer.studioChecksum() == previewChecksum)
-        #expect(try renderer.debugWetness(x: 64, y: 64, layerID: wet.id) == previewWetness)
+        #expect(try renderer.studioChecksum() != previewChecksum)
+        #expect(finishedWetness < previewWetness)
+        #expect(
+            finishedWetness
+                == (try replayed.debugWetness(x: 64, y: 64, layerID: wet.id))
+        )
         #expect(try renderer.studioChecksum() == replayed.studioChecksum())
     }
 
@@ -580,7 +585,7 @@ import WatercolorCore
         let before = try renderer.studioChecksum()
 
         var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id, x: 64, y: 64)
-        stroke.points = (0..<8).map { index in
+        stroke.points = (0..<9).map { index in
             StrokePoint(
                 x: Double(64 + index * 2),
                 y: 64,
@@ -627,7 +632,7 @@ import WatercolorCore
             )
         )
         var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
-        stroke.points = (0..<8).map { index in
+        stroke.points = (0..<9).map { index in
             StrokePoint(
                 x: Double(64 + index * 8),
                 y: 64,
@@ -691,7 +696,7 @@ import WatercolorCore
         )
         let before = try renderer.studioChecksum()
         var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id, x: 64, y: 64)
-        stroke.points = (0..<8).map { index in
+        stroke.points = (0..<9).map { index in
             StrokePoint(
                 x: Double(64 + index * 2),
                 y: 64,
@@ -987,7 +992,7 @@ import WatercolorCore
         )
         let model = StudioModel(project: project, renderer: renderer)
         var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
-        stroke.points = (0..<8).map { index in
+        stroke.points = (0..<9).map { index in
             StrokePoint(
                 x: Double(64 + index * 8),
                 y: 64,
@@ -1041,7 +1046,7 @@ import WatercolorCore
             onDocumentUpdate: { documentUpdates.append($0) }
         )
         var stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
-        stroke.points = (0..<8).map { index in
+        stroke.points = (0..<9).map { index in
             StrokePoint(
                 x: Double(64 + index * 8),
                 y: 64,
@@ -1176,9 +1181,9 @@ import WatercolorCore
             x: 24,
             y: 128
         )
-        hostile.points = (0..<8).map { index in
+        hostile.points = (0..<9).map { index in
             StrokePoint(
-                x: 24 + Double(index) * 208 / 7,
+                x: 24 + Double(index) * 208 / 8,
                 y: 128,
                 pressure: 1,
                 tiltX: 0,
