@@ -196,16 +196,12 @@ struct NativeDocumentSaveAsRequester {
     typealias FocusWindow = @MainActor (NSWindow) -> Void
 
     private let owningWindow: WindowProvider
-    private let keyWindow: WindowProvider
-    private let mainWindow: WindowProvider
     private let documentForWindow: DocumentForWindow
     private let focusWindow: FocusWindow
     private let sendAction: SendAction
 
     init(
         owningWindow: @escaping WindowProvider,
-        keyWindow: @escaping WindowProvider = { NSApplication.shared.keyWindow },
-        mainWindow: @escaping WindowProvider = { NSApplication.shared.mainWindow },
         documentForWindow: @escaping DocumentForWindow = {
             NSDocumentController.shared.document(for: $0)
         },
@@ -215,8 +211,6 @@ struct NativeDocumentSaveAsRequester {
         }
     ) {
         self.owningWindow = owningWindow
-        self.keyWindow = keyWindow
-        self.mainWindow = mainWindow
         self.documentForWindow = documentForWindow
         self.focusWindow = focusWindow
         self.sendAction = sendAction
@@ -224,16 +218,11 @@ struct NativeDocumentSaveAsRequester {
 
     @discardableResult
     func request() -> Bool {
-        var visitedWindows = Set<ObjectIdentifier>()
-        let candidates = [owningWindow(), keyWindow(), mainWindow()]
-        for case let window? in candidates {
-            guard !(window is NSPanel), visitedWindows.insert(ObjectIdentifier(window)).inserted,
-                  let document = documentForWindow(window)
-            else { continue }
-            focusWindow(window)
-            return sendAction(#selector(NSDocument.saveAs(_:)), document, nil)
-        }
-        return false
+        guard let window = owningWindow(), !(window is NSPanel),
+              let document = documentForWindow(window)
+        else { return false }
+        focusWindow(window)
+        return sendAction(#selector(NSDocument.saveAs(_:)), document, nil)
     }
 }
 

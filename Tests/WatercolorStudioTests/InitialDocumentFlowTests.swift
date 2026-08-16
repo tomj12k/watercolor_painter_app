@@ -243,8 +243,6 @@ import Testing
         let document = NSDocument()
         let requester = NativeDocumentSaveAsRequester(
             owningWindow: { owningWindow },
-            keyWindow: { nil },
-            mainWindow: { nil },
             documentForWindow: { $0 === owningWindow ? document : nil },
             focusWindow: { focusedWindow = $0 },
             sendAction: { selector, target, sender in
@@ -262,16 +260,54 @@ import Testing
         #expect(focusedWindow === owningWindow)
     }
 
-    @Test func nativeSaveRequesterSkipsPanelsAndUsesTheKeyDocumentWindow() {
-        let sheet = NSPanel()
-        let keyWindow = NSWindow()
-        let document = NSDocument()
+    @Test func missingOwnerNeverFallsBackToKeyOrMainDocument() {
+        let keyWindowForPaintingB = NSWindow()
+        let paintingB = NSDocument()
+        let paintingBWindowController = NSWindowController(window: keyWindowForPaintingB)
+        paintingB.addWindowController(paintingBWindowController)
+        NSDocumentController.shared.addDocument(paintingB)
+        keyWindowForPaintingB.makeKeyAndOrderFront(nil)
+        keyWindowForPaintingB.makeMain()
+        defer {
+            keyWindowForPaintingB.orderOut(nil)
+            NSDocumentController.shared.removeDocument(paintingB)
+        }
         var receivedTarget: Any?
         let requester = NativeDocumentSaveAsRequester(
-            owningWindow: { sheet },
-            keyWindow: { keyWindow },
-            mainWindow: { nil },
-            documentForWindow: { $0 === keyWindow ? document : nil },
+            owningWindow: { nil },
+            focusWindow: { _ in },
+            sendAction: { _, target, _ in
+                receivedTarget = target
+                return true
+            }
+        )
+
+        #expect(!requester.request())
+        #expect(receivedTarget == nil)
+    }
+
+    @Test func ownerForPaintingATakesIdentityOverKeyAndMainPaintingB() {
+        let ownerWindowForPaintingA = NSWindow()
+        let keyWindowForPaintingB = NSWindow()
+        let paintingA = NSDocument()
+        let paintingB = NSDocument()
+        let paintingBWindowController = NSWindowController(window: keyWindowForPaintingB)
+        paintingB.addWindowController(paintingBWindowController)
+        NSDocumentController.shared.addDocument(paintingB)
+        keyWindowForPaintingB.makeKeyAndOrderFront(nil)
+        keyWindowForPaintingB.makeMain()
+        defer {
+            keyWindowForPaintingB.orderOut(nil)
+            NSDocumentController.shared.removeDocument(paintingB)
+        }
+        var resolvedWindows: [NSWindow] = []
+        var receivedTarget: Any?
+        let requester = NativeDocumentSaveAsRequester(
+            owningWindow: { ownerWindowForPaintingA },
+            documentForWindow: { window in
+                resolvedWindows.append(window)
+                return window === ownerWindowForPaintingA ? paintingA : paintingB
+            },
             focusWindow: { _ in },
             sendAction: { _, target, _ in
                 receivedTarget = target
@@ -280,15 +316,16 @@ import Testing
         )
 
         #expect(requester.request())
-        #expect(receivedTarget as? NSDocument === document)
+        #expect(resolvedWindows.count == 1)
+        #expect(resolvedWindows.first === ownerWindowForPaintingA)
+        #expect(receivedTarget as? NSDocument === paintingA)
+        #expect(receivedTarget as? NSDocument !== paintingB)
     }
 
     @Test func nativeSaveRequesterReturnsFalseWhenNoDocumentOwnsAnyCandidateWindow() {
         var sentAction = false
         let requester = NativeDocumentSaveAsRequester(
             owningWindow: { NSWindow() },
-            keyWindow: { nil },
-            mainWindow: { nil },
             documentForWindow: { _ in nil },
             focusWindow: { _ in },
             sendAction: { _, _, _ in
@@ -325,6 +362,50 @@ import Testing
         scheduledActions.removeFirst()()
         #expect(requestedWindow === window)
         #expect(!flow.hasPendingInitialSave)
+    }
+
+    @Test func ownerDetachedBeforeScheduledSaveCannotRedirectToAnotherPainting() {
+        let locator = StudioDocumentWindowLocator()
+        let probe = StudioDocumentWindowProbe(locator: locator)
+        let ownerWindowForPaintingA = NSWindow()
+        ownerWindowForPaintingA.contentView = probe
+        let keyWindowForPaintingB = NSWindow()
+        let paintingB = NSDocument()
+        let paintingBWindowController = NSWindowController(window: keyWindowForPaintingB)
+        paintingB.addWindowController(paintingBWindowController)
+        NSDocumentController.shared.addDocument(paintingB)
+        keyWindowForPaintingB.makeKeyAndOrderFront(nil)
+        keyWindowForPaintingB.makeMain()
+        defer {
+            keyWindowForPaintingB.orderOut(nil)
+            NSDocumentController.shared.removeDocument(paintingB)
+        }
+        var scheduledActions: [@MainActor () -> Void] = []
+        var receivedTarget: Any?
+        let requester = NativeDocumentSaveAsRequester(
+            owningWindow: { locator.window },
+            documentForWindow: { $0 === keyWindowForPaintingB ? paintingB : nil },
+            focusWindow: { _ in },
+            sendAction: { _, target, _ in
+                receivedTarget = target
+                return true
+            }
+        )
+        let flow = InitialDocumentFlowCoordinator(
+            needsInitialConfiguration: true,
+            schedule: { scheduledActions.append($0) },
+            requestSaveAs: { requester.request() }
+        )
+
+        flow.configurationSucceeded()
+        flow.configurationSheetDidDismiss()
+        ownerWindowForPaintingA.contentView = NSView()
+        scheduledActions.removeFirst()()
+
+        #expect(locator.window == nil)
+        #expect(receivedTarget == nil)
+        #expect(flow.hasPendingInitialSave)
+        #expect(flow.initialSaveFailure != nil)
     }
 
     @Test func environmentGatedNativeDocumentSaveHostExercisesCancelSaveAndOverwrite() async throws {
