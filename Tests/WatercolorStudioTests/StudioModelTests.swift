@@ -256,6 +256,30 @@ import WatercolorCore
         #expect(model.error?.code == .malformedDocument)
     }
 
+    @Test func invalidStrokeValidationNeverExposesItsCommandIdentifier() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let sentinel = UUID(uuidString: "A93E0D96-6D71-43C5-9E9D-75D1260C80AD")!
+        var project = PaintingProject.studioTestProject()
+        project.commands = [
+            .stroke(.studioTestStroke(id: sentinel, layerID: project.layers[0].id))
+        ]
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        let duplicate = StrokeCommand.studioTestStroke(
+            id: sentinel,
+            layerID: project.layers[0].id,
+            x: 96,
+            y: 96
+        )
+
+        model.completeStroke(duplicate)
+
+        #expect(model.project == project)
+        #expect(model.error?.code == .malformedDocument)
+        #expect(model.error?.message.contains(sentinel.uuidString) == false)
+        #expect(model.error?.diagnostic.customerText.contains(sentinel.uuidString) == false)
+    }
+
     @Test func previewCommitRechecksAggregatePointCapacityAfterAwaitingUpdates() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let maximumTotalStrokePointCount = 10

@@ -367,9 +367,12 @@ struct StudioDocumentView: View {
             initialDocumentFlow.configurationSheetDidDismiss()
         }) {
             NewCanvasConfigurationView(
-                failure: host.model == nil ? nil : host.failure,
+                failure: host.failure,
                 copyDetails: { failure in host.copyDetails(for: failure) },
                 dismissFailure: { host.dismissFailure() },
+                retryRenderer: host.canRetryRendererInitialization
+                    ? { _ = host.retryRendererInitialization() }
+                    : nil,
                 create: { configuration in
                     if host.configureNewDocument(configuration) {
                         initialDocumentFlow.configurationSucceeded()
@@ -468,12 +471,15 @@ final class StudioDocumentHost: ObservableObject {
     }
 
     @discardableResult
-    private func initializeRenderer() -> Bool {
+    private func initializeRenderer(project requestedProject: PaintingProject? = nil) -> Bool {
+        let initializationProject = requestedProject ?? document.wrappedValue.project
         do {
             let createdModel = try modelFactory(
-                document.wrappedValue.project,
-                { project in
-                    guard self.document.wrappedValue.project != project else { return }
+                initializationProject,
+                { [weak self] project in
+                    guard let self,
+                          self.document.wrappedValue.project != project
+                    else { return }
                     self.document.wrappedValue.project = project
                 }
             )
@@ -488,7 +494,7 @@ final class StudioDocumentHost: ObservableObject {
             failureSubscription = nil
             failure = StudioFailure.rendererInitialization(
                 error: error,
-                project: document.wrappedValue.project
+                project: initializationProject
             )
             return false
         }
@@ -503,7 +509,13 @@ final class StudioDocumentHost: ObservableObject {
     func configureNewDocument(_ configuration: NewCanvasConfiguration) -> Bool {
         do {
             let project = try configuration.makeProject()
-            guard let model, model.replaceProjectFromDocument(project) else {
+            let isReady: Bool
+            if let model {
+                isReady = model.replaceProjectFromDocument(project)
+            } else {
+                isReady = initializeRenderer(project: project)
+            }
+            guard isReady else {
                 if failure == nil {
                     failure = StudioFailure(
                         error: RendererError.allocation("new canvas"),
@@ -526,7 +538,7 @@ final class StudioDocumentHost: ObservableObject {
 
     @discardableResult
     func useDefaultCanvas() -> Bool {
-        guard model != nil else { return false }
+        guard model != nil || initializeRenderer() else { return false }
         var configuredDocument = document.wrappedValue
         configuredDocument.needsInitialConfiguration = false
         document.wrappedValue = configuredDocument

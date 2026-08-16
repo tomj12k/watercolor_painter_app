@@ -101,10 +101,19 @@ public struct StudioFailure: Identifiable, Equatable, Sendable {
     public static func rendererInitialization(error: Error, project: PaintingProject?) -> Self {
         let mappedCode = code(for: error)
         let code = mappedCode == .unknown ? Code.metalUnavailable : mappedCode
+        let diagnostic = StudioDiagnostic.live(errorCode: code.rawValue, project: project)
+        if code == .gpuExecution {
+            return Self(
+                code: code,
+                message: "Watercolor Studio could not start the watercolor renderer. Your painting is unchanged.",
+                recoverySuggestion: "Try again. If it continues, restart the app and check for macOS updates.",
+                diagnostic: diagnostic
+            )
+        }
         return failure(
             for: error,
             code: code,
-            diagnostic: .live(errorCode: code.rawValue, project: project)
+            diagnostic: diagnostic
         )
     }
 
@@ -755,8 +764,9 @@ public final class StudioModel: ObservableObject {
                     message: "The project has reached its document storage capacity. Use a shorter stroke or remove painting history before continuing."
                 )
             default:
-                error = StudioFailure(
-                    message: RendererError.invalidProject(validationError).localizedDescription
+                error = StudioFailure.rendering(
+                    error: RendererError.invalidProject(validationError),
+                    project: project
                 )
             }
             return false

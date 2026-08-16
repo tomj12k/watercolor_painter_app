@@ -96,6 +96,84 @@ import WatercolorCore
         #expect(successfulModels == 1)
     }
 
+    @Test func failedDefaultRendererCanRecoverByCreatingASmallerCanvas() throws {
+        let originalDocument = PaintingDocument()
+        let originalProject = originalDocument.project
+        let document = StudioDocumentBox(originalDocument)
+        var documentWrites = 0
+        let binding = Binding(
+            get: { document.value },
+            set: { (updatedDocument: PaintingDocument) in
+                documentWrites += 1
+                document.value = updatedDocument
+            }
+        )
+        var attemptedCanvases: [CanvasSize] = []
+        let host = StudioDocumentHost(
+            document: binding,
+            modelFactory: { project, update in
+                attemptedCanvases.append(project.canvas)
+                if project.canvas == originalProject.canvas {
+                    throw RendererError.resourceBudgetExceeded(
+                        required: 2_000_000_000,
+                        available: 1_000_000_000
+                    )
+                }
+                return try StudioModel(project: project, onDocumentUpdate: update)
+            }
+        )
+        let smaller = NewCanvasConfiguration(width: 256, height: 320, paper: .hotPress)
+
+        #expect(host.model == nil)
+        #expect(host.failure?.code == .resourceBudget)
+        #expect(document.value.project == originalProject)
+        #expect(document.value.needsInitialConfiguration)
+
+        #expect(host.configureNewDocument(smaller))
+        #expect(attemptedCanvases == [originalProject.canvas, smaller.canvas])
+        #expect(host.model?.project.canvas == smaller.canvas)
+        #expect(document.value.project.canvas == smaller.canvas)
+        #expect(!document.value.needsInitialConfiguration)
+        #expect(documentWrites == 1)
+        #expect(host.failure == nil)
+    }
+
+    @Test func hostAndModelReleaseAfterTheDocumentOwnerCloses() throws {
+        let document = StudioDocumentBox(
+            PaintingDocument(project: .studioHostTestProject(layerName: "Lifetime"))
+        )
+        let binding = Binding(
+            get: { document.value },
+            set: { (updatedDocument: PaintingDocument) in document.value = updatedDocument }
+        )
+        var host: StudioDocumentHost? = StudioDocumentHost(document: binding)
+        weak let weakHost = host
+        weak let weakModel = host?.model
+
+        host = nil
+
+        #expect(weakHost == nil)
+        #expect(weakModel == nil)
+    }
+
+    @Test func allocationAndShaderInitializationFailuresUseStartRecoveryLanguage() {
+        let project = PaintingProject.studioHostTestProject(layerName: "Initialization")
+
+        for error in [
+            RendererError.allocation("private texture name"),
+            RendererError.shaderCompilation("private compiler output")
+        ] {
+            let failure = StudioFailure.rendererInitialization(error: error, project: project)
+
+            #expect(failure.code == .gpuExecution)
+            #expect(failure.message.contains("start the watercolor renderer"))
+            #expect(failure.recoverySuggestion.contains("Try again"))
+            #expect(!failure.message.contains("that change"))
+            #expect(!failure.recoverySuggestion.contains("save and reopen"))
+            #expect(!failure.message.contains("private"))
+        }
+    }
+
     @Test func copyDetailsWritesOnlyThePrivacySafeDiagnosticText() {
         let project = PaintingProject.studioHostTestProject(layerName: "Private Layer")
         let document = StudioDocumentBox(PaintingDocument(project: project))
