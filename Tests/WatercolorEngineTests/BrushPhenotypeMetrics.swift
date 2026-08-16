@@ -14,11 +14,13 @@ import Testing
 /// angle in radians in [-pi/2, pi/2), and aspect ratio uses pixel-center moments
 /// plus a pixel's intrinsic 1/12 variance on both axes. Roughness is four-neighbor
 /// perimeter divided by the circumference of an equal-area circle. Voids are
-/// enclosed four-connected background pixels. A persistent lane is a contiguous
-/// minor-axis band whose occupied major-axis bins cover at least 60% of the
-/// stroke and span at least 75% of its longitudinal extent. Spread is
-/// pigment-weighted RMS distance from the pigment centroid, and edge
-/// concentration is the fraction of in-mask pigment on the four-neighbor boundary.
+/// enclosed four-connected background pixels. A candidate lane is a maximal run
+/// of adjacent occupied minor-axis bins whose neighboring longitudinal bins
+/// overlap or touch. It is persistent when the candidate's combined occupied
+/// major-axis bins cover at least 60% of the stroke and span at least 75% of its
+/// longitudinal extent. Spread is pigment-weighted RMS distance from the pigment
+/// centroid, and edge concentration is the fraction of in-mask pigment on the
+/// four-neighbor boundary.
 struct BrushPhenotypeMetrics: Equatable {
     let area: Double
     let aspectRatio: Double
@@ -293,26 +295,50 @@ struct BrushPhenotypeMetrics: Equatable {
         }
         let longitudinalBinCount = lastLongitudinalBin - firstLongitudinalBin + 1
         guard longitudinalBinCount > 0 else { return 0 }
-        let persistentMinorBins: [Int] = longitudinalBinsByMinorBin.compactMap { entry -> Int? in
-            let (minorBin, bins) = entry
-            guard let first = bins.min(), let last = bins.max() else { return nil }
+        let candidateBands = candidateLaneBands(
+            longitudinalBinsByMinorBin: longitudinalBinsByMinorBin
+        )
+        return candidateBands.reduce(into: 0) { count, bins in
+            guard let first = bins.min(), let last = bins.max() else { return }
             let occupancyRatio = Double(bins.count) / Double(longitudinalBinCount)
             let spanRatio = Double(last - first + 1) / Double(longitudinalBinCount)
-            return occupancyRatio >= minimumLaneOccupancyRatio
-                && spanRatio >= minimumLaneSpanRatio
-                ? minorBin
-                : nil
-        }.sorted()
-
-        guard var previous = persistentMinorBins.first else { return 0 }
-        var count = 1
-        for bin in persistentMinorBins.dropFirst() {
-            if bin > previous + 1 {
+            if occupancyRatio >= minimumLaneOccupancyRatio,
+               spanRatio >= minimumLaneSpanRatio {
                 count += 1
             }
-            previous = bin
         }
-        return count
+    }
+
+    private static func candidateLaneBands(
+        longitudinalBinsByMinorBin: [Int: Set<Int>]
+    ) -> [Set<Int>] {
+        var bands: [Set<Int>] = []
+        var currentBand: Set<Int> = []
+        var previousMinorBin: Int?
+        var previousLongitudinalBins: Set<Int> = []
+
+        for minorBin in longitudinalBinsByMinorBin.keys.sorted() {
+            guard let longitudinalBins = longitudinalBinsByMinorBin[minorBin] else { continue }
+            let joinsCurrentBand = previousMinorBin == minorBin - 1
+                && longitudinalBinsTouch(previousLongitudinalBins, longitudinalBins)
+            if !joinsCurrentBand, !currentBand.isEmpty {
+                bands.append(currentBand)
+                currentBand = []
+            }
+            currentBand.formUnion(longitudinalBins)
+            previousMinorBin = minorBin
+            previousLongitudinalBins = longitudinalBins
+        }
+        if !currentBand.isEmpty {
+            bands.append(currentBand)
+        }
+        return bands
+    }
+
+    private static func longitudinalBinsTouch(_ lhs: Set<Int>, _ rhs: Set<Int>) -> Bool {
+        lhs.contains { bin in
+            rhs.contains(bin - 1) || rhs.contains(bin) || rhs.contains(bin + 1)
+        }
     }
 
     private static func pigmentMetrics(
@@ -460,6 +486,77 @@ struct BrushPhenotypeMetrics: Equatable {
         #expect(metrics.voidRatio == 0)
     }
 
+    @Test func twoShallowRotatedFullLanesMeasureAsTwoPersistentBands() {
+        let metrics = BrushPhenotypeMetrics.measure(
+            width: 32,
+            height: 24,
+            alpha: alphaMask(
+                width: 32,
+                height: 24,
+                foreground: [
+                    (10, 9), (11, 9), (12, 9), (13, 9), (14, 9), (15, 9),
+                    (16, 9), (17, 9), (18, 9), (19, 9), (20, 10), (21, 10),
+                    (10, 11), (11, 12), (12, 12), (13, 12), (14, 12), (15, 12),
+                    (16, 12), (17, 12), (18, 12), (19, 12), (20, 13), (21, 13)
+                ]
+            ),
+            pigment: [],
+            wetness: [],
+            coverageThreshold: 0.5
+        )
+
+        #expect(metrics.area == 24)
+        #expect((6.0...6.5).contains(metrics.orientation * 180 / .pi))
+        #expect(metrics.laneCount == 2)
+    }
+
+    @Test func twoMirroredShallowRotatedFullLanesMeasureAsTwoPersistentBands() {
+        let metrics = BrushPhenotypeMetrics.measure(
+            width: 32,
+            height: 24,
+            alpha: alphaMask(
+                width: 32,
+                height: 24,
+                foreground: [
+                    (12, 9), (13, 9), (14, 9), (15, 9), (16, 9), (17, 9),
+                    (18, 9), (19, 9), (20, 9), (21, 9), (10, 10), (11, 10),
+                    (21, 11), (12, 12), (13, 12), (14, 12), (15, 12), (16, 12),
+                    (17, 12), (18, 12), (19, 12), (20, 12), (10, 13), (11, 13)
+                ]
+            ),
+            pigment: [],
+            wetness: [],
+            coverageThreshold: 0.5
+        )
+
+        #expect(metrics.area == 24)
+        #expect((-6.5 ... -6.0).contains(metrics.orientation * 180 / .pi))
+        #expect(metrics.laneCount == 2)
+    }
+
+    @Test func adjacentLongitudinallyDisconnectedFragmentsDoNotFormPersistentBands() {
+        let metrics = BrushPhenotypeMetrics.measure(
+            width: 8,
+            height: 7,
+            alpha: [
+                0, 0, 0, 0, 0, 0, 0, 0,
+                1, 1, 1, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 1, 1, 1,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 1, 1, 1,
+                1, 1, 1, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0
+            ],
+            pigment: [],
+            wetness: [],
+            coverageThreshold: 0.5
+        )
+
+        #expect(metrics.area == 12)
+        #expect(abs(metrics.orientation) < 0.000_001)
+        #expect(metrics.laneCount == 0)
+    }
+
     @Test func staggeredHalfLengthBandsDoNotMeasureAsPersistentLanes() {
         let metrics = BrushPhenotypeMetrics.measure(
             width: 8,
@@ -575,5 +672,17 @@ struct BrushPhenotypeMetrics: Equatable {
             metrics.spreadRadius,
             metrics.edgeConcentration
         ]
+    }
+
+    private func alphaMask(
+        width: Int,
+        height: Int,
+        foreground: [(x: Int, y: Int)]
+    ) -> [Double] {
+        var alpha = Array(repeating: 0.0, count: width * height)
+        for point in foreground {
+            alpha[point.y * width + point.x] = 1
+        }
+        return alpha
     }
 }
