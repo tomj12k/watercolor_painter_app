@@ -225,6 +225,7 @@ private extension Double {
 public final class CanvasEventView: MTKView {
     private static let minimumZoom: CGFloat = 0.1
     private static let maximumZoom: CGFloat = 16
+    private static let minimumVisiblePaper: CGFloat = 48
     private static let spaceKeyCode: CGKeyCode = 49
 
     private var model: StudioModel
@@ -626,6 +627,15 @@ public final class CanvasEventView: MTKView {
     }
 
     private func requestCanvasDraw() {
+        // Keep a sliver of paper on screen no matter how far the customer
+        // pans or zooms, so the painting can always be found again.
+        let clampedPan = canvasTransform.clampedPan(
+            model.pan,
+            minimumVisiblePaper: Self.minimumVisiblePaper
+        )
+        if clampedPan != model.pan {
+            model.pan = clampedPan
+        }
         model.updateCanvasDisplay(self)
     }
 

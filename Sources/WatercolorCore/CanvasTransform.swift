@@ -48,6 +48,44 @@ public struct CanvasTransform: Equatable, Sendable {
         )
     }
 
+    /// Returns `candidatePan` limited so at least `minimumVisiblePaper` points
+    /// of paper remain inside the view on each axis. The customer can then
+    /// never scroll the painting entirely out of sight.
+    public func clampedPan(
+        _ candidatePan: CGSize,
+        minimumVisiblePaper: CGFloat
+    ) -> CGSize {
+        guard scale > 0 else { return candidatePan }
+        let displayedSize = CGSize(
+            width: canvasSize.width * scale,
+            height: canvasSize.height * scale
+        )
+        func clampedComponent(
+            _ component: CGFloat,
+            viewLength: CGFloat,
+            displayedLength: CGFloat
+        ) -> CGFloat {
+            let requiredVisible = min(minimumVisiblePaper, displayedLength, viewLength)
+            guard requiredVisible > 0 else { return component }
+            let centeredOrigin = (viewLength - displayedLength) * 0.5
+            let lowerBound = requiredVisible - centeredOrigin - displayedLength
+            let upperBound = viewLength - requiredVisible - centeredOrigin
+            return min(max(component, lowerBound), upperBound)
+        }
+        return CGSize(
+            width: clampedComponent(
+                candidatePan.width,
+                viewLength: viewSize.width,
+                displayedLength: displayedSize.width
+            ),
+            height: clampedComponent(
+                candidatePan.height,
+                viewLength: viewSize.height,
+                displayedLength: displayedSize.height
+            )
+        )
+    }
+
     public func canvasPoint(fromView point: CGPoint) -> CGPoint {
         let point = viewportPoint(fromView: point)
         return CGPoint(

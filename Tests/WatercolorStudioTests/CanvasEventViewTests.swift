@@ -929,6 +929,33 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 120, y: 128).alpha > 0.05)
     }
 
+    @Test func offscreenPanIsClampedSoThePaperStaysVisible() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [PaintLayer(name: "Layer")]
+        )
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device)
+        )
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+
+        model.pan = CGSize(width: 100_000, height: -100_000)
+        view.synchronize(with: model)
+
+        // The 256-point paper fills the 256-point view, so panning stops once
+        // only the 48-point minimum sliver of paper would remain visible.
+        #expect(model.pan == CGSize(width: 208, height: -208))
+
+        model.pan = CGSize(width: 30, height: -12)
+        view.synchronize(with: model)
+        #expect(model.pan == CGSize(width: 30, height: -12))
+    }
+
     @Test func zeroMotionEventsDoNotScheduleAdditionalPreviewUpdates() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject(
