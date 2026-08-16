@@ -1791,7 +1791,15 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         var simulationThreadCount = 0
         var largestDispatchedRegion: CanvasRegion?
         var simulatedSlices = Set<Int>()
-        var semanticPreviousPoint = initialSemanticPreviousPoint
+        let preparesStampOrientations = stroke.brush.behaviorVersion > 0
+            && stroke.tool != .smudge
+            && stroke.tool != .smear
+        var semanticPreviousPoint = preparesStampOrientations
+            ? initialSemanticPreviousPoint
+            : nil
+        #if DEBUG
+        var orientationPreparationPointCount = 0
+        #endif
 
         // Resolve coincident runs inside the same fixed batches used by live
         // preview. Fresh replay must not see farther into the future than a
@@ -1803,21 +1811,29 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             let immediatePreviousPoint = batchStart > 0
                 ? stroke.points[batchStart - 1]
                 : initialPreviousPoint
-            let immediateNextPoint = batchEnd < stroke.points.count
-                ? stroke.points[batchEnd]
-                : finalSemanticNextPoint
-            let semanticNextPoint = batch.points.last.flatMap { point in
-                immediateNextPoint.flatMap {
-                    Self.pointsAreCoincident($0, point) ? nil : $0
+            let orientations: [SIMD4<Float>]?
+            if preparesStampOrientations {
+                let immediateNextPoint = batchEnd < stroke.points.count
+                    ? stroke.points[batchEnd]
+                    : finalSemanticNextPoint
+                let semanticNextPoint = batch.points.last.flatMap { point in
+                    immediateNextPoint.flatMap {
+                        Self.pointsAreCoincident($0, point) ? nil : $0
+                    }
                 }
+                #if DEBUG
+                orientationPreparationPointCount += batch.points.count
+                #endif
+                orientations = Self.stampOrientations(
+                    for: batch.points,
+                    initialPreviousPoint: immediatePreviousPoint,
+                    initialSemanticPreviousPoint: semanticPreviousPoint,
+                    finalSemanticNextPoint: semanticNextPoint,
+                    brush: stroke.brush
+                )
+            } else {
+                orientations = nil
             }
-            let orientations = Self.stampOrientations(
-                for: batch.points,
-                initialPreviousPoint: immediatePreviousPoint,
-                initialSemanticPreviousPoint: semanticPreviousPoint,
-                finalSemanticNextPoint: semanticNextPoint,
-                brush: stroke.brush
-            )
             encode(
                 stroke: batch,
                 slice: slice,
@@ -1826,7 +1842,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                 orientations: orientations,
                 with: encoder
             )
-            if let lastPoint = batch.points.last {
+            if preparesStampOrientations, let lastPoint = batch.points.last {
                 semanticPreviousPoint = Self.firstNoncoincidentPoint(
                     to: lastPoint,
                     in: batch.points.dropLast().reversed()
@@ -1863,7 +1879,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             simulationStepCount: simulationStepCount,
             activeSliceDepth: simulatedSlices.count,
             simulationRegion: largestDispatchedRegion?.cgRect ?? .zero,
-            simulationThreadCount: simulationThreadCount
+            simulationThreadCount: simulationThreadCount,
+            orientationPreparationPointCount: orientationPreparationPointCount
         )
         #endif
     }
@@ -3221,13 +3238,15 @@ struct RendererDebugStrokeDispatch: Equatable {
     let activeSliceDepth: Int
     let simulationRegion: CGRect
     let simulationThreadCount: Int
+    let orientationPreparationPointCount: Int
 
     static let empty = Self(
         stampBatchCount: 0,
         simulationStepCount: 0,
         activeSliceDepth: 0,
         simulationRegion: .zero,
-        simulationThreadCount: 0
+        simulationThreadCount: 0,
+        orientationPreparationPointCount: 0
     )
 }
 

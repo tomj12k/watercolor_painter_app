@@ -753,7 +753,10 @@ import WatercolorCore
         }
     }
 
-    @Test func benchmarkConfiguredMaximumPreviewCommitAndCancelLatency() async throws {
+    @Test(arguments: [PaintTool.brush, .smudge, .smear])
+    func benchmarkConfiguredMaximumPreviewCommitAndCancelLatency(
+        tool: PaintTool
+    ) async throws {
         guard ProcessInfo.processInfo.environment["WATERCOLOR_RUN_BENCHMARK"] == "1",
               let device = MTLCreateSystemDefaultDevice()
         else { return }
@@ -766,6 +769,7 @@ import WatercolorCore
             maximumSerializedStorageBytes: 256 * 1024
         )
         var stroke = StrokeCommand.testDot(layerID: project.layers[0].id)
+        stroke.tool = tool
         stroke.brush.size = 4
         stroke.points = (0..<configuredMaximumPointCount).map { index in
             let progress = Double(index) / Double(configuredMaximumPointCount - 1)
@@ -820,6 +824,7 @@ import WatercolorCore
 
         print(
             "WATERCOLOR_RESOURCE_LATENCY phase=preview_transaction "
+                + "tool=\(tool.rawValue) "
                 + "configured_max_points=\(configuredMaximumPointCount) "
                 + "terminal_points=\(terminalPointCount) "
                 + "encode_ms=\(String(format: "%.3f", encodeMilliseconds)) "
@@ -860,6 +865,47 @@ import WatercolorCore
         #expect(dispatch.simulationRegion.width < CGFloat(project.canvas.width))
         #expect(dispatch.simulationRegion.height < CGFloat(project.canvas.height))
         #expect(dispatch.simulationThreadCount < project.canvas.width * project.canvas.height * 34)
+    }
+
+    @Test func orientationPreparationRunsOnlyForVersionOneStampTools() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let project = PaintingProject.testCanvas(128)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var template = StrokeCommand.testDot(layerID: project.layers[0].id)
+        template.points = (0..<9).map { index in
+            StrokePoint(
+                x: Double(32 + index * 4),
+                y: 64,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
+            )
+        }
+        let cases: [(PaintTool, Int, Int)] = [
+            (.brush, 1, 9),
+            (.water, 1, 9),
+            (.eraser, 1, 9),
+            (.dry, 1, 9),
+            (.smudge, 1, 0),
+            (.smear, 1, 0),
+            (.brush, 0, 0)
+        ]
+
+        for (tool, behaviorVersion, expectedPreparedPointCount) in cases {
+            var stroke = template
+            stroke.id = UUID()
+            stroke.tool = tool
+            stroke.brush.behaviorVersion = behaviorVersion
+
+            try renderer.renderAndWait(stroke: stroke)
+
+            #expect(
+                renderer.debugLastStrokeDispatch.orientationPreparationPointCount
+                    == expectedPreparedPointCount,
+                "\(tool.rawValue) behavior \(behaviorVersion) prepared unexpected orientations"
+            )
+        }
     }
 
     @Test func distantStrokesKeepSeparateDirtyRegionsAndAdvanceOnlyExplicitWetSlices() throws {
