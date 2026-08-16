@@ -1001,7 +1001,9 @@ public final class StudioModel: ObservableObject {
         )
         rendererRecoveryError = recoveryError
         rendererCheckpoints.removeAll()
-        error = StudioFailure.rendering(error: recoveryCause, project: project)
+        // The recovery banner carries the message and the Try Again control.
+        // Raising a modal alert here as well would cover that control, so
+        // recovery reports through the banner alone.
     }
 
     public func addLayer() {

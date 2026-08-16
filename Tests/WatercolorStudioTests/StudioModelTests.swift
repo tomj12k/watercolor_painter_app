@@ -1283,6 +1283,9 @@ import WatercolorCore
         #expect(documentUpdates.isEmpty)
         #expect(!model.capabilities.canPaint)
         #expect(model.rendererRecoveryError != nil)
+        // One report per failure: the recovery banner owns the message and
+        // the Try Again control, so no modal alert may appear on top of it.
+        #expect(model.error == nil)
         #expect(
             model.beginStrokePreview(.studioTestStroke(layerID: project.layers[0].id))
                 == .unavailable
@@ -1766,6 +1769,7 @@ import WatercolorCore
 
         #expect(model.project == project)
         #expect(model.rendererRecoveryError != nil)
+        #expect(model.error == nil)
         #expect(!model.capabilities.canPaint)
     }
 
