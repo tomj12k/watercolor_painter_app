@@ -109,6 +109,7 @@ import WatercolorCore
             }
         )
         var attemptedCanvases: [CanvasSize] = []
+        var customAttempts = 0
         let host = StudioDocumentHost(
             document: binding,
             modelFactory: { project, update in
@@ -118,6 +119,10 @@ import WatercolorCore
                         required: 2_000_000_000,
                         available: 1_000_000_000
                     )
+                }
+                customAttempts += 1
+                if customAttempts == 1 {
+                    throw RendererError.allocation("transient custom canvas allocation")
                 }
                 return try StudioModel(project: project, onDocumentUpdate: update)
             }
@@ -129,8 +134,14 @@ import WatercolorCore
         #expect(document.value.project == originalProject)
         #expect(document.value.needsInitialConfiguration)
 
-        #expect(host.configureNewDocument(smaller))
+        #expect(!host.configureNewDocument(smaller))
         #expect(attemptedCanvases == [originalProject.canvas, smaller.canvas])
+        #expect(document.value.project == originalProject)
+        #expect(document.value.needsInitialConfiguration)
+        #expect(documentWrites == 0)
+
+        #expect(host.configureNewDocument(smaller))
+        #expect(attemptedCanvases == [originalProject.canvas, smaller.canvas, smaller.canvas])
         #expect(host.model?.project.canvas == smaller.canvas)
         #expect(document.value.project.canvas == smaller.canvas)
         #expect(!document.value.needsInitialConfiguration)

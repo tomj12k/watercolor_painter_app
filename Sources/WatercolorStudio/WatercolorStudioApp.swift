@@ -370,9 +370,6 @@ struct StudioDocumentView: View {
                 failure: host.failure,
                 copyDetails: { failure in host.copyDetails(for: failure) },
                 dismissFailure: { host.dismissFailure() },
-                retryRenderer: host.canRetryRendererInitialization
-                    ? { _ = host.retryRendererInitialization() }
-                    : nil,
                 create: { configuration in
                     if host.configureNewDocument(configuration) {
                         initialDocumentFlow.configurationSucceeded()

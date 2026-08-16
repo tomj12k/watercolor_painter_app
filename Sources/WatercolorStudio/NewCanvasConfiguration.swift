@@ -81,7 +81,6 @@ struct NewCanvasConfigurationView: View {
     var failure: StudioFailure? = nil
     var copyDetails: (StudioFailure) -> Void = { _ in }
     var dismissFailure: () -> Void = {}
-    var retryRenderer: (() -> Void)? = nil
     let create: (NewCanvasConfiguration) -> Void
     let useDefault: () -> Void
 
@@ -158,9 +157,7 @@ struct NewCanvasConfigurationView: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     HStack {
-                        if let retryRenderer {
-                            Button("Try Again", action: retryRenderer)
-                        }
+                        Button("Try Again") { create(configuration) }
                         Button("Copy Details") { copyDetails(failure) }
                         Button("Dismiss", action: dismissFailure)
                     }
