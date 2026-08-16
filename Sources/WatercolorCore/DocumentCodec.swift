@@ -75,11 +75,13 @@ public enum PaintingDocumentCodec {
         } catch {
             throw DocumentCodecError.malformedData
         }
-        if header.schemaVersion == 1 {
-            var validationProject = project
-            validationProject.schemaVersion = PaintingProject.currentSchemaVersion
+        if header.schemaVersion == 1 || header.schemaVersion == 2 {
+            let validationProject = migrateLegacyProject(project, convertSRGBColor: false)
             try validate(validationProject, limits: limits)
-            project = migrateVersionOneProject(project)
+            project = migrateLegacyProject(
+                project,
+                convertSRGBColor: header.schemaVersion == 1
+            )
         }
         try validate(project, limits: limits)
         return project
@@ -101,18 +103,28 @@ public enum PaintingDocumentCodec {
         }
     }
 
-    private static func migrateVersionOneProject(_ legacyProject: PaintingProject) -> PaintingProject {
+    private static func migrateLegacyProject(
+        _ legacyProject: PaintingProject,
+        convertSRGBColor: Bool
+    ) -> PaintingProject {
         var migrated = legacyProject
         migrated.schemaVersion = PaintingProject.currentSchemaVersion
         migrated.commands = legacyProject.commands.map { command in
             guard case var .stroke(stroke) = command else { return command }
-            let legacyColor = stroke.brush.color
-            stroke.brush.color = .fromSRGB(
-                red: legacyColor.red,
-                green: legacyColor.green,
-                blue: legacyColor.blue,
-                alpha: legacyColor.alpha
-            )
+            if convertSRGBColor {
+                let legacyColor = stroke.brush.color
+                stroke.brush.color = .fromSRGB(
+                    red: legacyColor.red,
+                    green: legacyColor.green,
+                    blue: legacyColor.blue,
+                    alpha: legacyColor.alpha
+                )
+            }
+            stroke.brush.behaviorVersion = BrushSettings.legacyDynamics.behaviorVersion
+            stroke.brush.spacing = BrushSettings.legacyDynamics.spacing
+            stroke.brush.rotation = BrushSettings.legacyDynamics.rotation
+            stroke.brush.bristleStrength = BrushSettings.legacyDynamics.bristleStrength
+            stroke.brush.textureStrength = BrushSettings.legacyDynamics.textureStrength
             return .stroke(stroke)
         }
         return migrated

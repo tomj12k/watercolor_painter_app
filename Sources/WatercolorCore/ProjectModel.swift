@@ -136,6 +136,25 @@ public struct BrushSettings: Codable, Equatable, Sendable {
     public var water: Double
     public var granulation: Double
     public var edgeBloom: Double
+    public var behaviorVersion: Int
+    public var spacing: Double
+    public var rotation: Double
+    public var bristleStrength: Double
+    public var textureStrength: Double
+
+    public static let legacyDynamics: (
+        behaviorVersion: Int,
+        spacing: Double,
+        rotation: Double,
+        bristleStrength: Double,
+        textureStrength: Double
+    ) = (
+        behaviorVersion: 0,
+        spacing: 0.18,
+        rotation: 0,
+        bristleStrength: 0.5,
+        textureStrength: 0.5
+    )
 
     public init(
         shape: BrushShape,
@@ -148,7 +167,12 @@ public struct BrushSettings: Codable, Equatable, Sendable {
         flow: Double,
         water: Double,
         granulation: Double,
-        edgeBloom: Double
+        edgeBloom: Double,
+        behaviorVersion: Int = 1,
+        spacing: Double = 0.18,
+        rotation: Double = 0,
+        bristleStrength: Double = 0.5,
+        textureStrength: Double = 0.5
     ) {
         self.shape = shape
         self.hair = hair
@@ -161,6 +185,80 @@ public struct BrushSettings: Codable, Equatable, Sendable {
         self.water = water
         self.granulation = granulation
         self.edgeBloom = edgeBloom
+        self.behaviorVersion = behaviorVersion
+        self.spacing = spacing
+        self.rotation = rotation
+        self.bristleStrength = bristleStrength
+        self.textureStrength = textureStrength
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case shape
+        case hair
+        case texture
+        case style
+        case color
+        case size
+        case opacity
+        case flow
+        case water
+        case granulation
+        case edgeBloom
+        case behaviorVersion
+        case spacing
+        case rotation
+        case bristleStrength
+        case textureStrength
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        shape = try container.decode(BrushShape.self, forKey: .shape)
+        hair = try container.decode(BrushHair.self, forKey: .hair)
+        texture = try container.decode(BrushTexture.self, forKey: .texture)
+        style = try container.decode(WatercolorStyle.self, forKey: .style)
+        color = try container.decode(PaintColor.self, forKey: .color)
+        size = try container.decode(Double.self, forKey: .size)
+        opacity = try container.decode(Double.self, forKey: .opacity)
+        flow = try container.decode(Double.self, forKey: .flow)
+        water = try container.decode(Double.self, forKey: .water)
+        granulation = try container.decode(Double.self, forKey: .granulation)
+        edgeBloom = try container.decode(Double.self, forKey: .edgeBloom)
+        behaviorVersion = container.contains(.behaviorVersion)
+            ? try container.decode(Int.self, forKey: .behaviorVersion)
+            : Self.legacyDynamics.behaviorVersion
+        spacing = container.contains(.spacing)
+            ? try container.decode(Double.self, forKey: .spacing)
+            : Self.legacyDynamics.spacing
+        rotation = container.contains(.rotation)
+            ? try container.decode(Double.self, forKey: .rotation)
+            : Self.legacyDynamics.rotation
+        bristleStrength = container.contains(.bristleStrength)
+            ? try container.decode(Double.self, forKey: .bristleStrength)
+            : Self.legacyDynamics.bristleStrength
+        textureStrength = container.contains(.textureStrength)
+            ? try container.decode(Double.self, forKey: .textureStrength)
+            : Self.legacyDynamics.textureStrength
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(shape, forKey: .shape)
+        try container.encode(hair, forKey: .hair)
+        try container.encode(texture, forKey: .texture)
+        try container.encode(style, forKey: .style)
+        try container.encode(color, forKey: .color)
+        try container.encode(size, forKey: .size)
+        try container.encode(opacity, forKey: .opacity)
+        try container.encode(flow, forKey: .flow)
+        try container.encode(water, forKey: .water)
+        try container.encode(granulation, forKey: .granulation)
+        try container.encode(edgeBloom, forKey: .edgeBloom)
+        try container.encode(behaviorVersion, forKey: .behaviorVersion)
+        try container.encode(spacing, forKey: .spacing)
+        try container.encode(rotation, forKey: .rotation)
+        try container.encode(bristleStrength, forKey: .bristleStrength)
+        try container.encode(textureStrength, forKey: .textureStrength)
     }
 
     public static let `default` = Self(
@@ -174,7 +272,12 @@ public struct BrushSettings: Codable, Equatable, Sendable {
         flow: 0.4,
         water: 0.6,
         granulation: 0.2,
-        edgeBloom: 0.15
+        edgeBloom: 0.15,
+        behaviorVersion: 1,
+        spacing: 0.18,
+        rotation: 0,
+        bristleStrength: 0.5,
+        textureStrength: 0.5
     )
 }
 
@@ -393,7 +496,7 @@ public enum ProjectValidationError: Error, Equatable, Sendable {
 }
 
 public struct PaintingProject: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 2
+    public static let currentSchemaVersion = 3
     public static let minimumCanvasDimension = 256
     public static let maximumCanvasDimension = 4096
     public static let maximumLayerCount = 12
@@ -602,6 +705,16 @@ public struct PaintingProject: Codable, Equatable, Sendable {
         }
         guard [brush.opacity, brush.flow, brush.water, brush.granulation, brush.edgeBloom]
             .allSatisfy(Self.unitRangeContains)
+        else {
+            throw ProjectValidationError.invalidBrushParameter(stroke.id)
+        }
+        guard (0...1).contains(brush.behaviorVersion),
+              brush.spacing.isFinite,
+              (0.08...0.60).contains(brush.spacing),
+              brush.rotation.isFinite,
+              (-180...180).contains(brush.rotation),
+              Self.unitRangeContains(brush.bristleStrength),
+              Self.unitRangeContains(brush.textureStrength)
         else {
             throw ProjectValidationError.invalidBrushParameter(stroke.id)
         }

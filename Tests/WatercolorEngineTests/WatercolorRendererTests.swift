@@ -2735,8 +2735,13 @@ import WatercolorCore
         let reopened = try PaintingDocumentCodec.decode(reencoded)
         var expectedStroke = legacyStroke
         expectedStroke.brush.color = .fromSRGB(red: 0.5, green: 0.25, blue: 0.75)
+        expectedStroke.brush.behaviorVersion = BrushSettings.legacyDynamics.behaviorVersion
+        expectedStroke.brush.spacing = BrushSettings.legacyDynamics.spacing
+        expectedStroke.brush.rotation = BrushSettings.legacyDynamics.rotation
+        expectedStroke.brush.bristleStrength = BrushSettings.legacyDynamics.bristleStrength
+        expectedStroke.brush.textureStrength = BrushSettings.legacyDynamics.textureStrength
         let expected = PaintingProject(
-            schemaVersion: 2,
+            schemaVersion: 3,
             canvas: legacy.canvas,
             paper: legacy.paper,
             layers: legacy.layers,

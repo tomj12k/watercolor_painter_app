@@ -146,7 +146,7 @@ import Testing
         #expect(try PaintingDocumentCodec.decode(data) == project)
     }
 
-    @Test func codecMigratesVersionOneSRGBMidtonesToVersionTwoLinearColorExactlyOnce() throws {
+    @Test func codecMigratesVersionOneSRGBMidtonesAndLegacyDynamicsExactlyOnce() throws {
         let layer = PaintLayer(
             id: UUID(uuidString: "751CB1CA-E34A-4633-8CC9-0C999F0BE4C8")!,
             name: "Legacy layer"
@@ -163,21 +163,43 @@ import Testing
 
         let migrated = try PaintingDocumentCodec.decode(JSONEncoder().encode(legacy))
         let migratedStroke = try #require(migrated.commands.first?.stroke)
-        #expect(migrated.schemaVersion == 2)
+        #expect(migrated.schemaVersion == 3)
         #expect(abs(migratedStroke.brush.color.red - 0.214_041_140_482_232_55) < 1e-12)
         #expect(abs(migratedStroke.brush.color.green - 0.050_876_088_171_556_79) < 1e-12)
         #expect(abs(migratedStroke.brush.color.blue - 0.522_521_553_968_392_1) < 1e-12)
+        #expect(migratedStroke.brush.behaviorVersion == 0)
+        #expect(migratedStroke.brush.spacing == 0.18)
+        #expect(migratedStroke.brush.rotation == 0)
+        #expect(migratedStroke.brush.bristleStrength == 0.5)
+        #expect(migratedStroke.brush.textureStrength == 0.5)
 
         let reencoded = try PaintingDocumentCodec.encode(migrated)
         let redecoded = try PaintingDocumentCodec.decode(reencoded)
         #expect(redecoded == migrated)
-        #expect(try JSONDecoder().decode(SchemaVersionFixture.self, from: reencoded).schemaVersion == 2)
+        let redecodedStroke = try #require(redecoded.commands.first?.stroke)
+        #expect(redecodedStroke.brush.color == migratedStroke.brush.color)
+        #expect(try JSONDecoder().decode(SchemaVersionFixture.self, from: reencoded).schemaVersion == 3)
     }
 
-    @Test func codecPreservesVersionTwoLinearMidtonesWithoutRemigration() throws {
+    @Test func codecMigratesVersionTwoBrushesWithoutVisualFieldLossOrColorRemigration() throws {
         let layer = PaintLayer(name: "Linear layer")
         var brush = BrushSettings.default
+        brush.shape = .fan
+        brush.hair = .synthetic
+        brush.texture = .salt
+        brush.style = .bloom
         brush.color = PaintColor(red: 0.5, green: 0.25, blue: 0.75, alpha: 1)
+        brush.size = 73
+        brush.opacity = 0.44
+        brush.flow = 0.55
+        brush.water = 0.66
+        brush.granulation = 0.77
+        brush.edgeBloom = 0.88
+        brush.behaviorVersion = 1
+        brush.spacing = 0.31
+        brush.rotation = 45
+        brush.bristleStrength = 0.2
+        brush.textureStrength = 0.9
         let current = PaintingProject(
             schemaVersion: 2,
             canvas: CanvasSize(width: 256, height: 256),
@@ -189,8 +211,74 @@ import Testing
         let decoded = try PaintingDocumentCodec.decode(JSONEncoder().encode(current))
         let decodedStroke = try #require(decoded.commands.first?.stroke)
 
-        #expect(decoded.schemaVersion == 2)
+        #expect(decoded.schemaVersion == 3)
+        #expect(decodedStroke.brush.shape == brush.shape)
+        #expect(decodedStroke.brush.hair == brush.hair)
+        #expect(decodedStroke.brush.texture == brush.texture)
+        #expect(decodedStroke.brush.style == brush.style)
         #expect(decodedStroke.brush.color == brush.color)
+        #expect(decodedStroke.brush.size == brush.size)
+        #expect(decodedStroke.brush.opacity == brush.opacity)
+        #expect(decodedStroke.brush.flow == brush.flow)
+        #expect(decodedStroke.brush.water == brush.water)
+        #expect(decodedStroke.brush.granulation == brush.granulation)
+        #expect(decodedStroke.brush.edgeBloom == brush.edgeBloom)
+        #expect(decodedStroke.brush.behaviorVersion == 0)
+        #expect(decodedStroke.brush.spacing == 0.18)
+        #expect(decodedStroke.brush.rotation == 0)
+        #expect(decodedStroke.brush.bristleStrength == 0.5)
+        #expect(decodedStroke.brush.textureStrength == 0.5)
+    }
+
+    @Test func codecPreservesVersionThreeDynamicsThroughEncodeDecode() throws {
+        var project = PaintingProject.newDefault()
+        var brush = BrushSettings.default
+        brush.spacing = 0.37
+        brush.rotation = 123
+        brush.bristleStrength = 0.24
+        brush.textureStrength = 0.86
+        project.commands = [.stroke(.fixture(layerID: project.layers[0].id, brush: brush))]
+
+        let encoded = try PaintingDocumentCodec.encode(project)
+        let decoded = try PaintingDocumentCodec.decode(encoded)
+
+        #expect(decoded == project)
+        #expect(try #require(decoded.commands.first?.stroke).brush == brush)
+    }
+
+    @Test func codecDefaultsMissingVersionThreeDynamicsToLegacyBehavior() throws {
+        var project = PaintingProject.newDefault()
+        project.commands = [.stroke(.fixture(layerID: project.layers[0].id))]
+        let data = try replacingBrushDynamics(
+            in: JSONEncoder().encode(project),
+            with: [:],
+            removingExistingDynamics: true
+        )
+
+        let decoded = try PaintingDocumentCodec.decode(data)
+        let brush = try #require(decoded.commands.first?.stroke).brush
+
+        #expect(decoded.schemaVersion == 3)
+        #expect(brush.behaviorVersion == 0)
+        #expect(brush.spacing == 0.18)
+        #expect(brush.rotation == 0)
+        #expect(brush.bristleStrength == 0.5)
+        #expect(brush.textureStrength == 0.5)
+    }
+
+    @Test func codecRejectsMalformedAndUnknownBehaviorVersions() throws {
+        var project = PaintingProject.newDefault()
+        project.commands = [.stroke(.fixture(layerID: project.layers[0].id))]
+        let encoded = try JSONEncoder().encode(project)
+        let malformed = try replacingBrushDynamics(in: encoded, with: ["behaviorVersion": "new"])
+        let unknown = try replacingBrushDynamics(in: encoded, with: ["behaviorVersion": 42])
+
+        #expect(throws: DocumentCodecError.malformedData) {
+            _ = try PaintingDocumentCodec.decode(malformed)
+        }
+        #expect(throws: DocumentCodecError.validationFailed(.invalidBrushParameter(project.commands[0].id))) {
+            _ = try PaintingDocumentCodec.decode(unknown)
+        }
     }
 
     @Test func codecRoundTripsEveryPaintingCommandCaseIncludingDuplicate() throws {
@@ -424,6 +512,69 @@ import Testing
 
 private struct SchemaVersionFixture: Decodable {
     let schemaVersion: Int
+}
+
+private let dynamicBrushKeys = [
+    "behaviorVersion",
+    "spacing",
+    "rotation",
+    "bristleStrength",
+    "textureStrength"
+]
+
+private func replacingBrushDynamics(
+    in data: Data,
+    with replacements: [String: Any],
+    removingExistingDynamics: Bool = false
+) throws -> Data {
+    let object = try JSONSerialization.jsonObject(with: data)
+    let replaced = replaceBrushDynamics(
+        in: object,
+        with: replacements,
+        removingExistingDynamics: removingExistingDynamics
+    )
+    return try JSONSerialization.data(withJSONObject: replaced, options: [.sortedKeys])
+}
+
+private func replaceBrushDynamics(
+    in value: Any,
+    with replacements: [String: Any],
+    removingExistingDynamics: Bool
+) -> Any {
+    if let array = value as? [Any] {
+        return array.map {
+            replaceBrushDynamics(
+                in: $0,
+                with: replacements,
+                removingExistingDynamics: removingExistingDynamics
+            )
+        }
+    }
+    guard var dictionary = value as? [String: Any] else { return value }
+
+    if dictionary["shape"] != nil,
+       dictionary["hair"] != nil,
+       dictionary["texture"] != nil,
+       dictionary["style"] != nil {
+        if removingExistingDynamics {
+            for key in dynamicBrushKeys {
+                dictionary.removeValue(forKey: key)
+            }
+        }
+        for (key, replacement) in replacements {
+            dictionary[key] = replacement
+        }
+        return dictionary
+    }
+
+    for (key, nested) in dictionary {
+        dictionary[key] = replaceBrushDynamics(
+            in: nested,
+            with: replacements,
+            removingExistingDynamics: removingExistingDynamics
+        )
+    }
+    return dictionary
 }
 
 private extension PaintingCommand {

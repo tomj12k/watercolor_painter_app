@@ -1,6 +1,6 @@
 public extension BrushSettings {
     /// Returns these settings with the deterministic parameters for `preset` applied.
-    /// Brush identity and color remain unchanged when a style is selected.
+    /// Brush identity, color, and dynamics remain unchanged when a style is selected.
     func applying(_ preset: WatercolorStyle) -> Self {
         let parameters: (opacity: Double, flow: Double, water: Double, granulation: Double, edgeBloom: Double)
 
