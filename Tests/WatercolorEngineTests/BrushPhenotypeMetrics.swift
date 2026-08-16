@@ -14,10 +14,11 @@ import Testing
 /// angle in radians in [-pi/2, pi/2), and aspect ratio uses pixel-center moments
 /// plus a pixel's intrinsic 1/12 variance on both axes. Roughness is four-neighbor
 /// perimeter divided by the circumference of an equal-area circle. Voids are
-/// enclosed four-connected background pixels. Lanes are contiguous occupied
-/// one-pixel bins after projection onto the minor axis. Spread is pigment-weighted
-/// RMS distance from the pigment centroid, and edge concentration is the fraction
-/// of in-mask pigment on the four-neighbor boundary.
+/// enclosed four-connected background pixels. A persistent lane is a contiguous
+/// minor-axis band whose occupied major-axis bins cover at least 60% of the
+/// stroke and span at least 75% of its longitudinal extent. Spread is
+/// pigment-weighted RMS distance from the pigment centroid, and edge
+/// concentration is the fraction of in-mask pigment on the four-neighbor boundary.
 struct BrushPhenotypeMetrics: Equatable {
     let area: Double
     let aspectRatio: Double
@@ -32,6 +33,8 @@ struct BrushPhenotypeMetrics: Equatable {
 
     private static let defaultCoverageThreshold = 1.0 / 256.0
     private static let pixelVariance = 1.0 / 12.0
+    private static let minimumLaneOccupancyRatio = 0.60
+    private static let minimumLaneSpanRatio = 0.75
 
     static func measure(
         width: Int,
@@ -272,16 +275,38 @@ struct BrushPhenotypeMetrics: Equatable {
         foregroundIndices: [Int]
     ) -> Int {
         guard !foregroundIndices.isEmpty else { return 0 }
+        let tangentX = cos(orientation)
+        let tangentY = sin(orientation)
         let normalX = -sin(orientation)
         let normalY = cos(orientation)
-        let occupiedBins = Set(foregroundIndices.map { index in
+        var longitudinalBinsByMinorBin: [Int: Set<Int>] = [:]
+        var firstLongitudinalBin = Int.max
+        var lastLongitudinalBin = Int.min
+        for index in foregroundIndices {
             let x = Double(index % width)
             let y = Double(index / width)
-            return Int((x * normalX + y * normalY).rounded())
-        }).sorted()
-        guard var previous = occupiedBins.first else { return 0 }
+            let longitudinalBin = Int((x * tangentX + y * tangentY).rounded())
+            let minorBin = Int((x * normalX + y * normalY).rounded())
+            longitudinalBinsByMinorBin[minorBin, default: []].insert(longitudinalBin)
+            firstLongitudinalBin = min(firstLongitudinalBin, longitudinalBin)
+            lastLongitudinalBin = max(lastLongitudinalBin, longitudinalBin)
+        }
+        let longitudinalBinCount = lastLongitudinalBin - firstLongitudinalBin + 1
+        guard longitudinalBinCount > 0 else { return 0 }
+        let persistentMinorBins: [Int] = longitudinalBinsByMinorBin.compactMap { entry -> Int? in
+            let (minorBin, bins) = entry
+            guard let first = bins.min(), let last = bins.max() else { return nil }
+            let occupancyRatio = Double(bins.count) / Double(longitudinalBinCount)
+            let spanRatio = Double(last - first + 1) / Double(longitudinalBinCount)
+            return occupancyRatio >= minimumLaneOccupancyRatio
+                && spanRatio >= minimumLaneSpanRatio
+                ? minorBin
+                : nil
+        }.sorted()
+
+        guard var previous = persistentMinorBins.first else { return 0 }
         var count = 1
-        for bin in occupiedBins.dropFirst() {
+        for bin in persistentMinorBins.dropFirst() {
             if bin > previous + 1 {
                 count += 1
             }
@@ -414,25 +439,73 @@ struct BrushPhenotypeMetrics: Equatable {
         #expect(metrics.laneCount == 1)
     }
 
-    @Test func twoSeparatedPersistentRowsMeasureAsTwoLanesNotVoids() {
+    @Test func twoSeparatedFullLengthRowsMeasureAsTwoPersistentLanes() {
         let metrics = BrushPhenotypeMetrics.measure(
-            width: 5,
+            width: 8,
             height: 5,
             alpha: [
-                0, 0, 0, 0, 0,
-                1, 1, 1, 1, 1,
-                0, 0, 0, 0, 0,
-                1, 1, 1, 1, 1,
-                0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0, 0, 0,
+                1, 1, 1, 1, 1, 1, 1, 1,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                1, 1, 1, 1, 1, 1, 1, 1,
+                0, 0, 0, 0, 0, 0, 0, 0
             ],
             pigment: [],
             wetness: [],
             coverageThreshold: 0.5
         )
 
-        #expect(metrics.area == 10)
+        #expect(metrics.area == 16)
         #expect(metrics.laneCount == 2)
         #expect(metrics.voidRatio == 0)
+    }
+
+    @Test func staggeredHalfLengthBandsDoNotMeasureAsPersistentLanes() {
+        let metrics = BrushPhenotypeMetrics.measure(
+            width: 8,
+            height: 9,
+            alpha: [
+                0, 0, 0, 0, 0, 0, 0, 0,
+                1, 1, 1, 1, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 1, 1, 1, 1,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 1, 1, 1, 1,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                1, 1, 1, 1, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0
+            ],
+            pigment: [],
+            wetness: [],
+            coverageThreshold: 0.5
+        )
+
+        #expect(metrics.area == 16)
+        #expect(metrics.laneCount == 0)
+    }
+
+    @Test func alternatingDisconnectedNoiseDoesNotMeasureAsPersistentLanes() {
+        let metrics = BrushPhenotypeMetrics.measure(
+            width: 8,
+            height: 9,
+            alpha: [
+                0, 0, 0, 0, 0, 0, 0, 0,
+                1, 0, 1, 0, 1, 0, 1, 0,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 1, 0, 1, 0, 1, 0, 1,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 1, 0, 1, 0, 1, 0, 1,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                1, 0, 1, 0, 1, 0, 1, 0,
+                0, 0, 0, 0, 0, 0, 0, 0
+            ],
+            pigment: [],
+            wetness: [],
+            coverageThreshold: 0.5
+        )
+
+        #expect(metrics.area == 16)
+        #expect(metrics.laneCount == 0)
     }
 
     @Test func massesSpreadAndEdgeConcentrationUseIndependentScalarFields() {

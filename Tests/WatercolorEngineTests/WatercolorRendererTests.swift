@@ -77,39 +77,85 @@ import WatercolorCore
         #expect(before.compositePixelFormat == .bgra8Unorm)
     }
 
-    @Test func bulkLayerFieldReadbackPreservesLayoutBoundsAndLayerIdentity() throws {
-        guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let project = PaintingProject.testCanvas(64, paper: .hotPress)
+    @Test func bulkLayerFieldReadbackPreservesTwoSliceLayoutBoundsAndPositiveFields() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let bottom = PaintLayer(
+            id: UUID(uuidString: "6042E515-0F0C-429C-ACB8-2757B445C0E4")!,
+            name: "Bottom"
+        )
+        let top = PaintLayer(
+            id: UUID(uuidString: "A391560D-C044-4564-968E-BAC8A469DD4C")!,
+            name: "Top"
+        )
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 64, height: 64),
+            paper: .hotPress,
+            layers: [bottom, top]
+        )
         let renderer = try WatercolorRenderer(project: project, device: device)
-        let layerID = project.layers[0].id
-        try renderer.renderAndWait(stroke: .testDot(
-            layerID: layerID,
+        var bottomStroke = StrokeCommand.testDot(
+            layerID: bottom.id,
             color: PaintColor(red: 1, green: 0, blue: 0),
             x: 16,
             y: 8
-        ))
-        try renderer.renderAndWait(stroke: .testDot(
-            layerID: layerID,
+        )
+        bottomStroke.brush.water = 0.25
+        var topStroke = StrokeCommand.testDot(
+            layerID: top.id,
             color: PaintColor(red: 0, green: 0, blue: 1),
             x: 48,
             y: 56
-        ))
+        )
+        topStroke.brush.water = 0.9
+        try renderer.renderAndWait(stroke: bottomStroke)
+        try renderer.renderAndWait(stroke: topStroke)
 
-        let fields = try renderer.debugLayerFields(layerID: layerID)
+        let bottomFields = try renderer.debugLayerFields(layerID: bottom.id)
+        let topFields = try renderer.debugLayerFields(layerID: top.id)
 
-        #expect(fields.width == 64)
-        #expect(fields.height == 64)
-        #expect(fields.pigment.count == 4_096)
-        #expect(fields.wetness.count == 4_096)
-        for (x, y) in [(0, 0), (16, 8), (48, 56)] {
-            #expect(try fields.pigmentColor(x: x, y: y) == renderer.debugPixel(x: x, y: y, layerID: layerID))
-            #expect(try fields.wetnessValue(x: x, y: y) == renderer.debugWetness(x: x, y: y, layerID: layerID))
+        for fields in [bottomFields, topFields] {
+            #expect(fields.width == 64)
+            #expect(fields.height == 64)
+            #expect(fields.pigment.count == 4_096)
+            #expect(fields.wetness.count == 4_096)
+        }
+        let bottomPigment = try bottomFields.pigmentColor(x: 16, y: 8)
+        let bottomWetness = try bottomFields.wetnessValue(x: 16, y: 8)
+        #expect(bottomPigment.alpha > 0)
+        #expect(bottomPigment.red > bottomPigment.blue)
+        #expect(bottomWetness > 0)
+        #expect(try bottomFields.pigmentColor(x: 48, y: 56).alpha == 0)
+        #expect(try bottomFields.wetnessValue(x: 48, y: 56) == 0)
+
+        let topPigment = try topFields.pigmentColor(x: 48, y: 56)
+        let topWetness = try topFields.wetnessValue(x: 48, y: 56)
+        #expect(topPigment.alpha > 0)
+        #expect(topPigment.blue > topPigment.red)
+        #expect(topWetness > bottomWetness)
+        #expect(try topFields.pigmentColor(x: 16, y: 8).alpha == 0)
+        #expect(try topFields.wetnessValue(x: 16, y: 8) == 0)
+
+        #expect(
+            try bottomFields.pigmentColor(x: 16, y: 8)
+                == renderer.debugPixel(x: 16, y: 8, layerID: bottom.id)
+        )
+        #expect(
+            try bottomFields.wetnessValue(x: 16, y: 8)
+                == renderer.debugWetness(x: 16, y: 8, layerID: bottom.id)
+        )
+        #expect(
+            try topFields.pigmentColor(x: 48, y: 56)
+                == renderer.debugPixel(x: 48, y: 56, layerID: top.id)
+        )
+        #expect(
+            try topFields.wetnessValue(x: 48, y: 56)
+                == renderer.debugWetness(x: 48, y: 56, layerID: top.id)
+        )
+        #expect(throws: RendererError.self) {
+            try bottomFields.pigmentColor(x: -1, y: 0)
         }
         #expect(throws: RendererError.self) {
-            try fields.pigmentColor(x: -1, y: 0)
-        }
-        #expect(throws: RendererError.self) {
-            try fields.wetnessValue(x: 64, y: 0)
+            try topFields.wetnessValue(x: 64, y: 0)
         }
         let missingLayerID = UUID(uuidString: "8CE99563-FF17-4FF7-9A52-9243478037E6")!
         #expect(throws: RendererError.unknownLayer(missingLayerID)) {
@@ -2467,7 +2513,7 @@ import WatercolorCore
     }
 
     @Test func canonicalRendererPhenotypeMetricsAreFiniteAndStable() throws {
-        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let device = try #require(MTLCreateSystemDefaultDevice())
 
         for fixture in canonicalPhenotypeFixtures() {
             let first = try renderPhenotypeMetrics(fixture, device: device)
@@ -2477,7 +2523,12 @@ import WatercolorCore
                 for value in phenotypeMetricScalars(metrics) {
                     #expect(value.isFinite, "\(fixture.name) produced a non-finite metric")
                 }
-                #expect(metrics.laneCount >= 0)
+                #expect(metrics.area > 0, "\(fixture.name) produced an empty coverage mask")
+                #expect(metrics.pigmentMass > 0, "\(fixture.name) produced no pigment")
+                #expect(metrics.wetnessMass > 0, "\(fixture.name) produced no wetness")
+                #expect(metrics.spreadRadius > 0, "\(fixture.name) produced no spatial spread")
+                #expect(metrics.edgeRoughness > 0, "\(fixture.name) produced no measurable edge")
+                #expect(metrics.laneCount > 0, "\(fixture.name) produced no persistent lane")
             }
             expectStablePhenotypeMetrics(first, second, fixtureName: fixture.name)
             print("Brush phenotype characterization [\(fixture.name)]: \(phenotypeDiagnostics(first))")
