@@ -15,6 +15,8 @@ struct StrokeFinishResult {
 }
 
 struct CanvasStrokeBuilder {
+    private static let initialPointCapacity = 256
+
     private let canvasSize: CGSize
     private let maximumPointCount: Int
     private var stroke: StrokeCommand?
@@ -32,6 +34,14 @@ struct CanvasStrokeBuilder {
 
     var currentStroke: StrokeCommand? { stroke }
 
+    var strokeID: UUID? { stroke?.id }
+
+    var pointStorageIdentityForTesting: UInt? {
+        stroke?.points.withUnsafeBufferPointer { buffer in
+            buffer.baseAddress.map { UInt(bitPattern: $0) }
+        }
+    }
+
     mutating func begin(
         layerID: UUID,
         tool: PaintTool,
@@ -39,11 +49,13 @@ struct CanvasStrokeBuilder {
         point: StrokePoint
     ) {
         let point = clamped(point)
+        var points = [point]
+        points.reserveCapacity(min(maximumPointCount, Self.initialPointCapacity))
         stroke = StrokeCommand(
             layerID: layerID,
             tool: tool,
             brush: brush,
-            points: [point]
+            points: points
         )
         latestInputPoint = point
         distanceToNextSample = nil
@@ -52,7 +64,7 @@ struct CanvasStrokeBuilder {
 
     mutating func append(_ point: StrokePoint) -> StrokeAppendResult {
         guard !isExhausted,
-              let stroke,
+              stroke != nil,
               let previousInputPoint = latestInputPoint
         else {
             return StrokeAppendResult(points: [], isExhausted: isExhausted)
@@ -62,8 +74,8 @@ struct CanvasStrokeBuilder {
             latestInputPoint = point
             return StrokeAppendResult(points: [], isExhausted: false)
         }
-        let spacing = samplingSpacing(for: stroke.brush)
-        let remainingCapacity = maximumPointCount - stroke.points.count
+        let spacing = samplingSpacing(for: stroke!.brush)
+        let remainingCapacity = maximumPointCount - stroke!.points.count
         guard remainingCapacity > 0 else {
             isExhausted = true
             return StrokeAppendResult(points: [], isExhausted: true)
@@ -99,19 +111,19 @@ struct CanvasStrokeBuilder {
         if let point {
             appendedPoints = append(point).points
         }
-        guard !isExhausted, var stroke, let endpoint = latestInputPoint else {
+        guard !isExhausted, stroke != nil, let endpoint = latestInputPoint else {
             return StrokeFinishResult(stroke: nil, points: [], isExhausted: true)
         }
-        guard let lastStoredPoint = stroke.points.last else {
+        guard let lastStoredPoint = stroke!.points.last else {
             return StrokeFinishResult(stroke: nil, points: [], isExhausted: false)
         }
         if samePosition(lastStoredPoint, endpoint) {
-            stroke.points[stroke.points.count - 1] = endpoint
+            stroke!.points[stroke!.points.count - 1] = endpoint
         } else {
-            guard stroke.points.count < maximumPointCount else {
+            guard stroke!.points.count < maximumPointCount else {
                 return StrokeFinishResult(stroke: nil, points: [], isExhausted: true)
             }
-            stroke.points.append(endpoint)
+            stroke!.points.append(endpoint)
             appendedPoints.append(endpoint)
         }
         return StrokeFinishResult(stroke: stroke, points: appendedPoints, isExhausted: false)
@@ -171,6 +183,10 @@ public final class CanvasEventView: MTKView {
 
     var hasTransientInputStateForTesting: Bool {
         spaceKeyDown || panAnchor != nil || strokeBuilder != nil
+    }
+
+    var strokePointStorageIdentityForTesting: UInt? {
+        strokeBuilder?.pointStorageIdentityForTesting
     }
 
     public override func resignFirstResponder() -> Bool {
@@ -343,9 +359,8 @@ public final class CanvasEventView: MTKView {
     }
 
     private func appendStrokePoint(from event: NSEvent) {
-        guard var builder = strokeBuilder else { return }
-        let appendResult = builder.append(strokePoint(from: event))
-        strokeBuilder = builder
+        guard strokeBuilder != nil else { return }
+        let appendResult = strokeBuilder!.append(strokePoint(from: event))
         guard !appendResult.isExhausted else {
             model.cancelStrokePreview()
             strokeBuilder = nil
@@ -353,15 +368,15 @@ public final class CanvasEventView: MTKView {
             return
         }
         guard !appendResult.points.isEmpty else { return }
-        if let stroke = builder.currentStroke {
-            model.appendStrokePreview(id: stroke.id, points: appendResult.points)
+        if let strokeID = strokeBuilder?.strokeID {
+            model.appendStrokePreview(id: strokeID, points: appendResult.points)
         }
     }
 
     private func completeStroke(with event: NSEvent) {
-        guard var builder = strokeBuilder else { return }
+        guard strokeBuilder != nil else { return }
+        let completion = strokeBuilder!.finish(at: strokePoint(from: event))
         strokeBuilder = nil
-        let completion = builder.finish(at: strokePoint(from: event))
         guard !completion.isExhausted else {
             model.cancelStrokePreview()
             updateInputAvailability()

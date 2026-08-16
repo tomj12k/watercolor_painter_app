@@ -30,6 +30,38 @@ import WatercolorCore
         #expect(builder.currentStroke?.points.count == 3)
     }
 
+    @Test func longBurstAppendsInPlaceWithoutRelocatingTheReservedPointBuffer() throws {
+        var brush = BrushSettings.default
+        brush.size = 100
+        var builder = CanvasStrokeBuilder(
+            canvasSize: .init(width: 4096, height: 256),
+            maximumPointCount: 256
+        )
+        builder.begin(
+            layerID: UUID(),
+            tool: .brush,
+            brush: brush,
+            point: StrokePoint(x: 0, y: 128, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
+        )
+        let pointStorageIdentity = try #require(builder.pointStorageIdentityForTesting)
+
+        for index in 1...200 {
+            let append = builder.append(StrokePoint(
+                x: Double(index * 18),
+                y: 128,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
+            ))
+            #expect(append.points.count == 1)
+            #expect(!append.isExhausted)
+            #expect(builder.pointStorageIdentityForTesting == pointStorageIdentity)
+        }
+
+        #expect(try #require(builder.currentStroke).points.count == 201)
+    }
+
     @Test func finishReturnsOnlyPointsAddedByThePointerUpEvent() throws {
         var brush = BrushSettings.default
         brush.size = 100
@@ -355,6 +387,47 @@ import WatercolorCore
             StrokePoint(x: 82, y: 192, pressure: 1, tiltX: 0, tiltY: 0, time: 1),
             StrokePoint(x: 100, y: 192, pressure: 1, tiltX: 0, tiltY: 0, time: 2)
         ]])
+        model.cancelStrokePreview()
+    }
+
+    @Test func longCanvasDragMutatesTheStoredBuilderWithoutRepeatedPrefixCopies() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [PaintLayer(name: "Layer")]
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        model.brush.size = 1
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown,
+            timestamp: 0,
+            eventNumber: 0,
+            location: CGPoint(x: 20, y: 64)
+        )))
+        view.mouseDragged(with: try #require(canvasMouseEvent(
+            .leftMouseDragged,
+            timestamp: 1,
+            eventNumber: 1,
+            location: CGPoint(x: 21, y: 64)
+        )))
+        let stableStorageIdentity = try #require(view.strokePointStorageIdentityForTesting)
+
+        for index in 2...200 {
+            view.mouseDragged(with: try #require(canvasMouseEvent(
+                .leftMouseDragged,
+                timestamp: Double(index),
+                eventNumber: index,
+                location: CGPoint(x: 20 + index, y: 64)
+            )))
+            #expect(view.strokePointStorageIdentityForTesting == stableStorageIdentity)
+        }
+
+        await model.waitForStrokePreviewIdle()
         model.cancelStrokePreview()
     }
 
