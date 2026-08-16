@@ -445,7 +445,9 @@ import WatercolorCore
             pngExportWorker: worker
         )
 
-        DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
+        // Generous fail-safe: a fully loaded machine can delay the export
+        // task well past 10 seconds without anything being wrong.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 30) {
             blockingGate.failSafeRelease()
         }
         let directory = FileManager.default.temporaryDirectory
