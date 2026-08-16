@@ -77,6 +77,46 @@ import WatercolorCore
         #expect(before.compositePixelFormat == .bgra8Unorm)
     }
 
+    @Test func bulkLayerFieldReadbackPreservesLayoutBoundsAndLayerIdentity() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64, paper: .hotPress)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let layerID = project.layers[0].id
+        try renderer.renderAndWait(stroke: .testDot(
+            layerID: layerID,
+            color: PaintColor(red: 1, green: 0, blue: 0),
+            x: 16,
+            y: 8
+        ))
+        try renderer.renderAndWait(stroke: .testDot(
+            layerID: layerID,
+            color: PaintColor(red: 0, green: 0, blue: 1),
+            x: 48,
+            y: 56
+        ))
+
+        let fields = try renderer.debugLayerFields(layerID: layerID)
+
+        #expect(fields.width == 64)
+        #expect(fields.height == 64)
+        #expect(fields.pigment.count == 4_096)
+        #expect(fields.wetness.count == 4_096)
+        for (x, y) in [(0, 0), (16, 8), (48, 56)] {
+            #expect(try fields.pigmentColor(x: x, y: y) == renderer.debugPixel(x: x, y: y, layerID: layerID))
+            #expect(try fields.wetnessValue(x: x, y: y) == renderer.debugWetness(x: x, y: y, layerID: layerID))
+        }
+        #expect(throws: RendererError.self) {
+            try fields.pigmentColor(x: -1, y: 0)
+        }
+        #expect(throws: RendererError.self) {
+            try fields.wetnessValue(x: 64, y: 0)
+        }
+        let missingLayerID = UUID(uuidString: "8CE99563-FF17-4FF7-9A52-9243478037E6")!
+        #expect(throws: RendererError.unknownLayer(missingLayerID)) {
+            try renderer.debugLayerFields(layerID: missingLayerID)
+        }
+    }
+
     @Test func pointerDownUsesInitializedPreviewSnapshotTextures() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
@@ -2391,7 +2431,7 @@ import WatercolorCore
         #expect(absoluteMassDelta / before.mass < 0.005)
     }
 
-    @Test func everyBrushAndPaperEnumChangesTheDeposit() throws {
+    @Test func everyBrushAndPaperEnumParticipatesInDeterministicDepositSmokeCheck() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let base = PaintingProject.testCanvas(64)
         let renderer = try WatercolorRenderer(project: base, device: device)
@@ -2416,12 +2456,32 @@ import WatercolorCore
         let noBloom = try depositSignature(project: base, renderer: renderer) { $0.edgeBloom = 0 }
         let fullBloom = try depositSignature(project: base, renderer: renderer) { $0.edgeBloom = 1 }
 
+        // Sparse signature inequality only proves each enum reaches rendering.
+        // Customer-visible separation belongs to the perceptual metric tests.
         #expect(Set(shapeSignatures).count == BrushShape.allCases.count)
         #expect(Set(hairSignatures).count == BrushHair.allCases.count)
         #expect(Set(textureSignatures).count == BrushTexture.allCases.count)
         #expect(Set(styleSignatures).count == WatercolorStyle.allCases.count)
         #expect(Set(paperSignatures).count == PaperTexture.allCases.count)
         #expect(noBloom != fullBloom)
+    }
+
+    @Test func canonicalRendererPhenotypeMetricsAreFiniteAndStable() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+
+        for fixture in canonicalPhenotypeFixtures() {
+            let first = try renderPhenotypeMetrics(fixture, device: device)
+            let second = try renderPhenotypeMetrics(fixture, device: device)
+
+            for metrics in [first, second] {
+                for value in phenotypeMetricScalars(metrics) {
+                    #expect(value.isFinite, "\(fixture.name) produced a non-finite metric")
+                }
+                #expect(metrics.laneCount >= 0)
+            }
+            expectStablePhenotypeMetrics(first, second, fixtureName: fixture.name)
+            print("Brush phenotype characterization [\(fixture.name)]: \(phenotypeDiagnostics(first))")
+        }
     }
 
     @Test func layerVisibilityOpacityAndOrderAffectComposite() throws {
@@ -3124,6 +3184,134 @@ import WatercolorCore
         return Int((try renderer.debugPixel(x: 38, y: 32).alpha * 100_000).rounded())
     }
 
+    private func canonicalPhenotypeFixtures() -> [CanonicalPhenotypeFixture] {
+        func point(
+            _ x: Double,
+            _ y: Double,
+            _ index: Int,
+            tiltX: Double = 0,
+            tiltY: Double = 0
+        ) -> StrokePoint {
+            StrokePoint(
+                x: x,
+                y: y,
+                pressure: 0.85,
+                tiltX: tiltX,
+                tiltY: tiltY,
+                time: Double(index) * 0.1
+            )
+        }
+
+        let horizontalCoordinates = [20.0, 30, 40, 50, 60, 70, 76]
+        let verticalCoordinates = [20.0, 30, 40, 50, 60, 70, 76]
+        let curvedCoordinates = [
+            (20.0, 64.0),
+            (28, 54),
+            (38, 46),
+            (50, 42),
+            (62, 44),
+            (72, 52),
+            (78, 64)
+        ]
+        return [
+            CanonicalPhenotypeFixture(
+                name: "horizontal",
+                strokeID: UUID(uuidString: "D15CB94A-F492-4808-822D-4696771FD2CD")!,
+                points: horizontalCoordinates.enumerated().map {
+                    point($0.element, 48, $0.offset)
+                }
+            ),
+            CanonicalPhenotypeFixture(
+                name: "vertical",
+                strokeID: UUID(uuidString: "183750DB-545E-42F3-9048-02894C34D675")!,
+                points: verticalCoordinates.enumerated().map {
+                    point(48, $0.element, $0.offset)
+                }
+            ),
+            CanonicalPhenotypeFixture(
+                name: "curved",
+                strokeID: UUID(uuidString: "9E007381-1E12-470F-BEE3-731FD3FEEB80")!,
+                points: curvedCoordinates.enumerated().map {
+                    point($0.element.0, $0.element.1, $0.offset)
+                }
+            ),
+            CanonicalPhenotypeFixture(
+                name: "tilted",
+                strokeID: UUID(uuidString: "9D418AA5-AD61-4D2C-8B91-7D8295410747")!,
+                points: horizontalCoordinates.enumerated().map {
+                    point($0.element, 48, $0.offset, tiltX: 0.65, tiltY: -0.45)
+                }
+            )
+        ]
+    }
+
+    private func renderPhenotypeMetrics(
+        _ fixture: CanonicalPhenotypeFixture,
+        device: MTLDevice
+    ) throws -> BrushPhenotypeMetrics {
+        let project = PaintingProject.testCanvas(96, paper: .coldPress)
+        var brush = BrushSettings.default
+        brush.shape = .flat
+        brush.hair = .bristle
+        brush.texture = .granulating
+        brush.style = .wetOnWet
+        brush.color = PaintColor(red: 0.72, green: 0.18, blue: 0.08, alpha: 0.9)
+        brush.size = 18
+        brush.opacity = 0.78
+        brush.flow = 0.74
+        brush.water = 0.82
+        brush.granulation = 0.58
+        brush.edgeBloom = 0.42
+        let stroke = StrokeCommand(
+            id: fixture.strokeID,
+            layerID: project.layers[0].id,
+            tool: .brush,
+            brush: brush,
+            points: fixture.points
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        try renderer.renderAndWait(stroke: stroke)
+        return BrushPhenotypeMetrics.measure(
+            try renderer.debugLayerFields(layerID: project.layers[0].id)
+        )
+    }
+
+    private func phenotypeMetricScalars(_ metrics: BrushPhenotypeMetrics) -> [Double] {
+        [
+            metrics.area,
+            metrics.aspectRatio,
+            metrics.orientation,
+            metrics.edgeRoughness,
+            metrics.voidRatio,
+            metrics.pigmentMass,
+            metrics.wetnessMass,
+            metrics.spreadRadius,
+            metrics.edgeConcentration
+        ]
+    }
+
+    private func expectStablePhenotypeMetrics(
+        _ first: BrushPhenotypeMetrics,
+        _ second: BrushPhenotypeMetrics,
+        fixtureName: String
+    ) {
+        let firstScalars = phenotypeMetricScalars(first)
+        let secondScalars = phenotypeMetricScalars(second)
+        for (lhs, rhs) in zip(firstScalars, secondScalars) {
+            let tolerance = 0.000_000_01 + max(abs(lhs), abs(rhs)) * 0.000_001
+            #expect(abs(lhs - rhs) <= tolerance, "\(fixtureName) metric changed between identical renders")
+        }
+        #expect(first.laneCount == second.laneCount)
+    }
+
+    private func phenotypeDiagnostics(_ metrics: BrushPhenotypeMetrics) -> String {
+        "area=\(metrics.area), aspectRatio=\(metrics.aspectRatio), orientation=\(metrics.orientation), "
+            + "edgeRoughness=\(metrics.edgeRoughness), voidRatio=\(metrics.voidRatio), "
+            + "laneCount=\(metrics.laneCount), pigmentMass=\(metrics.pigmentMass), "
+            + "wetnessMass=\(metrics.wetnessMass), spreadRadius=\(metrics.spreadRadius), "
+            + "edgeConcentration=\(metrics.edgeConcentration)"
+    }
+
     private func depositSignature(
         project: PaintingProject,
         renderer: WatercolorRenderer,
@@ -3171,6 +3359,12 @@ import WatercolorCore
             ]
         )
     }
+}
+
+private struct CanonicalPhenotypeFixture {
+    let name: String
+    let strokeID: UUID
+    let points: [StrokePoint]
 }
 
 private actor RendererPreviewCallSuspension {

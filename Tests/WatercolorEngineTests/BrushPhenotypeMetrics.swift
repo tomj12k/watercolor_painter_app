@@ -1,0 +1,506 @@
+import Foundation
+import Testing
+@testable import WatercolorEngine
+
+/// Test-only semantic measurements for a row-major scalar-field snapshot.
+///
+/// `alpha` must contain exactly `width * height` normalized samples. A malformed
+/// grid measures as empty. The default foreground threshold is 1/256; callers
+/// may supply any finite threshold in (0, 1]. Missing pigment or wetness entries
+/// are zero and extras are ignored. Non-finite and negative field values are
+/// zero. Alpha is additionally clamped to one.
+///
+/// Geometry uses the thresholded alpha mask. Orientation is the major-axis
+/// angle in radians in [-pi/2, pi/2), and aspect ratio uses pixel-center moments
+/// plus a pixel's intrinsic 1/12 variance on both axes. Roughness is four-neighbor
+/// perimeter divided by the circumference of an equal-area circle. Voids are
+/// enclosed four-connected background pixels. Lanes are contiguous occupied
+/// one-pixel bins after projection onto the minor axis. Spread is pigment-weighted
+/// RMS distance from the pigment centroid, and edge concentration is the fraction
+/// of in-mask pigment on the four-neighbor boundary.
+struct BrushPhenotypeMetrics: Equatable {
+    let area: Double
+    let aspectRatio: Double
+    let orientation: Double
+    let edgeRoughness: Double
+    let voidRatio: Double
+    let laneCount: Int
+    let pigmentMass: Double
+    let wetnessMass: Double
+    let spreadRadius: Double
+    let edgeConcentration: Double
+
+    private static let defaultCoverageThreshold = 1.0 / 256.0
+    private static let pixelVariance = 1.0 / 12.0
+
+    static func measure(
+        width: Int,
+        height: Int,
+        alpha: [Double],
+        pigment: [Double],
+        wetness: [Double],
+        coverageThreshold: Double = defaultCoverageThreshold
+    ) -> Self {
+        guard width > 0, height > 0 else { return .empty }
+        let (pixelCount, didOverflow) = width.multipliedReportingOverflow(by: height)
+        guard !didOverflow, pixelCount > 0, alpha.count == pixelCount else { return .empty }
+
+        let threshold = coverageThreshold.isFinite
+            && coverageThreshold > 0
+            && coverageThreshold <= 1
+            ? coverageThreshold
+            : defaultCoverageThreshold
+        let normalizedAlpha = alpha.map { value in
+            guard value.isFinite, value > 0 else { return 0.0 }
+            return min(value, 1)
+        }
+        let pigmentValues = (0..<pixelCount).map { index in
+            sanitizedQuantity(index < pigment.count ? pigment[index] : 0)
+        }
+        let wetnessValues = (0..<pixelCount).map { index in
+            sanitizedQuantity(index < wetness.count ? wetness[index] : 0)
+        }
+        let foreground = normalizedAlpha.map { $0 >= threshold }
+        let foregroundIndices = foreground.indices.filter { foreground[$0] }
+
+        let geometry = geometryMetrics(
+            width: width,
+            foregroundIndices: foregroundIndices
+        )
+        let boundary = boundaryMetrics(
+            width: width,
+            height: height,
+            foreground: foreground,
+            foregroundIndices: foregroundIndices
+        )
+        let holes = enclosedBackgroundCount(
+            width: width,
+            height: height,
+            foreground: foreground
+        )
+        let pigmentStatistics = pigmentMetrics(
+            width: width,
+            foreground: foreground,
+            boundary: boundary.pixels,
+            values: pigmentValues
+        )
+        let area = Double(foregroundIndices.count)
+        let voidDenominator = foregroundIndices.count + holes
+
+        return Self(
+            area: area,
+            aspectRatio: geometry.aspectRatio,
+            orientation: geometry.orientation,
+            edgeRoughness: area > 0
+                ? finiteOrZero(Double(boundary.perimeter) / (2 * sqrt(.pi * area)))
+                : 0,
+            voidRatio: voidDenominator > 0
+                ? Double(holes) / Double(voidDenominator)
+                : 0,
+            laneCount: laneCount(
+                width: width,
+                orientation: geometry.orientation,
+                foregroundIndices: foregroundIndices
+            ),
+            pigmentMass: saturatingSum(pigmentValues),
+            wetnessMass: saturatingSum(wetnessValues),
+            spreadRadius: pigmentStatistics.spreadRadius,
+            edgeConcentration: pigmentStatistics.edgeConcentration
+        )
+    }
+
+    /// Adapts the renderer's raw half-float fields without reproducing any
+    /// deposition or simulation equation. Pigment alpha is the renderer's
+    /// stored concentration, so it supplies both the coverage mask and the
+    /// scalar pigment mass field; wetness remains its independent scalar field.
+    static func measure(
+        _ fields: RendererDebugLayerFields,
+        coverageThreshold: Double = defaultCoverageThreshold
+    ) -> Self {
+        let pigmentConcentration = fields.pigment.map { Double($0.w) }
+        return measure(
+            width: fields.width,
+            height: fields.height,
+            alpha: pigmentConcentration,
+            pigment: pigmentConcentration,
+            wetness: fields.wetness.map(Double.init),
+            coverageThreshold: coverageThreshold
+        )
+    }
+
+    private static var empty: Self {
+        Self(
+            area: 0,
+            aspectRatio: 1,
+            orientation: 0,
+            edgeRoughness: 0,
+            voidRatio: 0,
+            laneCount: 0,
+            pigmentMass: 0,
+            wetnessMass: 0,
+            spreadRadius: 0,
+            edgeConcentration: 0
+        )
+    }
+
+    private static func geometryMetrics(
+        width: Int,
+        foregroundIndices: [Int]
+    ) -> (aspectRatio: Double, orientation: Double) {
+        guard !foregroundIndices.isEmpty else { return (1, 0) }
+        let count = Double(foregroundIndices.count)
+        let centroidX = foregroundIndices.reduce(0.0) { $0 + Double($1 % width) } / count
+        let centroidY = foregroundIndices.reduce(0.0) { $0 + Double($1 / width) } / count
+        var covarianceXX = 0.0
+        var covarianceXY = 0.0
+        var covarianceYY = 0.0
+        for index in foregroundIndices {
+            let dx = Double(index % width) - centroidX
+            let dy = Double(index / width) - centroidY
+            covarianceXX += dx * dx
+            covarianceXY += dx * dy
+            covarianceYY += dy * dy
+        }
+        covarianceXX = covarianceXX / count + pixelVariance
+        covarianceXY /= count
+        covarianceYY = covarianceYY / count + pixelVariance
+
+        let difference = covarianceXX - covarianceYY
+        let discriminant = hypot(difference, 2 * covarianceXY)
+        let major = max((covarianceXX + covarianceYY + discriminant) / 2, pixelVariance)
+        let minor = max((covarianceXX + covarianceYY - discriminant) / 2, pixelVariance)
+        let orientation: Double
+        if abs(difference) < 0.000_000_000_001,
+           abs(covarianceXY) < 0.000_000_000_001 {
+            orientation = 0
+        } else {
+            var candidate = 0.5 * atan2(2 * covarianceXY, difference)
+            if candidate >= .pi / 2 {
+                candidate -= .pi
+            }
+            orientation = candidate
+        }
+        return (finiteOrOne(sqrt(major / minor)), finiteOrZero(orientation))
+    }
+
+    private static func boundaryMetrics(
+        width: Int,
+        height: Int,
+        foreground: [Bool],
+        foregroundIndices: [Int]
+    ) -> (perimeter: Int, pixels: [Bool]) {
+        var perimeter = 0
+        var boundary = Array(repeating: false, count: foreground.count)
+        let offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        for index in foregroundIndices {
+            let x = index % width
+            let y = index / width
+            for (dx, dy) in offsets {
+                let neighborX = x + dx
+                let neighborY = y + dy
+                guard (0..<width).contains(neighborX),
+                      (0..<height).contains(neighborY),
+                      foreground[neighborY * width + neighborX]
+                else {
+                    perimeter += 1
+                    boundary[index] = true
+                    continue
+                }
+            }
+        }
+        return (perimeter, boundary)
+    }
+
+    private static func enclosedBackgroundCount(
+        width: Int,
+        height: Int,
+        foreground: [Bool]
+    ) -> Int {
+        var exterior = Array(repeating: false, count: foreground.count)
+        var queue: [Int] = []
+
+        func borderIndices() -> [Int] {
+            var indices = Array(0..<width)
+            if height > 1 {
+                indices += ((height - 1) * width..<(height * width))
+            }
+            if height > 2 {
+                for y in 1..<(height - 1) {
+                    indices.append(y * width)
+                    if width > 1 {
+                        indices.append(y * width + width - 1)
+                    }
+                }
+            }
+            return indices
+        }
+
+        for index in borderIndices() where !foreground[index] && !exterior[index] {
+            exterior[index] = true
+            queue.append(index)
+        }
+        var cursor = 0
+        while cursor < queue.count {
+            let index = queue[cursor]
+            cursor += 1
+            let x = index % width
+            let y = index / width
+            let neighbors = [
+                (x - 1, y),
+                (x + 1, y),
+                (x, y - 1),
+                (x, y + 1)
+            ]
+            for (neighborX, neighborY) in neighbors
+            where (0..<width).contains(neighborX) && (0..<height).contains(neighborY) {
+                let neighbor = neighborY * width + neighborX
+                guard !foreground[neighbor], !exterior[neighbor] else { continue }
+                exterior[neighbor] = true
+                queue.append(neighbor)
+            }
+        }
+        return foreground.indices.reduce(into: 0) { count, index in
+            if !foreground[index], !exterior[index] {
+                count += 1
+            }
+        }
+    }
+
+    private static func laneCount(
+        width: Int,
+        orientation: Double,
+        foregroundIndices: [Int]
+    ) -> Int {
+        guard !foregroundIndices.isEmpty else { return 0 }
+        let normalX = -sin(orientation)
+        let normalY = cos(orientation)
+        let occupiedBins = Set(foregroundIndices.map { index in
+            let x = Double(index % width)
+            let y = Double(index / width)
+            return Int((x * normalX + y * normalY).rounded())
+        }).sorted()
+        guard var previous = occupiedBins.first else { return 0 }
+        var count = 1
+        for bin in occupiedBins.dropFirst() {
+            if bin > previous + 1 {
+                count += 1
+            }
+            previous = bin
+        }
+        return count
+    }
+
+    private static func pigmentMetrics(
+        width: Int,
+        foreground: [Bool],
+        boundary: [Bool],
+        values: [Double]
+    ) -> (spreadRadius: Double, edgeConcentration: Double) {
+        guard let maximum = values.max(), maximum > 0 else { return (0, 0) }
+        let scaled = values.map { $0 / maximum }
+        let scaledMass = scaled.reduce(0, +)
+        guard scaledMass > 0, scaledMass.isFinite else { return (0, 0) }
+        let centroidX = scaled.indices.reduce(0.0) {
+            $0 + scaled[$1] * Double($1 % width)
+        } / scaledMass
+        let centroidY = scaled.indices.reduce(0.0) {
+            $0 + scaled[$1] * Double($1 / width)
+        } / scaledMass
+        let radialMoment = scaled.indices.reduce(0.0) { sum, index in
+            let dx = Double(index % width) - centroidX
+            let dy = Double(index / width) - centroidY
+            return sum + scaled[index] * (dx * dx + dy * dy)
+        } / scaledMass
+
+        var inMaskMass = 0.0
+        var boundaryMass = 0.0
+        for index in scaled.indices where foreground[index] {
+            inMaskMass += scaled[index]
+            if boundary[index] {
+                boundaryMass += scaled[index]
+            }
+        }
+        return (
+            finiteOrZero(sqrt(max(radialMoment, 0))),
+            inMaskMass > 0 ? finiteOrZero(boundaryMass / inMaskMass) : 0
+        )
+    }
+
+    private static func sanitizedQuantity(_ value: Double) -> Double {
+        value.isFinite && value > 0 ? value : 0
+    }
+
+    private static func saturatingSum(_ values: [Double]) -> Double {
+        values.reduce(0) { partial, value in
+            let sum = partial + value
+            return sum.isFinite ? sum : .greatestFiniteMagnitude
+        }
+    }
+
+    private static func finiteOrZero(_ value: Double) -> Double {
+        value.isFinite ? value : 0
+    }
+
+    private static func finiteOrOne(_ value: Double) -> Double {
+        value.isFinite && value >= 1 ? value : 1
+    }
+}
+
+@Suite struct BrushPhenotypeMetricTests {
+    @Test func fourByTwoRectangleHasHandDerivedAreaAspectAndRoughness() {
+        let metrics = BrushPhenotypeMetrics.measure(
+            width: 4,
+            height: 2,
+            alpha: [
+                1, 1, 1, 1,
+                1, 1, 1, 1
+            ],
+            pigment: [],
+            wetness: [],
+            coverageThreshold: 0.5
+        )
+
+        #expect(metrics.area == 8)
+        #expect(abs(metrics.aspectRatio - 2) < 0.000_001)
+        #expect(abs(metrics.orientation) < 0.000_001)
+        #expect(abs(metrics.edgeRoughness - 1.196_826_841_204_298_2) < 0.000_001)
+    }
+
+    @Test func verticalAndTiltedMasksHaveKnownPrincipalOrientations() {
+        let vertical = BrushPhenotypeMetrics.measure(
+            width: 2,
+            height: 4,
+            alpha: Array(repeating: 1, count: 8),
+            pigment: [],
+            wetness: [],
+            coverageThreshold: 0.5
+        )
+        let tilted = BrushPhenotypeMetrics.measure(
+            width: 3,
+            height: 3,
+            alpha: [
+                1, 0, 0,
+                0, 1, 0,
+                0, 0, 1
+            ],
+            pigment: [],
+            wetness: [],
+            coverageThreshold: 0.5
+        )
+
+        #expect(abs(abs(vertical.orientation) - .pi / 2) < 0.000_001)
+        #expect(abs(tilted.orientation - .pi / 4) < 0.000_001)
+        #expect(abs(tilted.aspectRatio - 4.123_105_625_617_661) < 0.000_001)
+    }
+
+    @Test func twoEnclosedSinglePixelHolesHaveKnownVoidRatio() {
+        let metrics = BrushPhenotypeMetrics.measure(
+            width: 7,
+            height: 5,
+            alpha: [
+                0, 0, 0, 0, 0, 0, 0,
+                0, 1, 1, 1, 1, 1, 0,
+                0, 1, 0, 1, 0, 1, 0,
+                0, 1, 1, 1, 1, 1, 0,
+                0, 0, 0, 0, 0, 0, 0
+            ],
+            pigment: [],
+            wetness: [],
+            coverageThreshold: 0.5
+        )
+
+        #expect(metrics.area == 13)
+        #expect(abs(metrics.voidRatio - 0.133_333_333_333_333_33) < 0.000_001)
+        #expect(metrics.laneCount == 1)
+    }
+
+    @Test func twoSeparatedPersistentRowsMeasureAsTwoLanesNotVoids() {
+        let metrics = BrushPhenotypeMetrics.measure(
+            width: 5,
+            height: 5,
+            alpha: [
+                0, 0, 0, 0, 0,
+                1, 1, 1, 1, 1,
+                0, 0, 0, 0, 0,
+                1, 1, 1, 1, 1,
+                0, 0, 0, 0, 0
+            ],
+            pigment: [],
+            wetness: [],
+            coverageThreshold: 0.5
+        )
+
+        #expect(metrics.area == 10)
+        #expect(metrics.laneCount == 2)
+        #expect(metrics.voidRatio == 0)
+    }
+
+    @Test func massesSpreadAndEdgeConcentrationUseIndependentScalarFields() {
+        let metrics = BrushPhenotypeMetrics.measure(
+            width: 3,
+            height: 3,
+            alpha: Array(repeating: 1, count: 9),
+            pigment: [
+                1, 1, 1,
+                1, 4, 1,
+                1, 1, 1
+            ],
+            wetness: [
+                1, 2, 3,
+                4, 5, 6,
+                7, 8, 9
+            ],
+            coverageThreshold: 0.5
+        )
+
+        #expect(metrics.pigmentMass == 12)
+        #expect(metrics.wetnessMass == 45)
+        #expect(abs(metrics.spreadRadius - 1) < 0.000_001)
+        #expect(abs(metrics.edgeConcentration - 0.666_666_666_666_666_6) < 0.000_001)
+    }
+
+    @Test func invalidAndDegenerateInputsProduceFiniteNeutralMetrics() {
+        let sanitized = BrushPhenotypeMetrics.measure(
+            width: 3,
+            height: 1,
+            alpha: [0.49, 0.5, .nan],
+            pigment: [-1, .infinity, 2],
+            wetness: [.nan, -3, 4],
+            coverageThreshold: 0.5
+        )
+        let empty = BrushPhenotypeMetrics.measure(
+            width: .max,
+            height: 2,
+            alpha: [1],
+            pigment: [1],
+            wetness: [1],
+            coverageThreshold: .nan
+        )
+
+        #expect(sanitized.area == 1)
+        #expect(sanitized.aspectRatio == 1)
+        #expect(sanitized.pigmentMass == 2)
+        #expect(sanitized.wetnessMass == 4)
+        #expect(sanitized.edgeConcentration == 0)
+        #expect(empty.area == 0)
+        #expect(empty.aspectRatio == 1)
+        #expect(empty.laneCount == 0)
+        for value in metricScalars(sanitized) + metricScalars(empty) {
+            #expect(value.isFinite)
+        }
+    }
+
+    private func metricScalars(_ metrics: BrushPhenotypeMetrics) -> [Double] {
+        [
+            metrics.area,
+            metrics.aspectRatio,
+            metrics.orientation,
+            metrics.edgeRoughness,
+            metrics.voidRatio,
+            metrics.pigmentMass,
+            metrics.wetnessMass,
+            metrics.spreadRadius,
+            metrics.edgeConcentration
+        ]
+    }
+}

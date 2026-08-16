@@ -3027,6 +3027,37 @@ struct RendererDebugPigmentMoments: Equatable {
     let centroidY: Double
 }
 
+struct RendererDebugLayerFields: Equatable {
+    let width: Int
+    let height: Int
+    let pigment: [SIMD4<Float>]
+    let wetness: [Float]
+
+    func pigmentColor(x: Int, y: Int) throws -> PaintColor {
+        let index = try checkedIndex(x: x, y: y)
+        let value = pigment[index]
+        return PaintColor(
+            red: Double(value.x),
+            green: Double(value.y),
+            blue: Double(value.z),
+            alpha: Double(value.w)
+        )
+    }
+
+    func wetnessValue(x: Int, y: Int) throws -> Double {
+        Double(wetness[try checkedIndex(x: x, y: y)])
+    }
+
+    private func checkedIndex(x: Int, y: Int) throws -> Int {
+        guard (0..<width).contains(x), (0..<height).contains(y) else {
+            throw RendererError.readback(
+                "Pixel (\(x), \(y)) is outside the \(width) by \(height) debug field"
+            )
+        }
+        return y * width + x
+    }
+}
+
 extension WatercolorRenderer {
     func pixelChecksum() throws -> UInt64 {
         let image = try makeCGImage()
@@ -3242,6 +3273,96 @@ extension WatercolorRenderer {
             mass: mass,
             centroidX: mass > 0 ? weightedX / mass : 0,
             centroidY: mass > 0 ? weightedY / mass : 0
+        )
+    }
+
+    func debugLayerFields(layerID: UUID) throws -> RendererDebugLayerFields {
+        guard let slice = layerSlices[layerID] else {
+            throw RendererError.unknownLayer(layerID)
+        }
+        let pigmentTexture = pigmentTextures[frontTextureIndex]
+        let wetnessTexture = wetnessTextures[frontTextureIndex]
+        let width = pigmentTexture.width
+        let height = pigmentTexture.height
+        guard wetnessTexture.width == width, wetnessTexture.height == height else {
+            throw RendererError.readback("Pigment and wetness debug fields have different dimensions")
+        }
+
+        let pigmentBytesPerPixel = MemoryLayout<UInt16>.stride * 4
+        let wetnessBytesPerPixel = MemoryLayout<UInt16>.stride
+        let pigmentBytesPerRow = ((width * pigmentBytesPerPixel + 255) / 256) * 256
+        let wetnessBytesPerRow = ((width * wetnessBytesPerPixel + 255) / 256) * 256
+        let pigmentBytesPerImage = pigmentBytesPerRow * height
+        let wetnessBytesPerImage = wetnessBytesPerRow * height
+        let (bufferLength, didOverflow) = pigmentBytesPerImage.addingReportingOverflow(
+            wetnessBytesPerImage
+        )
+        guard !didOverflow,
+              let buffer = device.makeBuffer(length: bufferLength, options: .storageModeShared)
+        else {
+            throw RendererError.readback("Could not allocate the layer field readback buffer")
+        }
+
+        let commandBuffer = try makeCommandBuffer(label: "Read watercolor layer fields")
+        guard let encoder = commandBuffer.makeBlitCommandEncoder() else {
+            throw RendererError.readback("Could not create the layer field readback encoder")
+        }
+        let sourceSize = MTLSize(width: width, height: height, depth: 1)
+        encoder.copy(
+            from: pigmentTexture,
+            sourceSlice: slice,
+            sourceLevel: 0,
+            sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+            sourceSize: sourceSize,
+            to: buffer,
+            destinationOffset: 0,
+            destinationBytesPerRow: pigmentBytesPerRow,
+            destinationBytesPerImage: pigmentBytesPerImage
+        )
+        encoder.copy(
+            from: wetnessTexture,
+            sourceSlice: slice,
+            sourceLevel: 0,
+            sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+            sourceSize: sourceSize,
+            to: buffer,
+            destinationOffset: pigmentBytesPerImage,
+            destinationBytesPerRow: wetnessBytesPerRow,
+            destinationBytesPerImage: wetnessBytesPerImage
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error {
+            throw RendererError.readback(error.localizedDescription)
+        }
+
+        let bytes = buffer.contents().assumingMemoryBound(to: UInt8.self)
+        func half(at offset: Int) -> Float {
+            let bits = UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
+            return Float(Float16(bitPattern: bits))
+        }
+        var pigment = Array(repeating: SIMD4<Float>.zero, count: width * height)
+        var wetness = Array(repeating: Float.zero, count: width * height)
+        for y in 0..<height {
+            for x in 0..<width {
+                let index = y * width + x
+                let pigmentOffset = y * pigmentBytesPerRow + x * pigmentBytesPerPixel
+                pigment[index] = SIMD4<Float>(
+                    half(at: pigmentOffset),
+                    half(at: pigmentOffset + 2),
+                    half(at: pigmentOffset + 4),
+                    half(at: pigmentOffset + 6)
+                )
+                let wetnessOffset = pigmentBytesPerImage + y * wetnessBytesPerRow + x * wetnessBytesPerPixel
+                wetness[index] = half(at: wetnessOffset)
+            }
+        }
+        return RendererDebugLayerFields(
+            width: width,
+            height: height,
+            pigment: pigment,
+            wetness: wetness
         )
     }
 
