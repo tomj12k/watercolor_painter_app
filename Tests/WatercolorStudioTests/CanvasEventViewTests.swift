@@ -106,9 +106,18 @@ import WatercolorCore
         ])
     }
 
-    @Test func consecutiveSamplesUseEighteenPercentOfBrushDiameter() throws {
+    @Test(arguments: [
+        (spacing: 0.08, expectedSample: 8.0),
+        (spacing: 0.18, expectedSample: 18.0),
+        (spacing: 0.60, expectedSample: 60.0)
+    ])
+    func consecutiveSamplesUseTheSelectedBrushSpacing(
+        spacing: Double,
+        expectedSample: Double
+    ) throws {
         var brush = BrushSettings.default
         brush.size = 100
+        brush.spacing = spacing
         var builder = CanvasStrokeBuilder(canvasSize: .init(width: 1600, height: 1200))
         let layerID = UUID(uuidString: "05E428FB-8CE0-40E7-8383-F61B67408BE1")!
 
@@ -118,12 +127,102 @@ import WatercolorCore
             brush: brush,
             point: .init(x: 0, y: 100, pressure: 0.5, tiltX: 0, tiltY: 0, time: 0)
         )
-        _ = builder.append(.init(x: 18, y: 100, pressure: 0.5, tiltX: 0, tiltY: 0, time: 2))
+        let append = builder.append(.init(
+            x: expectedSample,
+            y: 100,
+            pressure: 0.5,
+            tiltX: 0,
+            tiltY: 0,
+            time: 2
+        ))
 
-        let completedStroke = builder.finish()
-        let stroke = try #require(completedStroke)
-        #expect(stroke.points.map(\.x) == [0, 18])
-        #expect(stroke.points.map(\.time) == [0, 2])
+        #expect(append.points.map(\.x) == [expectedSample])
+        #expect(append.points.map(\.time) == [2])
+    }
+
+    @Test func tinyBrushSpacingUsesThePhysicalThreeQuarterPixelFloor() {
+        var brush = BrushSettings.default
+        brush.size = 1
+        brush.spacing = 0.08
+        var builder = CanvasStrokeBuilder(canvasSize: .init(width: 100, height: 100))
+        builder.begin(
+            layerID: UUID(), tool: .brush, brush: brush,
+            point: .init(x: 0, y: 50, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
+        )
+
+        let append = builder.append(
+            .init(x: 1.5, y: 50, pressure: 1, tiltX: 0, tiltY: 0, time: 1)
+        )
+
+        #expect(append.points.map(\.x) == [0.75, 1.5])
+    }
+
+    @Test func nonfiniteSpacingFallsBackToTheVersionOneDefault() {
+        var brush = BrushSettings.default
+        brush.size = 100
+        brush.spacing = .nan
+        var builder = CanvasStrokeBuilder(canvasSize: .init(width: 100, height: 100))
+        builder.begin(
+            layerID: UUID(), tool: .brush, brush: brush,
+            point: .init(x: 0, y: 50, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
+        )
+
+        let append = builder.append(
+            .init(x: 18, y: 50, pressure: 1, tiltX: 0, tiltY: 0, time: 1)
+        )
+
+        #expect(append.points.map(\.x) == [18])
+    }
+
+    @Test func nonfiniteBrushSizeUsesThePhysicalSpacingFloor() {
+        var brush = BrushSettings.default
+        brush.size = .infinity
+        brush.spacing = 0.60
+        var builder = CanvasStrokeBuilder(canvasSize: .init(width: 100, height: 100))
+        builder.begin(
+            layerID: UUID(), tool: .brush, brush: brush,
+            point: .init(x: 0, y: 50, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
+        )
+
+        let append = builder.append(
+            .init(x: 1.5, y: 50, pressure: 1, tiltX: 0, tiltY: 0, time: 1)
+        )
+
+        #expect(append.points.map(\.x) == [0.75, 1.5])
+    }
+
+    @Test func lowerSpacingCreatesMoreSamplesWithoutExceedingThePointCap() throws {
+        var brush = BrushSettings.default
+        brush.size = 100
+        let maximumPointCount = 32
+
+        brush.spacing = 0.08
+        var fine = CanvasStrokeBuilder(
+            canvasSize: .init(width: 400, height: 100),
+            maximumPointCount: maximumPointCount
+        )
+        fine.begin(
+            layerID: UUID(), tool: .brush, brush: brush,
+            point: .init(x: 0, y: 50, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
+        )
+        _ = fine.append(.init(x: 240, y: 50, pressure: 1, tiltX: 0, tiltY: 0, time: 1))
+
+        brush.spacing = 0.60
+        var coarse = CanvasStrokeBuilder(
+            canvasSize: .init(width: 400, height: 100),
+            maximumPointCount: maximumPointCount
+        )
+        coarse.begin(
+            layerID: UUID(), tool: .brush, brush: brush,
+            point: .init(x: 0, y: 50, pressure: 1, tiltX: 0, tiltY: 0, time: 0)
+        )
+        _ = coarse.append(.init(x: 240, y: 50, pressure: 1, tiltX: 0, tiltY: 0, time: 1))
+
+        let fineCount = try #require(fine.currentStroke).points.count
+        let coarseCount = try #require(coarse.currentStroke).points.count
+        #expect(fineCount > coarseCount)
+        #expect(fineCount <= maximumPointCount)
+        #expect(coarseCount <= maximumPointCount)
     }
 
     @Test func equivalentCoarseAndFineEventsProduceTheSameGeometricStroke() throws {
@@ -377,6 +476,117 @@ import WatercolorCore
 }
 
 @Suite @MainActor struct CanvasEventViewTests {
+    @Test func pointerDownSnapshotsCompleteBrushSettingsAcrossPreviewBoundaryForCurrentAndNextStroke() async throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let layer = PaintLayer(name: "Layer")
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [layer]
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var submittedBatches: [[StrokePoint]] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, id, points, token in
+                    submittedBatches.append(points)
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
+                },
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
+                }
+            )
+        )
+        let initialBrush = BrushSettings(
+            shape: .fan,
+            hair: .bristle,
+            texture: .salt,
+            style: .bloom,
+            color: PaintColor(red: 0.18, green: 0.31, blue: 0.52, alpha: 1),
+            size: 10,
+            opacity: 0.61,
+            flow: 0.72,
+            water: 0.83,
+            granulation: 0.44,
+            edgeBloom: 0.91,
+            behaviorVersion: 1,
+            spacing: 0.08,
+            rotation: -37,
+            bristleStrength: 0.92,
+            textureStrength: 0.81
+        )
+        let nextBrush = BrushSettings(
+            shape: .rigger,
+            hair: .synthetic,
+            texture: .smooth,
+            style: .glazing,
+            color: PaintColor(red: 0.58, green: 0.22, blue: 0.11, alpha: 1),
+            size: 80,
+            opacity: 0.24,
+            flow: 0.33,
+            water: 0.19,
+            granulation: 0.07,
+            edgeBloom: 0.12,
+            behaviorVersion: 1,
+            spacing: 0.60,
+            rotation: 124,
+            bristleStrength: 0.13,
+            textureStrength: 0.26
+        )
+        model.brush = initialBrush
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown,
+            timestamp: 0,
+            eventNumber: 0,
+            location: CGPoint(x: 20, y: 64)
+        )))
+        model.brush = nextBrush
+        view.mouseDragged(with: try #require(canvasMouseEvent(
+            .leftMouseDragged,
+            timestamp: 1,
+            eventNumber: 1,
+            location: CGPoint(x: 44, y: 64)
+        )))
+        await model.waitForStrokePreviewIdle()
+        #expect(submittedBatches.contains { $0.count > 8 })
+        view.mouseUp(with: try #require(canvasMouseEvent(
+            .leftMouseUp,
+            timestamp: 2,
+            eventNumber: 2,
+            location: CGPoint(x: 44, y: 64)
+        )))
+        await waitForStrokePreviewToFinish(in: model)
+
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown,
+            timestamp: 3,
+            eventNumber: 3,
+            location: CGPoint(x: 92, y: 92)
+        )))
+        view.mouseUp(with: try #require(canvasMouseEvent(
+            .leftMouseUp,
+            timestamp: 4,
+            eventNumber: 4,
+            location: CGPoint(x: 92, y: 92)
+        )))
+        await waitForStrokePreviewToFinish(in: model)
+
+        let strokes = model.project.commands.compactMap { command -> StrokeCommand? in
+            guard case let .stroke(stroke) = command else { return nil }
+            return stroke
+        }
+        #expect(strokes.count == 2)
+        #expect(strokes.first?.brush == initialBrush)
+        #expect(strokes.first?.points.count ?? 0 > 8)
+        #expect(strokes.last?.brush == nextBrush)
+    }
+
     @Test func dragSendsExactlyTheNewInterpolatedPoints() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject(

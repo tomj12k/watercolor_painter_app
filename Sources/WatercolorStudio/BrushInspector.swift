@@ -2,45 +2,316 @@ import AppKit
 import SwiftUI
 import WatercolorCore
 
+struct BrushAccessibilityPresentation: Equatable, Sendable {
+    let label: String
+    let help: String
+}
+
+struct BrushNumericPresentation: Equatable, Sendable {
+    let title: String
+    let range: ClosedRange<Double>
+    let step: Double
+    let accessibility: BrushAccessibilityPresentation
+}
+
+enum BrushInspectorPresentation {
+    static let sectionTitles = ["Identity", "Color", "Paint", "Dynamics"]
+
+    static let identityAccessibility = [
+        BrushAccessibilityPresentation(
+            label: "Brush style",
+            help: "Choose how pigment and water behave on the paper."
+        ),
+        BrushAccessibilityPresentation(
+            label: "Brush shape",
+            help: "Choose the footprint the brush leaves as it moves."
+        ),
+        BrushAccessibilityPresentation(
+            label: "Brush hair",
+            help: "Choose how the brush carries and releases pigment and water."
+        ),
+        BrushAccessibilityPresentation(
+            label: "Brush texture",
+            help: "Choose the paper pattern visible through the stroke."
+        )
+    ]
+
+    static let colorAccessibility = [
+        BrushAccessibilityPresentation(
+            label: "Pigment color",
+            help: "Open the native color wheel to choose a pigment."
+        )
+    ]
+
+    static let paintAccessibility = [
+        BrushAccessibilityPresentation(
+            label: "Brush size",
+            help: "Set the width of the brush in points."
+        ),
+        BrushAccessibilityPresentation(
+            label: "Paint opacity",
+            help: "Set how transparent the pigment appears."
+        ),
+        BrushAccessibilityPresentation(
+            label: "Paint flow",
+            help: "Set how quickly pigment leaves the brush."
+        ),
+        BrushAccessibilityPresentation(
+            label: "Paint water",
+            help: "Set how much water the brush carries."
+        ),
+        BrushAccessibilityPresentation(
+            label: "Paint granulation",
+            help: "Set how strongly pigment settles into the paper."
+        ),
+        BrushAccessibilityPresentation(
+            label: "Paint edge bloom",
+            help: "Set how strongly pigment gathers along wet edges."
+        )
+    ]
+
+    static let dynamics = [
+        BrushNumericPresentation(
+            title: "Spacing",
+            range: 0.08...0.60,
+            step: 0.01,
+            accessibility: BrushAccessibilityPresentation(
+                label: "Brush spacing",
+                help: "Set the distance between brush marks. Lower spacing makes a denser stroke."
+            )
+        ),
+        BrushNumericPresentation(
+            title: "Rotation",
+            range: -180...180,
+            step: 1,
+            accessibility: BrushAccessibilityPresentation(
+                label: "Brush rotation",
+                help: "Rotate the brush footprint relative to the stroke direction."
+            )
+        ),
+        BrushNumericPresentation(
+            title: "Bristle",
+            range: 0...1,
+            step: 0.01,
+            accessibility: BrushAccessibilityPresentation(
+                label: "Bristle strength",
+                help: "Blend from a solid brush footprint to the selected hair pattern."
+            )
+        ),
+        BrushNumericPresentation(
+            title: "Texture strength",
+            range: 0...1,
+            step: 0.01,
+            accessibility: BrushAccessibilityPresentation(
+                label: "Texture strength",
+                help: "Blend from smooth coverage to the selected paper texture."
+            )
+        )
+    ]
+
+    static let recipeAccessibility = BrushAccessibilityPresentation(
+        label: "Brush recipe",
+        help: "Summarizes the selected shape, hair, texture, and watercolor style."
+    )
+
+    static let resetDynamicsAccessibility = BrushAccessibilityPresentation(
+        label: "Reset brush dynamics",
+        help: "Restore spacing, rotation, bristle, and texture strength to their defaults."
+    )
+
+    static func description(for style: WatercolorStyle) -> String {
+        switch style {
+        case .transparentWash:
+            "An even translucent wash that lets the paper glow through."
+        case .wetOnWet:
+            "A fluid wash that spreads softly into damp color."
+        case .dryBrush:
+            "A low-water broken stroke that leaves paper showing."
+        case .glazing:
+            "A thin controlled layer for building color gradually."
+        case .bloom:
+            "A wet bloom that gathers pigment along expanding edges."
+        }
+    }
+
+    static func description(for shape: BrushShape) -> String {
+        switch shape {
+        case .round:
+            "A versatile round point with a soft circular footprint."
+        case .flat:
+            "A broad flat chisel that leaves a crisp long edge."
+        case .filbert:
+            "A rounded filbert oval for broad marks with soft ends."
+        case .fan:
+            "A splayed fan that separates into five tapered fingers."
+        case .rigger:
+            "A long narrow rigger for continuous fine lines."
+        }
+    }
+
+    static func description(for hair: BrushHair) -> String {
+        switch hair {
+        case .sable:
+            "Balanced sable hair that carries pigment and water smoothly."
+        case .squirrel:
+            "Soft squirrel hair with a generous, gentle water release."
+        case .synthetic:
+            "Springy synthetic hair with a crisp pigment-rich release."
+        case .bristle:
+            "Stiff bristles that leave separated, broken paint lanes."
+        case .mop:
+            "A broad soft mop that releases a generous load of water."
+        }
+    }
+
+    static func description(for texture: BrushTexture) -> String {
+        switch texture {
+        case .smooth:
+            "Smooth coverage with an even response across the paper."
+        case .granulating:
+            "Granulating pigment that settles into the paper valleys."
+        case .dry:
+            "A dry texture with connected skips of exposed paper."
+        case .mottled:
+            "A mottled texture with broad natural pigment variation."
+        case .salt:
+            "A salt texture with sparse pale centers and ringed blooms."
+        }
+    }
+
+    static func recipe(for brush: BrushSettings) -> String {
+        "\(recipeFragment(for: brush.shape)) + \(recipeFragment(for: brush.hair)) · \(recipeFragment(for: brush.texture)) · \(recipeFragment(for: brush.style))"
+    }
+
+    private static func recipeFragment(for style: WatercolorStyle) -> String {
+        switch style {
+        case .transparentWash: "Light wash"
+        case .wetOnWet: "Wet spread"
+        case .dryBrush: "Dry brush"
+        case .glazing: "Glaze"
+        case .bloom: "Bloom edge"
+        }
+    }
+
+    private static func recipeFragment(for shape: BrushShape) -> String {
+        switch shape {
+        case .round: "Round"
+        case .flat: "Flat"
+        case .filbert: "Filbert"
+        case .fan: "Fan"
+        case .rigger: "Rigger"
+        }
+    }
+
+    private static func recipeFragment(for hair: BrushHair) -> String {
+        switch hair {
+        case .sable: "sable"
+        case .squirrel: "squirrel"
+        case .synthetic: "synthetic"
+        case .bristle: "bristle"
+        case .mop: "mop"
+        }
+    }
+
+    private static func recipeFragment(for texture: BrushTexture) -> String {
+        switch texture {
+        case .smooth: "Smooth"
+        case .granulating: "Granulating"
+        case .dry: "Dry skips"
+        case .mottled: "Mottled"
+        case .salt: "Salt blooms"
+        }
+    }
+}
+
 struct BrushInspector: View {
     @ObservedObject var model: StudioModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            StudioSectionTitle(title: "Brush")
+            identitySection
+            sectionDivider
+            colorSection
+            sectionDivider
+            paintSection
+            sectionDivider
+            dynamicsSection
+        }
+        .font(.system(size: 12))
+        .tint(StudioPalette.cobalt)
+    }
+
+    private var identitySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            StudioSectionTitle(title: BrushInspectorPresentation.sectionTitles[0])
 
             Picker("Style", selection: styleBinding) {
                 ForEach(WatercolorStyle.allCases, id: \.self) { style in
                     Text(style.displayName).tag(style)
                 }
             }
-            .help("Choose how pigment and water behave")
+            .help(BrushInspectorPresentation.description(for: model.brush.style))
+            .accessibilityLabel(BrushInspectorPresentation.identityAccessibility[0].label)
+            .accessibilityValue(model.brush.style.displayName)
+            .accessibilityHint(BrushInspectorPresentation.identityAccessibility[0].help)
 
             Picker("Shape", selection: brushBinding(\.shape)) {
                 ForEach(BrushShape.allCases, id: \.self) { shape in
                     Text(shape.displayName).tag(shape)
                 }
             }
+            .help(BrushInspectorPresentation.description(for: model.brush.shape))
+            .accessibilityLabel(BrushInspectorPresentation.identityAccessibility[1].label)
+            .accessibilityValue(model.brush.shape.displayName)
+            .accessibilityHint(BrushInspectorPresentation.identityAccessibility[1].help)
 
             Picker("Hair", selection: brushBinding(\.hair)) {
                 ForEach(BrushHair.allCases, id: \.self) { hair in
                     Text(hair.displayName).tag(hair)
                 }
             }
+            .help(BrushInspectorPresentation.description(for: model.brush.hair))
+            .accessibilityLabel(BrushInspectorPresentation.identityAccessibility[2].label)
+            .accessibilityValue(model.brush.hair.displayName)
+            .accessibilityHint(BrushInspectorPresentation.identityAccessibility[2].help)
 
             Picker("Texture", selection: brushBinding(\.texture)) {
                 ForEach(BrushTexture.allCases, id: \.self) { texture in
                     Text(texture.displayName).tag(texture)
                 }
             }
+            .help(BrushInspectorPresentation.description(for: model.brush.texture))
+            .accessibilityLabel(BrushInspectorPresentation.identityAccessibility[3].label)
+            .accessibilityValue(model.brush.texture.displayName)
+            .accessibilityHint(BrushInspectorPresentation.identityAccessibility[3].help)
 
-            Divider()
-                .overlay(StudioPalette.graphite.opacity(0.24))
+            HStack(spacing: 7) {
+                Rectangle()
+                    .fill(StudioPalette.pigment)
+                    .frame(width: 2, height: 15)
+                    .accessibilityHidden(true)
+                Text(BrushInspectorPresentation.recipe(for: model.brush))
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(StudioPalette.fiber)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+            }
+            .help(BrushInspectorPresentation.recipeAccessibility.help)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(BrushInspectorPresentation.recipeAccessibility.label)
+            .accessibilityValue(BrushInspectorPresentation.recipe(for: model.brush))
+            .accessibilityHint(BrushInspectorPresentation.recipeAccessibility.help)
+        }
+    }
 
-            StudioSectionTitle(title: "Color")
+    private var colorSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            StudioSectionTitle(title: BrushInspectorPresentation.sectionTitles[1])
 
             ColorPicker("Pigment", selection: colorBinding, supportsOpacity: false)
-                .help("Open the native color wheel")
+                .help(BrushInspectorPresentation.colorAccessibility[0].help)
+                .accessibilityLabel(BrushInspectorPresentation.colorAccessibility[0].label)
+                .accessibilityValue(colorAccessibilityValue)
 
             HStack(spacing: 7) {
                 ForEach(Self.swatches, id: \.name) { swatch in
@@ -55,8 +326,9 @@ struct BrushInspector: View {
                             }
                     }
                     .buttonStyle(.borderless)
-                    .help(swatch.name)
+                    .help("Use \(swatch.name) pigment")
                     .accessibilityLabel("Use \(swatch.name) pigment")
+                    .accessibilityValue("Color swatch")
                 }
             }
 
@@ -66,7 +338,7 @@ struct BrushInspector: View {
                         .font(.system(size: 10))
                         .foregroundStyle(StudioPalette.graphite)
                     HStack(spacing: 7) {
-                        ForEach(Array(model.recentColors.enumerated()), id: \.offset) { _, color in
+                        ForEach(Array(model.recentColors.enumerated()), id: \.offset) { index, color in
                             Button {
                                 model.brush.color = color
                             } label: {
@@ -78,66 +350,103 @@ struct BrushInspector: View {
                                     }
                             }
                             .buttonStyle(.borderless)
-                            .help("Use recent pigment")
-                            .accessibilityLabel("Use recent pigment")
+                            .help("Use recent pigment \(index + 1)")
+                            .accessibilityLabel("Use recent pigment \(index + 1)")
+                            .accessibilityValue("Recent color")
                         }
                     }
                 }
             }
+        }
+    }
 
-            Divider()
-                .overlay(StudioPalette.graphite.opacity(0.24))
+    private var paintSection: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            StudioSectionTitle(title: BrushInspectorPresentation.sectionTitles[2])
 
             NumericControl(
-                title: "Size",
+                presentation: BrushNumericPresentation(
+                    title: "Size",
+                    range: StudioModel.brushSizeRange,
+                    step: 1,
+                    accessibility: BrushInspectorPresentation.paintAccessibility[0]
+                ),
                 value: Binding(get: { model.brush.size }, set: { model.setBrushSize($0) }),
-                range: StudioModel.brushSizeRange,
-                step: 1,
                 display: { "\(Int($0.rounded())) pt" }
             )
 
             NumericControl(
-                title: "Opacity",
+                presentation: paintPresentation(at: 1, title: "Opacity"),
                 value: brushBinding(\.opacity),
-                range: 0...1,
-                step: 0.01,
-                display: { Self.percent($0) }
+                display: Self.percent
             )
-
             NumericControl(
-                title: "Flow",
+                presentation: paintPresentation(at: 2, title: "Flow"),
                 value: brushBinding(\.flow),
-                range: 0...1,
-                step: 0.01,
-                display: { Self.percent($0) }
+                display: Self.percent
             )
-
             NumericControl(
-                title: "Water",
+                presentation: paintPresentation(at: 3, title: "Water"),
                 value: brushBinding(\.water),
-                range: 0...1,
-                step: 0.01,
-                display: { Self.percent($0) }
+                display: Self.percent
             )
-
             NumericControl(
-                title: "Granulation",
+                presentation: paintPresentation(at: 4, title: "Granulation"),
                 value: brushBinding(\.granulation),
-                range: 0...1,
-                step: 0.01,
-                display: { Self.percent($0) }
+                display: Self.percent
             )
-
             NumericControl(
-                title: "Edge bloom",
+                presentation: paintPresentation(at: 5, title: "Edge bloom"),
                 value: brushBinding(\.edgeBloom),
-                range: 0...1,
-                step: 0.01,
-                display: { Self.percent($0) }
+                display: Self.percent
             )
         }
-        .font(.system(size: 12))
-        .tint(StudioPalette.cobalt)
+    }
+
+    private var dynamicsSection: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            StudioSectionTitle(title: BrushInspectorPresentation.sectionTitles[3])
+
+            NumericControl(
+                presentation: BrushInspectorPresentation.dynamics[0],
+                value: Binding(get: { model.brush.spacing }, set: { model.setBrushSpacing($0) }),
+                display: Self.percent
+            )
+            NumericControl(
+                presentation: BrushInspectorPresentation.dynamics[1],
+                value: Binding(get: { model.brush.rotation }, set: { model.setBrushRotation($0) }),
+                display: { "\(Int($0.rounded()))°" }
+            )
+            NumericControl(
+                presentation: BrushInspectorPresentation.dynamics[2],
+                value: Binding(
+                    get: { model.brush.bristleStrength },
+                    set: { model.setBristleStrength($0) }
+                ),
+                display: Self.percent
+            )
+            NumericControl(
+                presentation: BrushInspectorPresentation.dynamics[3],
+                value: Binding(
+                    get: { model.brush.textureStrength },
+                    set: { model.setTextureStrength($0) }
+                ),
+                display: Self.percent
+            )
+
+            Button("Reset dynamics", action: model.resetBrushDynamics)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(StudioPalette.fiber)
+                .help(BrushInspectorPresentation.resetDynamicsAccessibility.help)
+                .accessibilityLabel(BrushInspectorPresentation.resetDynamicsAccessibility.label)
+                .accessibilityValue("Defaults: 18% spacing, 0° rotation, 50% bristle, 50% texture strength")
+        }
+    }
+
+    private var sectionDivider: some View {
+        Divider()
+            .overlay(StudioPalette.graphite.opacity(0.24))
     }
 
     private var styleBinding: Binding<WatercolorStyle> {
@@ -177,6 +486,20 @@ struct BrushInspector: View {
         )
     }
 
+    private var colorAccessibilityValue: String {
+        let color = model.brush.color.convertedToSRGB()
+        return "Red \(Int((color.red * 100).rounded()))%, green \(Int((color.green * 100).rounded()))%, blue \(Int((color.blue * 100).rounded()))%"
+    }
+
+    private func paintPresentation(at index: Int, title: String) -> BrushNumericPresentation {
+        BrushNumericPresentation(
+            title: title,
+            range: 0...1,
+            step: 0.01,
+            accessibility: BrushInspectorPresentation.paintAccessibility[index]
+        )
+    }
+
     private static func percent(_ value: Double) -> String {
         "\(Int((value * 100).rounded()))%"
     }
@@ -196,16 +519,14 @@ struct BrushInspector: View {
 }
 
 private struct NumericControl: View {
-    let title: String
+    let presentation: BrushNumericPresentation
     @Binding var value: Double
-    let range: ClosedRange<Double>
-    let step: Double
     let display: (Double) -> String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack {
-                Text(title)
+                Text(presentation.title)
                     .foregroundStyle(StudioPalette.graphite)
                 Spacer()
                 Text(display(value))
@@ -215,21 +536,32 @@ private struct NumericControl: View {
             }
 
             HStack(spacing: 8) {
-                Slider(value: $value, in: range, step: step)
-                    .accessibilityLabel(title)
-                    .accessibilityValue(display(value))
+                Slider(
+                    value: $value,
+                    in: presentation.range,
+                    step: presentation.step
+                )
+                .help(presentation.accessibility.help)
+                .accessibilityLabel(presentation.accessibility.label)
+                .accessibilityValue(display(value))
 
-                Stepper(title, value: $value, in: range, step: step)
-                    .labelsHidden()
-                    .fixedSize()
-                    .accessibilityLabel("Adjust \(title.lowercased())")
-                    .accessibilityValue(display(value))
+                Stepper(
+                    presentation.title,
+                    value: $value,
+                    in: presentation.range,
+                    step: presentation.step
+                )
+                .labelsHidden()
+                .fixedSize()
+                .help(presentation.accessibility.help)
+                .accessibilityLabel("Adjust \(presentation.accessibility.label.lowercased())")
+                .accessibilityValue(display(value))
             }
         }
     }
 }
 
-private extension WatercolorStyle {
+extension WatercolorStyle {
     var displayName: String {
         switch self {
         case .transparentWash: "Transparent wash"
@@ -241,14 +573,38 @@ private extension WatercolorStyle {
     }
 }
 
-private extension BrushShape {
-    var displayName: String { rawValue.capitalized }
+extension BrushShape {
+    var displayName: String {
+        switch self {
+        case .round: "Round"
+        case .flat: "Flat"
+        case .filbert: "Filbert"
+        case .fan: "Fan"
+        case .rigger: "Rigger"
+        }
+    }
 }
 
-private extension BrushHair {
-    var displayName: String { rawValue.capitalized }
+extension BrushHair {
+    var displayName: String {
+        switch self {
+        case .sable: "Sable"
+        case .squirrel: "Squirrel"
+        case .synthetic: "Synthetic"
+        case .bristle: "Bristle"
+        case .mop: "Mop"
+        }
+    }
 }
 
-private extension BrushTexture {
-    var displayName: String { rawValue.capitalized }
+extension BrushTexture {
+    var displayName: String {
+        switch self {
+        case .smooth: "Smooth"
+        case .granulating: "Granulating"
+        case .dry: "Dry"
+        case .mottled: "Mottled"
+        case .salt: "Salt"
+        }
+    }
 }

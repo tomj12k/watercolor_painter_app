@@ -858,6 +858,33 @@ public final class StudioModel: ObservableObject {
         brush.size = min(max(size, Self.brushSizeRange.lowerBound), Self.brushSizeRange.upperBound)
     }
 
+    public func setBrushSpacing(_ spacing: Double) {
+        guard spacing.isFinite else { return }
+        brush.spacing = min(max(spacing, 0.08), 0.60)
+    }
+
+    public func setBrushRotation(_ rotation: Double) {
+        guard rotation.isFinite else { return }
+        brush.rotation = min(max(rotation, -180), 180)
+    }
+
+    public func setBristleStrength(_ strength: Double) {
+        guard strength.isFinite else { return }
+        brush.bristleStrength = min(max(strength, 0), 1)
+    }
+
+    public func setTextureStrength(_ strength: Double) {
+        guard strength.isFinite else { return }
+        brush.textureStrength = min(max(strength, 0), 1)
+    }
+
+    public func resetBrushDynamics() {
+        brush.spacing = 0.18
+        brush.rotation = 0
+        brush.bristleStrength = 0.50
+        brush.textureStrength = 0.50
+    }
+
     public func adjustBrushSize(by amount: Double) {
         setBrushSize(brush.size + amount)
     }

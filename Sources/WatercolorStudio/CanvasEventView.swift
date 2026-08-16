@@ -172,8 +172,11 @@ struct CanvasStrokeBuilder {
     }
 
     private func samplingSpacing(for brush: BrushSettings) -> Double {
-        let brushSpacing = abs(brush.size) * 0.18
-        return brushSpacing.isFinite ? max(brushSpacing, 0.75) : 0.75
+        guard brush.size.isFinite else { return 0.75 }
+        let spacing = brush.spacing.isFinite
+            ? min(max(brush.spacing, 0.08), 0.60)
+            : 0.18
+        return max(abs(brush.size) * spacing, 0.75)
     }
 
     private func samePosition(_ lhs: StrokePoint, _ rhs: StrokePoint) -> Bool {
