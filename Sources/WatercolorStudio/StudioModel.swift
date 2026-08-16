@@ -640,6 +640,13 @@ public final class StudioModel: ObservableObject {
         if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
     }
 
+    /// Explains why a capacity-ended stroke stopped, without disturbing a
+    /// failure that the commit itself already reported.
+    func noteStrokeExhaustion(_ reason: StrokeExhaustionReason) {
+        guard error == nil else { return }
+        error = StudioFailure(message: reason.message)
+    }
+
     func cancelStrokePreview(reason: StrokeExhaustionReason? = nil) {
         guard let token = strokePreviewState.token else { return }
         guard !isCancellingStrokePreview(token) else { return }

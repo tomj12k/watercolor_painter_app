@@ -352,7 +352,8 @@ import WatercolorCore
             x: 20, y: 10, pressure: 1, tiltX: 0, tiltY: 0, time: 1
         ))
 
-        #expect(completion.stroke == nil)
+        // The truncated stroke survives exhaustion so its paint can commit.
+        #expect(completion.stroke?.points.count == 1)
         #expect(
             completion.exhaustionReason
                 == .pointCapacity(maximumPointCount: 1)
@@ -886,7 +887,7 @@ import WatercolorCore
         #expect(await updates.count == 0)
     }
 
-    @Test func aggregatePointExhaustionCancelsThePreviewAndAllowsRecovery() async throws {
+    @Test func aggregatePointExhaustionCommitsTheTruncatedPaintAndReportsTheLimit() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let layer = PaintLayer(name: "Layer")
         let existingStroke = StrokeCommand(
@@ -910,8 +911,6 @@ import WatercolorCore
         let view = CanvasEventView(model: model)
         view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
         model.configureCanvas(view)
-        let committedAlpha = try renderer.debugPixel(x: 16, y: 16, layerID: layer.id).alpha
-        let checksumBefore = try canvasChecksum(renderer)
         #expect(model.maximumPointCountForNewStroke == 1)
 
         view.mouseDown(with: try #require(canvasMouseEvent(
@@ -921,34 +920,32 @@ import WatercolorCore
         view.mouseDragged(with: try #require(canvasMouseEvent(
             .leftMouseDragged, timestamp: 2, eventNumber: 2, location: .init(x: 200, y: 64)
         )))
-        await model.waitForStrokePreviewCancellation()
+        await waitForStrokePreviewToFinish(in: model)
 
         #expect(!model.isStrokePreviewActive)
         #expect(!view.hasTransientInputStateForTesting)
-        #expect(model.project == project)
+        #expect(model.project.commands.count == 2)
         #expect(
             model.error?.message
-                == "This stroke reached its 1-point limit. Try a shorter stroke or use a larger brush for wider spacing."
+                == "This stroke reached its 1-point limit, so Watercolor Studio ended and saved it there. Start a new stroke to keep painting."
         )
-        #expect(try canvasChecksum(renderer) == checksumBefore)
-        #expect(try renderer.debugPixel(x: 16, y: 16, layerID: layer.id).alpha == committedAlpha)
+        #expect(try renderer.debugPixel(x: 64, y: 192, layerID: layer.id).alpha > 0.05)
 
-        let recovery = try #require(canvasMouseEvent(
+        // The document is now at its point capacity, so the next stroke is
+        // rejected with the capacity explanation instead of silently failing.
+        view.mouseDown(with: try #require(canvasMouseEvent(
             .leftMouseDown, timestamp: 3, eventNumber: 3, location: .init(x: 96, y: 96)
-        ))
-        let recoveryUp = try #require(canvasMouseEvent(
+        )))
+        view.mouseUp(with: try #require(canvasMouseEvent(
             .leftMouseUp, timestamp: 4, eventNumber: 4, location: .init(x: 96, y: 96)
-        ))
-        view.mouseDown(with: recovery)
-        view.mouseUp(with: recoveryUp)
+        )))
         await waitForStrokePreviewToFinish(in: model)
 
         #expect(model.project.commands.count == 2)
-        #expect(model.error == nil)
-        #expect(try renderer.debugPixel(x: 96, y: 160, layerID: layer.id).alpha > 0.05)
+        #expect(model.error?.message == "The project has reached its point capacity of 2.")
     }
 
-    @Test func inFlightAppendCannotDuplicateCapacityCancellationOrReplaceItsReason() async throws {
+    @Test func exhaustionWithAnInFlightAppendCommitsTheTruncatedStrokeExactlyOnce() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject(
             canvas: CanvasSize(width: 256, height: 256),
@@ -956,8 +953,6 @@ import WatercolorCore
             layers: [PaintLayer(name: "Layer")]
         )
         let append = CanvasPreviewSuspension()
-        let failureProcessed = CanvasPreviewSuspension()
-        let cancellation = CanvasPreviewSuspension()
         let renderer = try WatercolorRenderer(
             project: project,
             device: device,
@@ -965,7 +960,7 @@ import WatercolorCore
                 await append.suspend()
             }
         )
-        var cancellationCount = 0
+        var finishCount = 0
         let model = StudioModel(
             project: project,
             renderer: renderer,
@@ -978,18 +973,8 @@ import WatercolorCore
                     )
                 },
                 finish: { renderer, stroke, token in
+                    finishCount += 1
                     try await renderer.finishStrokePreview(stroke, token: token)
-                },
-                cancel: { renderer, token in
-                    cancellationCount += 1
-                    let ordinal = cancellationCount
-                    try await renderer.restoreStrokePreviewCancellation(token)
-                    if ordinal == 1 {
-                        await cancellation.suspend()
-                    }
-                },
-                didProcessUpdateFailure: { _ in
-                    await failureProcessed.suspend()
                 }
             ),
             maximumTotalStrokePointCount: 10
@@ -1013,35 +998,30 @@ import WatercolorCore
         )))
         await append.waitUntilSuspended()
 
+        // Exhaustion arrives while the first append is still on the GPU. The
+        // truncated stroke must wait for that append and then commit once.
         view.mouseDragged(with: try #require(canvasMouseEvent(
             .leftMouseDragged,
             timestamp: 2,
             eventNumber: 2,
             location: CGPoint(x: 220, y: 64)
         )))
-        await cancellation.waitUntilSuspended()
         #expect(model.isStrokePreviewActive)
-        #expect(!model.capabilities.canPaint)
 
         await append.resume()
-        await failureProcessed.waitUntilSuspended()
-        #expect(model.isStrokePreviewActive)
-        #expect(!model.capabilities.canPaint)
-        #expect(cancellationCount == 1)
-        await failureProcessed.resume()
-        await cancellation.resume()
-        await model.waitForStrokePreviewCancellation()
+        await waitForStrokePreviewToFinish(in: model)
 
-        #expect(cancellationCount == 1)
+        #expect(finishCount == 1)
+        #expect(model.project.commands.count == 1)
         #expect(
             model.error?.message
-                == "This stroke reached its 10-point limit. Try a shorter stroke or use a larger brush for wider spacing."
+                == "This stroke reached its 10-point limit, so Watercolor Studio ended and saved it there. Start a new stroke to keep painting."
         )
         #expect(!model.isStrokePreviewActive)
         #expect(model.capabilities.canPaint)
     }
 
-    @Test func pointerUpPointExhaustionRestoresAndReportsBeforeContinuedPainting() async throws {
+    @Test func pointerUpPointExhaustionCommitsTheTruncatedPaintAndReportsTheLimit() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let layer = PaintLayer(name: "Layer")
         let existingStroke = StrokeCommand(
@@ -1065,7 +1045,6 @@ import WatercolorCore
         let view = CanvasEventView(model: model)
         view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
         model.configureCanvas(view)
-        let checksumBefore = try canvasChecksum(renderer)
 
         view.mouseDown(with: try #require(canvasMouseEvent(
             .leftMouseDown, timestamp: 1, eventNumber: 1, location: .init(x: 64, y: 64)
@@ -1073,14 +1052,14 @@ import WatercolorCore
         view.mouseUp(with: try #require(canvasMouseEvent(
             .leftMouseUp, timestamp: 2, eventNumber: 2, location: .init(x: 128, y: 64)
         )))
-        await model.waitForStrokePreviewCancellation()
+        await waitForStrokePreviewToFinish(in: model)
 
-        #expect(model.project == project)
-        #expect(try canvasChecksum(renderer) == checksumBefore)
+        #expect(model.project.commands.count == 2)
         #expect(
             model.error?.message
-                == "This stroke reached its 1-point limit. Try a shorter stroke or use a larger brush for wider spacing."
+                == "This stroke reached its 1-point limit, so Watercolor Studio ended and saved it there. Start a new stroke to keep painting."
         )
+        #expect(try renderer.debugPixel(x: 64, y: 192, layerID: layer.id).alpha > 0.05)
 
         view.mouseDown(with: try #require(canvasMouseEvent(
             .leftMouseDown, timestamp: 3, eventNumber: 3, location: .init(x: 96, y: 96)
@@ -1091,7 +1070,7 @@ import WatercolorCore
         await waitForStrokePreviewToFinish(in: model)
 
         #expect(model.project.commands.count == 2)
-        #expect(model.error == nil)
+        #expect(model.error?.message == "The project has reached its point capacity of 2.")
     }
 }
 

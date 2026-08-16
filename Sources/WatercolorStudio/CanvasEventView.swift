@@ -9,7 +9,7 @@ enum StrokeExhaustionReason: Equatable, Sendable {
     var message: String {
         switch self {
         case let .pointCapacity(maximumPointCount):
-            "This stroke reached its \(maximumPointCount)-point limit. Try a shorter stroke or use a larger brush for wider spacing."
+            "This stroke reached its \(maximumPointCount)-point limit, so Watercolor Studio ended and saved it there. Start a new stroke to keep painting."
         }
     }
 }
@@ -135,17 +135,18 @@ struct CanvasStrokeBuilder {
             let appendResult = append(point)
             appendedPoints = appendResult.points
             if let exhaustionReason = appendResult.exhaustionReason {
+                // Keep the truncated stroke so its paint can still commit.
                 return StrokeFinishResult(
-                    stroke: nil,
-                    points: [],
+                    stroke: stroke,
+                    points: appendedPoints,
                     exhaustionReason: exhaustionReason
                 )
             }
         }
         if let exhaustionReason {
             return StrokeFinishResult(
-                stroke: nil,
-                points: [],
+                stroke: stroke,
+                points: appendedPoints,
                 exhaustionReason: exhaustionReason
             )
         }
@@ -160,8 +161,8 @@ struct CanvasStrokeBuilder {
         } else {
             guard stroke!.points.count < maximumPointCount else {
                 return StrokeFinishResult(
-                    stroke: nil,
-                    points: [],
+                    stroke: stroke,
+                    points: appendedPoints,
                     exhaustionReason: .pointCapacity(maximumPointCount: maximumPointCount)
                 )
             }
@@ -413,9 +414,13 @@ public final class CanvasEventView: MTKView {
             }
             return
         }
-        model.cancelStrokePreview(reason: exhaustionReason)
+        let truncatedStroke = strokeBuilder?.currentStroke
         strokeBuilder = nil
-        updateInputAvailability()
+        commitExhaustedStroke(
+            truncatedStroke,
+            newPoints: appendResult.points,
+            reason: exhaustionReason
+        )
     }
 
     private func completeStroke(with event: NSEvent) {
@@ -423,8 +428,11 @@ public final class CanvasEventView: MTKView {
         let completion = strokeBuilder!.finish(at: strokePoint(from: event))
         strokeBuilder = nil
         if let exhaustionReason = completion.exhaustionReason {
-            model.cancelStrokePreview(reason: exhaustionReason)
-            updateInputAvailability()
+            commitExhaustedStroke(
+                completion.stroke,
+                newPoints: completion.points,
+                reason: exhaustionReason
+            )
             return
         }
         guard let stroke = completion.stroke else { return }
@@ -434,6 +442,31 @@ public final class CanvasEventView: MTKView {
             await model.commitStrokePreview(stroke)
             self?.requestCanvasDraw()
         }
+    }
+
+    /// Commits the paint a capacity-ended stroke already produced instead of
+    /// discarding it, then surfaces why the stroke ended.
+    private func commitExhaustedStroke(
+        _ stroke: StrokeCommand?,
+        newPoints: [StrokePoint],
+        reason: StrokeExhaustionReason
+    ) {
+        guard let stroke, model.isStrokePreviewActive else {
+            model.cancelStrokePreview(reason: reason)
+            updateInputAvailability()
+            return
+        }
+        if !newPoints.isEmpty {
+            model.appendStrokePreview(id: stroke.id, points: newPoints)
+        }
+        let model = model
+        Task { @MainActor [weak self] in
+            await model.commitStrokePreview(stroke)
+            model.noteStrokeExhaustion(reason)
+            self?.requestCanvasDraw()
+            self?.updateInputAvailability()
+        }
+        updateInputAvailability()
     }
 
     private func beginPan(with event: NSEvent) {
