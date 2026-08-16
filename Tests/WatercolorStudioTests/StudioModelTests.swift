@@ -56,6 +56,51 @@ import WatercolorCore
         )
     }
 
+    @Test @MainActor func routineLimitsRaiseANoticeInsteadOfAModalError() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let maximumCommandCount = 2
+        var project = PaintingProject.studioTestProject()
+        project.commands = (0..<maximumCommandCount).map { _ in
+            .clearLayer(LayerCommand(layerID: UUID()))
+        }
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugProjectAdmissionLimits: ProjectAdmissionLimits(
+                maximumCommandCount: maximumCommandCount,
+                maximumTotalStrokePointCount: 128,
+                maximumSerializedStorageBytes: 1_048_576
+            ),
+            debugCommandBufferError: { $0.error }
+        )
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            maximumCommandCount: maximumCommandCount,
+            maximumTotalStrokePointCount: 128,
+            maximumSerializedStorageBytes: 1_048_576
+        )
+
+        // A stroke refused at a document limit is a routine event: it must
+        // inform without interrupting, so it may never raise a modal alert.
+        model.completeStroke(.studioTestStroke(layerID: project.layers[0].id))
+        #expect(model.error == nil)
+        #expect(model.notice?.message.contains("command capacity") == true)
+        #expect(model.notice?.code == .capacity)
+
+        // A capacity-ended-but-saved stroke and dropped queued strokes are
+        // the same kind of event.
+        model.dismissNotice()
+        #expect(model.notice == nil)
+        model.noteStrokeExhaustion(.pointCapacity(maximumPointCount: 2))
+        #expect(model.error == nil)
+        #expect(model.notice?.message.contains("ended and saved") == true)
+
+        model.noteDroppedDeferredStrokes(count: 2)
+        #expect(model.error == nil)
+        #expect(model.notice?.message.contains("could not be painted") == true)
+    }
+
     @Test @MainActor func capacityLimitsCarryTheCapacityCategoryAndAccurateRecovery() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let maximumCommandCount = 2
@@ -83,7 +128,7 @@ import WatercolorCore
 
         model.completeStroke(.studioTestStroke(layerID: project.layers[0].id))
 
-        let failure = try #require(model.error)
+        let failure = try #require(model.notice)
         #expect(failure.message.contains("command capacity"))
         #expect(failure.code.rawValue == "WC-CAPACITY-001")
         #expect(!failure.recoverySuggestion.contains("Try the operation again"))
@@ -99,7 +144,7 @@ import WatercolorCore
             maximumSerializedStorageBytes: 6_000
         )
         storageModel.completeStroke(.studioTestStroke(layerID: storageProject.layers[0].id))
-        let storageFailure = try #require(storageModel.error)
+        let storageFailure = try #require(storageModel.notice)
         #expect(storageFailure.message.contains("document storage capacity"))
         #expect(storageFailure.code.rawValue == "WC-CAPACITY-001")
         #expect(!storageFailure.recoverySuggestion.contains("Try the operation again"))
@@ -126,7 +171,7 @@ import WatercolorCore
             StrokePoint(x: 129, y: 128, pressure: 1, tiltX: 0, tiltY: 0, time: 1)
         )
         pointModel.completeStroke(pointStroke)
-        let pointFailure = try #require(pointModel.error)
+        let pointFailure = try #require(pointModel.notice)
         #expect(pointFailure.message.contains("point capacity"))
         #expect(pointFailure.code.rawValue == "WC-CAPACITY-001")
         #expect(!pointFailure.recoverySuggestion.contains("Try the operation again"))
@@ -191,7 +236,7 @@ import WatercolorCore
 
         model.noteStrokeExhaustion(.pointCapacity(maximumPointCount: 12))
 
-        let failure = try #require(model.error)
+        let failure = try #require(model.notice)
         #expect(failure.message == "This stroke reached its 12-point limit, so Watercolor Studio ended and saved it there.")
         #expect(failure.recoverySuggestion == "Start a new stroke to keep painting.")
         #expect(failure.code.rawValue == "WC-CAPACITY-001")
@@ -291,7 +336,7 @@ import WatercolorCore
         #expect(model.project.commands.count == maximumCommandCount)
         #expect(model.rendererProject.commands.count == maximumCommandCount)
         #expect(documentUpdates.isEmpty)
-        #expect(model.error?.message.contains("2") == true)
+        #expect(model.notice?.message.contains("2") == true)
         #expect(try renderer.studioChecksum() == checksumBefore)
 
         model.completeStroke(stroke)
@@ -299,7 +344,7 @@ import WatercolorCore
         #expect(model.project.commands.count == maximumCommandCount)
         #expect(model.rendererProject.commands.count == maximumCommandCount)
         #expect(documentUpdates.isEmpty)
-        #expect(model.error?.message.contains("2") == true)
+        #expect(model.notice?.message.contains("2") == true)
         #expect(try renderer.studioChecksum() == checksumBefore)
     }
 
@@ -335,7 +380,7 @@ import WatercolorCore
         #expect(model.project.commands.count == project.commands.count)
         #expect(model.rendererProject.commands.count == project.commands.count)
         #expect(documentUpdates.isEmpty)
-        #expect(model.error?.message.contains("point capacity") == true)
+        #expect(model.notice?.message.contains("point capacity") == true)
         #expect(try renderer.studioChecksum() == checksumBefore)
     }
 
@@ -354,7 +399,7 @@ import WatercolorCore
         let checksumBefore = try renderer.studioChecksum()
 
         #expect(model.beginStrokePreview(stroke) == .unavailable)
-        #expect(model.error?.message.contains("document storage capacity") == true)
+        #expect(model.notice?.message.contains("document storage capacity") == true)
         #expect(!model.isStrokePreviewActive)
 
         model.completeStroke(stroke)
@@ -362,7 +407,7 @@ import WatercolorCore
         #expect(model.project == project)
         #expect(model.rendererProject == project)
         #expect(documentUpdates.isEmpty)
-        #expect(model.error?.message.contains("document storage capacity") == true)
+        #expect(model.notice?.message.contains("document storage capacity") == true)
         #expect(try renderer.studioChecksum() == checksumBefore)
     }
 
@@ -485,7 +530,7 @@ import WatercolorCore
         #expect(model.project.commands.count == project.commands.count)
         #expect(model.rendererProject.commands.count == project.commands.count)
         #expect(documentUpdates.isEmpty)
-        #expect(model.error?.message.contains("point capacity") == true)
+        #expect(model.notice?.message.contains("point capacity") == true)
         #expect(try renderer.studioChecksum() == checksumBefore)
     }
 

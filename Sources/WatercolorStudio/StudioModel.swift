@@ -418,6 +418,11 @@ public final class StudioModel: ObservableObject {
     @Published public var zoom: CGFloat
     @Published public var pan: CGSize
     @Published public private(set) var error: StudioFailure?
+    /// A routine limit the customer ran into — a stroke ended at capacity, a
+    /// refused stroke, or queued strokes that expired. These are expected
+    /// events, so they inform from the canvas activity area instead of
+    /// interrupting with a modal alert; `error` stays reserved for failures.
+    @Published public private(set) var notice: StudioFailure?
     @Published public private(set) var rendererRecoveryError: StudioRendererRecoveryError?
     @Published public private(set) var capabilities: StudioCapabilities
     /// Non-modal notice shown from 90% of any document limit, so the customer
@@ -564,6 +569,7 @@ public final class StudioModel: ObservableObject {
         zoom = 1
         pan = .zero
         error = nil
+        notice = nil
         rendererRecoveryError = nil
         capabilities = StudioCapabilities(canPaint: true, canUndo: false, canRedo: false)
         capacityWarning = nil
@@ -612,6 +618,7 @@ public final class StudioModel: ObservableObject {
             strokePreviewState = .active(token)
             refreshCapabilities()
             error = nil
+            notice = nil
             return .accepted
         } catch {
             self.error = StudioFailure.rendering(error: error, project: project)
@@ -687,12 +694,12 @@ public final class StudioModel: ObservableObject {
         if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
     }
 
-    /// Reports strokes that waited for the renderer but never obtained it,
-    /// without disturbing a failure that explains why the renderer is stuck.
+    /// Reports strokes that waited for the renderer but never obtained it.
+    /// A routine loss report, so it lands on the notice channel.
     func noteDroppedDeferredStrokes(count: Int) {
-        guard count > 0, error == nil else { return }
+        guard count > 0 else { return }
         let subject = count == 1 ? "A queued stroke" : "\(count) queued strokes"
-        error = StudioFailure(
+        notice = StudioFailure(
             message: "\(subject) could not be painted because the renderer stayed busy."
         )
     }
@@ -701,7 +708,7 @@ public final class StudioModel: ObservableObject {
     /// failure that the commit itself already reported.
     func noteStrokeExhaustion(_ reason: StrokeExhaustionReason) {
         guard error == nil else { return }
-        error = StudioFailure.capacity(
+        notice = StudioFailure.capacity(
             message: reason.message,
             recoverySuggestion: reason.recoverySuggestion,
             project: project
@@ -887,7 +894,7 @@ public final class StudioModel: ObservableObject {
     }
 
     private func reportCommandCapacityFailure() {
-        error = StudioFailure.capacity(
+        notice = StudioFailure.capacity(
             message: "The project has reached its command capacity of \(projectAdmissionLimits.maximumCommandCount).",
             recoverySuggestion: "Undo strokes, or continue in a new document.",
             project: project
@@ -910,13 +917,13 @@ public final class StudioModel: ObservableObject {
             case .commandLimitExceeded:
                 reportCommandCapacityFailure()
             case .totalStrokePointLimitExceeded:
-                error = StudioFailure.capacity(
+                notice = StudioFailure.capacity(
                     message: "The project has reached its point capacity of \(projectAdmissionLimits.maximumTotalStrokePointCount).",
                     recoverySuggestion: "Undo strokes, or continue in a new document.",
                     project: project
                 )
             case .documentByteLimitExceeded:
-                error = StudioFailure.capacity(
+                notice = StudioFailure.capacity(
                     message: "The project has reached its document storage capacity.",
                     recoverySuggestion: "Use a shorter stroke, or undo strokes before continuing.",
                     project: project
@@ -1423,6 +1430,10 @@ public final class StudioModel: ObservableObject {
         error = nil
     }
 
+    public func dismissNotice() {
+        notice = nil
+    }
+
     @discardableResult
     func replaceProjectFromDocument(_ replacement: PaintingProject) -> Bool {
         guard canModifyProject else { return false }
@@ -1580,6 +1591,7 @@ public final class StudioModel: ObservableObject {
         refreshCapabilities()
         onDocumentUpdate?(project)
         error = nil
+        notice = nil
     }
 
     private func replaceRenderer(

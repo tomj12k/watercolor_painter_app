@@ -861,10 +861,10 @@ import WatercolorCore
         // The renderer never frees up within the timeout, so the deferred
         // stroke is dropped — and the customer must be told, not left to
         // wonder where the paint went.
-        for _ in 0..<2_000 where model.error == nil {
+        for _ in 0..<2_000 where model.notice == nil {
             try? await Task.sleep(for: .milliseconds(2))
         }
-        #expect(model.error?.message.contains("could not be painted") == true)
+        #expect(model.notice?.message.contains("could not be painted") == true)
 
         await finish.resume()
         await commit.value
@@ -1287,7 +1287,7 @@ import WatercolorCore
         #expect(!view.hasTransientInputStateForTesting)
         #expect(model.project.commands.count == 2)
         #expect(
-            model.error?.message
+            model.notice?.message
                 == "This stroke reached its 1-point limit, so Watercolor Studio ended and saved it there."
         )
         #expect(try renderer.debugPixel(x: 64, y: 192, layerID: layer.id).alpha > 0.05)
@@ -1303,7 +1303,7 @@ import WatercolorCore
         await waitForStrokePreviewToFinish(in: model)
 
         #expect(model.project.commands.count == 2)
-        #expect(model.error?.message == "The project has reached its point capacity of 2.")
+        #expect(model.notice?.message == "The project has reached its point capacity of 2.")
     }
 
     @Test func exhaustionWithAnInFlightAppendCommitsTheTruncatedStrokeExactlyOnce() async throws {
@@ -1375,7 +1375,7 @@ import WatercolorCore
         #expect(finishCount == 1)
         #expect(model.project.commands.count == 1)
         #expect(
-            model.error?.message
+            model.notice?.message
                 == "This stroke reached its 10-point limit, so Watercolor Studio ended and saved it there."
         )
         #expect(!model.isStrokePreviewActive)
@@ -1417,7 +1417,7 @@ import WatercolorCore
 
         #expect(model.project.commands.count == 2)
         #expect(
-            model.error?.message
+            model.notice?.message
                 == "This stroke reached its 1-point limit, so Watercolor Studio ended and saved it there."
         )
         #expect(try renderer.debugPixel(x: 64, y: 192, layerID: layer.id).alpha > 0.05)
@@ -1431,7 +1431,7 @@ import WatercolorCore
         await waitForStrokePreviewToFinish(in: model)
 
         #expect(model.project.commands.count == 2)
-        #expect(model.error?.message == "The project has reached its point capacity of 2.")
+        #expect(model.notice?.message == "The project has reached its point capacity of 2.")
     }
 }
 

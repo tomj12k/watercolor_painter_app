@@ -171,6 +171,40 @@ public struct StudioView: View {
                         .accessibilityValue("Preparing the paper surface")
                     }
 
+                    if let notice = model.notice {
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Image(systemName: "info.circle")
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(notice.message)
+                                if !notice.recoverySuggestion.isEmpty {
+                                    Text(notice.recoverySuggestion)
+                                        .foregroundStyle(StudioPalette.fiber.opacity(0.75))
+                                }
+                            }
+                            Button {
+                                model.dismissNotice()
+                            } label: {
+                                Image(systemName: "xmark")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Dismiss notice")
+                        }
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(StudioPalette.fiber)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(StudioPalette.carbon.opacity(0.88))
+                        .overlay(alignment: .leading) {
+                            Rectangle()
+                                .fill(StudioPalette.pigment)
+                                .frame(width: 2)
+                        }
+                        .frame(maxWidth: 380, alignment: .leading)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("Painting notice")
+                        .accessibilityValue(notice.message)
+                    }
+
                     if let capacityWarning = model.capacityWarning {
                         HStack(spacing: 6) {
                             Image(systemName: "gauge.with.needle")
