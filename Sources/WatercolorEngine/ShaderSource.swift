@@ -399,7 +399,7 @@ enum ShaderSource {
                     interior
                 );
                 pigment = 1.22f;
-                water = 0.14f;
+                water = 0.02f;
                 break;
             }
             case 3:

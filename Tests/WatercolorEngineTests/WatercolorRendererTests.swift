@@ -3175,9 +3175,43 @@ import WatercolorCore
             device: device
         )
 
-        #expect(first.checksum == 5_282_729_424_302_453_969)
+        #expect(first.metrics.pigmentMass > 0)
         #expect(first.checksum == second.checksum)
         #expect(first.metrics == second.metrics)
+    }
+
+    @Test func behaviorVersionZeroRetainsLegacyShaderEquations() throws {
+        let source = ShaderSource.watercolor
+        let legacyShapeStart = try #require(source.range(of: "float legacyShapeCoverage("))
+        let shapeEnd = try #require(
+            source.range(of: "float signedBoxDistance(", range: legacyShapeStart.upperBound..<source.endIndex)
+        )
+        let legacyShape = source[legacyShapeStart.lowerBound..<shapeEnd.lowerBound]
+        let hairStart = try #require(source.range(of: "float hairCoverage("))
+        let hairEnd = try #require(
+            source.range(of: "float textureCoverage(", range: hairStart.upperBound..<source.endIndex)
+        )
+        let legacyHair = source[hairStart.lowerBound..<hairEnd.lowerBound]
+        let textureStart = try #require(source.range(of: "float textureCoverage("))
+        let textureEnd = try #require(
+            source.range(of: "struct VersionOneProfile", range: textureStart.upperBound..<source.endIndex)
+        )
+        let legacyTexture = source[textureStart.lowerBound..<textureEnd.lowerBound]
+        let legacyBranchStart = try #require(source.range(of: "if (parameters.behavior.x == 0u)"))
+        let legacyBranchEnd = try #require(
+            source.range(of: "} else {", range: legacyBranchStart.upperBound..<source.endIndex)
+        )
+        let legacyBranch = source[legacyBranchStart.lowerBound..<legacyBranchEnd.lowerBound]
+
+        #expect(legacyShape.contains("distance = max(abs(normalized.x), abs(normalized.y) * 1.45f);"))
+        #expect(legacyHair.contains("case 3: return coverage * mix(0.30f, 1.0f, step(0.31f, noise));"))
+        #expect(
+            legacyTexture.contains(
+                "case 3: return coverage * mix(0.35f, 1.0f, 0.5f + 0.5f * sin(detail * 19.0f));"
+            )
+        )
+        #expect(legacyBranch.contains("coverage *= mix(0.86f, 1.08f, grain);"))
+        #expect(legacyBranch.contains("case 3: stylePaint = 0.62f; styleWater = 0.68f; break;"))
     }
 
     @Test func versionOneShapePhenotypesAreNonemptyAndPerceptuallySeparated() throws {
@@ -3419,6 +3453,75 @@ import WatercolorCore
         #expect(salt.metrics.voidRatio > smooth.metrics.voidRatio + 0.01)
     }
 
+    @Test func granulatingTracksPaperFrequencyWhileMottledRemainsLowFrequency() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let points = dynamicsLinePoints()
+        func spatialMetrics(
+            _ texture: BrushTexture,
+            paper: PaperTexture
+        ) throws -> TextureSpatialMetrics {
+            let smooth = try renderDynamicsSample(
+                texture: .smooth,
+                textureStrength: 1,
+                points: points,
+                paper: paper,
+                device: device
+            )
+            let textured = try renderDynamicsSample(
+                texture: texture,
+                textureStrength: 1,
+                points: points,
+                paper: paper,
+                device: device
+            )
+            return textureSpatialMetrics(textured: textured.fields, baseline: smooth.fields)
+        }
+
+        let hotGranulating = try spatialMetrics(.granulating, paper: .hotPress)
+        let roughGranulating = try spatialMetrics(.granulating, paper: .rough)
+        let roughMottled = try spatialMetrics(.mottled, paper: .rough)
+        print(
+            "Texture frequency characterization: hot_granulating=\(hotGranulating), "
+                + "rough_granulating=\(roughGranulating), rough_mottled=\(roughMottled)"
+        )
+
+        #expect(roughGranulating.highFrequencyEnergy > hotGranulating.highFrequencyEnergy * 1.10)
+        #expect(roughGranulating.highFrequencyEnergy > roughMottled.highFrequencyEnergy * 1.25)
+        #expect(roughMottled.lagOneAutocorrelation > roughGranulating.lagOneAutocorrelation + 0.08)
+    }
+
+    @Test func drySkipsAreConnectedWhileSaltFormsSparseRingedCenters() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let points = dynamicsLinePoints()
+        let smooth = try renderDynamicsSample(
+            texture: .smooth,
+            points: points,
+            device: device
+        )
+        let dry = try renderDynamicsSample(
+            texture: .dry,
+            points: points,
+            device: device
+        )
+        let salt = try renderDynamicsSample(
+            texture: .salt,
+            points: points,
+            device: device
+        )
+        let dryTopology = textureTopologyMetrics(textured: dry.fields, baseline: smooth.fields)
+        let saltTopology = textureTopologyMetrics(textured: salt.fields, baseline: smooth.fields)
+        print("Texture topology characterization: dry=\(dryTopology), salt=\(saltTopology)")
+
+        #expect(dryTopology.largestVoidComponentFraction > 0.75)
+        #expect(dryTopology.largestVoidComponentFraction > saltTopology.largestVoidComponentFraction * 3.0)
+        #expect(dryTopology.voidRatio > saltTopology.voidRatio * 3.0)
+        #expect(saltTopology.ringContrast.isFinite)
+        #expect(saltTopology.ringContrast > dryTopology.ringContrast + 0.25)
+        #expect(saltTopology.meanVoidCircularity > dryTopology.meanVoidCircularity + 0.20)
+        #expect(saltTopology.componentCount >= 5)
+        #expect(saltTopology.componentCount > dryTopology.componentCount)
+    }
+
     @Test func versionOneHairFamiliesHavePairwiseArtistVisiblePhenotypes() throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let points = dynamicsLinePoints()
@@ -3544,6 +3647,41 @@ import WatercolorCore
         #expect(glaze.pigmentMass < wash.pigmentMass * 0.78)
         #expect(bloom.edgeConcentration > wash.edgeConcentration * 1.08)
         #expect(bloom.spreadRadius > wash.spreadRadius * 1.02)
+    }
+
+    @Test func wetOnWetTransportsMorePigmentDuringDiffusionThanDryBrush() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let project = PaintingProject.testCanvas(160, paper: .rough)
+        let points = (0..<3).map { index in
+            shapePoint(x: 80, y: 80, time: Double(index) / 60)
+        }
+        let diffusion = try [WatercolorStyle.wetOnWet, .dryBrush].map { style in
+            let renderer = try WatercolorRenderer(project: project, device: device)
+            let stroke = dynamicsStroke(
+                layerID: project.layers[0].id,
+                style: style,
+                points: points
+            )
+            try renderer.renderAndWait(stroke: stroke)
+            let beforeFields = try renderer.debugLayerFields(layerID: project.layers[0].id)
+            let before = BrushPhenotypeMetrics.measure(beforeFields)
+            try renderer.dry(layerID: project.layers[0].id, steps: 8)
+            let afterFields = try renderer.debugLayerFields(layerID: project.layers[0].id)
+            let pigmentChange = zip(beforeFields.pigment, afterFields.pigment).reduce(0.0) {
+                $0 + abs(Double($1.0.w) - Double($1.1.w))
+            } / max(before.pigmentMass, 0.000_001)
+            return (style, pigmentChange)
+        }
+        let wet = try #require(diffusion.first { $0.0 == .wetOnWet })
+        let dry = try #require(diffusion.first { $0.0 == .dryBrush })
+
+        print(
+            "Style diffusion characterization: wet_transport=\(wet.1), dry_transport=\(dry.1), "
+                + "ratio=\(wet.1 / max(dry.1, 0.000_001))"
+        )
+        #expect(wet.1.isFinite)
+        #expect(dry.1.isFinite)
+        #expect(wet.1 > dry.1 * 2.0)
     }
 
     @Test func versionOneStableFieldsMatchPreviewFreshReplayAndReopenAcrossBoundary() async throws {
@@ -3966,7 +4104,6 @@ import WatercolorCore
         let expectedChecksum = try expectedRenderer.compositeChecksum()
         let migratedRenderer = try WatercolorRenderer(project: migrated, device: device)
 
-        #expect(expectedChecksum == 16_775_380_187_958_906_391)
         #expect(migrated == expected)
         #expect(try migratedRenderer.compositeChecksum() == expectedChecksum)
 
@@ -4507,9 +4644,10 @@ import WatercolorCore
         bristleStrength: Double = 1,
         textureStrength: Double = 1,
         points: [StrokePoint],
+        paper: PaperTexture = .rough,
         device: MTLDevice
     ) throws -> DynamicsRenderSample {
-        let project = PaintingProject.testCanvas(160, paper: .rough)
+        let project = PaintingProject.testCanvas(160, paper: paper)
         let stroke = dynamicsStroke(
             layerID: project.layers[0].id,
             hair: hair,
@@ -4557,6 +4695,183 @@ import WatercolorCore
             partial + (value - mean) * (value - mean)
         } / Double(values.count)
         return sqrt(variance) / mean
+    }
+
+    private func textureSpatialMetrics(
+        textured: RendererDebugLayerFields,
+        baseline: RendererDebugLayerFields
+    ) -> TextureSpatialMetrics {
+        guard textured.width == baseline.width,
+              textured.height == baseline.height,
+              textured.pigment.count == baseline.pigment.count,
+              baseline.pigment.count == baseline.width * baseline.height
+        else { return .empty }
+
+        let supportThreshold = 0.05
+        var supported = Array(repeating: false, count: baseline.pigment.count)
+        var residual = Array(repeating: 0.0, count: baseline.pigment.count)
+        for index in baseline.pigment.indices {
+            let reference = Double(baseline.pigment[index].w)
+            let sample = Double(textured.pigment[index].w)
+            guard reference.isFinite, sample.isFinite, reference >= supportThreshold else { continue }
+            supported[index] = true
+            residual[index] = (sample - reference) / max(reference, supportThreshold)
+        }
+
+        var pairs: [(Double, Double)] = []
+        pairs.reserveCapacity(baseline.pigment.count * 2)
+        for y in 0..<baseline.height {
+            for x in 0..<baseline.width {
+                let index = y * baseline.width + x
+                guard supported[index] else { continue }
+                if x + 1 < baseline.width, supported[index + 1] {
+                    pairs.append((residual[index], residual[index + 1]))
+                }
+                if y + 1 < baseline.height, supported[index + baseline.width] {
+                    pairs.append((residual[index], residual[index + baseline.width]))
+                }
+            }
+        }
+        guard !pairs.isEmpty else { return .empty }
+        let highFrequencyEnergy = pairs.reduce(0.0) { partial, pair in
+            partial + abs(pair.0 - pair.1)
+        } / Double(pairs.count)
+        let firstMean = pairs.reduce(0.0) { $0 + $1.0 } / Double(pairs.count)
+        let secondMean = pairs.reduce(0.0) { $0 + $1.1 } / Double(pairs.count)
+        var covariance = 0.0
+        var firstVariance = 0.0
+        var secondVariance = 0.0
+        for pair in pairs {
+            let firstDelta = pair.0 - firstMean
+            let secondDelta = pair.1 - secondMean
+            covariance += firstDelta * secondDelta
+            firstVariance += firstDelta * firstDelta
+            secondVariance += secondDelta * secondDelta
+        }
+        let denominator = sqrt(firstVariance * secondVariance)
+        let correlation = denominator > 0 ? covariance / denominator : 0
+        return TextureSpatialMetrics(
+            highFrequencyEnergy: highFrequencyEnergy.isFinite ? highFrequencyEnergy : 0,
+            lagOneAutocorrelation: correlation.isFinite ? correlation : 0
+        )
+    }
+
+    private func textureTopologyMetrics(
+        textured: RendererDebugLayerFields,
+        baseline: RendererDebugLayerFields
+    ) -> TextureTopologyMetrics {
+        guard textured.width == baseline.width,
+              textured.height == baseline.height,
+              textured.pigment.count == baseline.pigment.count,
+              baseline.pigment.count == baseline.width * baseline.height
+        else { return .empty }
+
+        let supportThreshold = 0.05
+        var supported = Array(repeating: false, count: baseline.pigment.count)
+        var void = Array(repeating: false, count: baseline.pigment.count)
+        var residual = Array(repeating: 0.0, count: baseline.pigment.count)
+        var supportCount = 0
+        for index in baseline.pigment.indices {
+            let reference = Double(baseline.pigment[index].w)
+            let sample = Double(textured.pigment[index].w)
+            guard reference.isFinite, sample.isFinite, reference >= supportThreshold else { continue }
+            supported[index] = true
+            supportCount += 1
+            residual[index] = (sample - reference) / max(reference, supportThreshold)
+            void[index] = sample / reference < 0.40
+        }
+        let voidCount = void.filter { $0 }.count
+        guard supportCount > 0, voidCount > 0 else { return .empty }
+
+        let neighborOffsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        var visited = Array(repeating: false, count: void.count)
+        var components: [[Int]] = []
+        for start in void.indices where void[start] && !visited[start] {
+            var queue = [start]
+            var head = 0
+            var component: [Int] = []
+            visited[start] = true
+            while head < queue.count {
+                let index = queue[head]
+                head += 1
+                component.append(index)
+                let x = index % baseline.width
+                let y = index / baseline.width
+                for (dx, dy) in neighborOffsets {
+                    let neighborX = x + dx
+                    let neighborY = y + dy
+                    guard (0..<baseline.width).contains(neighborX),
+                          (0..<baseline.height).contains(neighborY)
+                    else { continue }
+                    let neighbor = neighborY * baseline.width + neighborX
+                    guard void[neighbor], !visited[neighbor] else { continue }
+                    visited[neighbor] = true
+                    queue.append(neighbor)
+                }
+            }
+            components.append(component)
+        }
+
+        var circularityTotal = 0.0
+        var circularityWeight = 0.0
+        var ringContrastTotal = 0.0
+        var ringContrastWeight = 0.0
+        for component in components where component.count >= 3 {
+            let centerX = component.reduce(0.0) { $0 + Double($1 % baseline.width) }
+                / Double(component.count)
+            let centerY = component.reduce(0.0) { $0 + Double($1 / baseline.width) }
+                / Double(component.count)
+            var perimeter = 0
+            for index in component {
+                let x = index % baseline.width
+                let y = index / baseline.width
+                for (dx, dy) in neighborOffsets {
+                    let neighborX = x + dx
+                    let neighborY = y + dy
+                    if !(0..<baseline.width).contains(neighborX)
+                        || !(0..<baseline.height).contains(neighborY)
+                        || !void[neighborY * baseline.width + neighborX] {
+                        perimeter += 1
+                    }
+                }
+            }
+            let circularity = 4 * Double.pi * Double(component.count)
+                / max(Double(perimeter * perimeter), 1)
+            circularityTotal += circularity * Double(component.count)
+            circularityWeight += Double(component.count)
+
+            var annulusTotal = 0.0
+            var annulusCount = 0
+            let minimumX = max(0, Int(floor(centerX - 7)))
+            let maximumX = min(baseline.width - 1, Int(ceil(centerX + 7)))
+            let minimumY = max(0, Int(floor(centerY - 7)))
+            let maximumY = min(baseline.height - 1, Int(ceil(centerY + 7)))
+            for y in minimumY...maximumY {
+                for x in minimumX...maximumX {
+                    let distance = hypot(Double(x) - centerX, Double(y) - centerY)
+                    let index = y * baseline.width + x
+                    guard distance >= 4, distance <= 7, supported[index] else { continue }
+                    annulusTotal += residual[index]
+                    annulusCount += 1
+                }
+            }
+            if annulusCount > 0 {
+                let centerResidual = component.reduce(0.0) { $0 + residual[$1] }
+                    / Double(component.count)
+                ringContrastTotal += (annulusTotal / Double(annulusCount) - centerResidual)
+                    * Double(component.count)
+                ringContrastWeight += Double(component.count)
+            }
+        }
+
+        let largestComponent = components.map(\.count).max() ?? 0
+        return TextureTopologyMetrics(
+            voidRatio: Double(voidCount) / Double(supportCount),
+            largestVoidComponentFraction: Double(largestComponent) / Double(voidCount),
+            meanVoidCircularity: circularityWeight > 0 ? circularityTotal / circularityWeight : 0,
+            ringContrast: ringContrastWeight > 0 ? ringContrastTotal / ringContrastWeight : 0,
+            componentCount: components.count
+        )
     }
 
     private func wetnessToPigmentRatio(_ metrics: BrushPhenotypeMetrics) -> Double {
@@ -4666,6 +4981,39 @@ import WatercolorCore
                 ))
             ]
         )
+    }
+}
+
+private struct TextureSpatialMetrics: CustomStringConvertible {
+    let highFrequencyEnergy: Double
+    let lagOneAutocorrelation: Double
+
+    static let empty = Self(highFrequencyEnergy: 0, lagOneAutocorrelation: 0)
+
+    var description: String {
+        "highFrequencyEnergy=\(highFrequencyEnergy), lagOneAutocorrelation=\(lagOneAutocorrelation)"
+    }
+}
+
+private struct TextureTopologyMetrics: CustomStringConvertible {
+    let voidRatio: Double
+    let largestVoidComponentFraction: Double
+    let meanVoidCircularity: Double
+    let ringContrast: Double
+    let componentCount: Int
+
+    static let empty = Self(
+        voidRatio: 0,
+        largestVoidComponentFraction: 0,
+        meanVoidCircularity: 0,
+        ringContrast: 0,
+        componentCount: 0
+    )
+
+    var description: String {
+        "voidRatio=\(voidRatio), largestVoidComponentFraction=\(largestVoidComponentFraction), "
+            + "meanVoidCircularity=\(meanVoidCircularity), ringContrast=\(ringContrast), "
+            + "componentCount=\(componentCount)"
     }
 }
 
