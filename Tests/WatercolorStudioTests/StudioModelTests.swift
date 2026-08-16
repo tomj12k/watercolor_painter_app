@@ -404,6 +404,88 @@ import WatercolorCore
         #expect(updates == [model.project])
     }
 
+    @Test func queuedPreviewPointsSplitIntoBoundedRendererSubmissions() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var submittedPointCounts: [Int] = []
+        let operation = StrokePreviewRendererOperation(
+            update: { _, _, points, _ in
+                submittedPointCounts.append(points.count)
+            },
+            finish: { _, _, _ in }
+        )
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            strokePreviewOperation: operation
+        )
+        let stroke = StrokeCommand.studioTestStroke(
+            layerID: project.layers[0].id,
+            x: 48,
+            y: 96
+        )
+        #expect(model.beginStrokePreview(stroke) == .accepted)
+
+        let queuedIndices: [Int] = Array(1...33)
+        let queuedPoints: [StrokePoint] = queuedIndices.map { index in
+            StrokePoint(
+                x: Double(48 + index * 3),
+                y: Double(96 + (index % 5) * 2),
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 120
+            )
+        }
+        model.appendStrokePreview(id: stroke.id, points: queuedPoints)
+        await model.waitForStrokePreviewIdle()
+
+        #expect(submittedPointCounts == [8, 8, 8, 8, 1])
+        #expect(submittedPointCounts.allSatisfy { $0 <= 8 })
+        #expect(model.error == nil)
+    }
+
+    @Test func longQueuedScribbleStaysWithinTheRendererWorkBudget() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        var project = PaintingProject.studioTestProject()
+        project.canvas = CanvasSize(width: 1_600, height: 1_200)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let model = StudioModel(project: project, renderer: renderer)
+        var stroke = StrokeCommand.studioTestStroke(
+            layerID: project.layers[0].id,
+            x: 24,
+            y: 48
+        )
+        let scribbleIndices: [Int] = Array(1...120)
+        let scribblePoints: [StrokePoint] = scribbleIndices.map { index in
+            StrokePoint(
+                x: Double(24 + (index % 32) * 48),
+                y: Double(48 + ((index * 17) % 24) * 48),
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 60
+            )
+        }
+        stroke.points.append(contentsOf: scribblePoints)
+        var initial = stroke
+        initial.points = [stroke.points[0]]
+
+        #expect(model.beginStrokePreview(initial) == .accepted)
+        model.appendStrokePreview(id: stroke.id, points: Array(stroke.points.dropFirst()))
+        await model.waitForStrokePreviewIdle()
+
+        #expect(model.error == nil)
+        #expect(model.isStrokePreviewActive)
+        await model.commitStrokePreview(stroke)
+
+        #expect(model.error == nil)
+        #expect(model.project.commands == [.stroke(stroke)])
+        let replayed = try WatercolorRenderer(project: model.project, device: device)
+        #expect(try renderer.studioChecksum() == replayed.studioChecksum())
+    }
+
     @Test func multiUpdatePreviewCommitExactlyMatchesFreshSemanticReplay() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()

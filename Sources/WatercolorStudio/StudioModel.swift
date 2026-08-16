@@ -375,6 +375,9 @@ actor StudioPNGExportCoordinator {
 public final class StudioModel: ObservableObject {
     public static let brushSizeRange = 1.0...300.0
     private static let dryStepCount = 24
+    // Keep each queued preview update within one renderer stamp batch. This
+    // bounds GPU work per submission when input arrives faster than Metal.
+    private static let previewPointBatchSize = 8
     private static let maximumRendererCheckpointCount = 2
     private static let defaultRendererCheckpointByteBudget = 256 * 1024 * 1024
 
@@ -679,8 +682,9 @@ public final class StudioModel: ObservableObject {
               isCurrentStrokePreview(token),
               renderer === token.renderer,
               !pendingStrokePreviewPoints.isEmpty {
-            let points = pendingStrokePreviewPoints
-            pendingStrokePreviewPoints = []
+            let pointCount = min(Self.previewPointBatchSize, pendingStrokePreviewPoints.count)
+            let points = Array(pendingStrokePreviewPoints.prefix(pointCount))
+            pendingStrokePreviewPoints = Array(pendingStrokePreviewPoints.dropFirst(pointCount))
             do {
                 try await strokePreviewOperation.update(
                     token.renderer,
