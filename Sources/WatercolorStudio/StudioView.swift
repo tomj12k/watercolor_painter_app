@@ -113,6 +113,11 @@ public struct StudioView: View {
 
                 MetalCanvasView(model: model)
 
+                if model.rendererRecoveryError != nil {
+                    recoveryBanner
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                }
+
                 Rectangle()
                     .stroke(
                         StudioPalette.cobalt.opacity(0.28 + model.canvasWetness * 0.62),
@@ -152,6 +157,31 @@ public struct StudioView: View {
 
     private var activityLabel: String {
         "Canvas wetness \(Int((model.canvasWetness * 100).rounded()))%"
+    }
+
+    private var recoveryBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+            Text("Painting is paused after a renderer problem. Your work so far is safe.")
+            Button("Try Again", action: model.retryRendererRecovery)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(StudioPalette.cobalt)
+        }
+        .font(.system(size: 12, weight: .medium))
+        .foregroundStyle(StudioPalette.fiber)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(StudioPalette.carbon.opacity(0.94))
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill(StudioPalette.pigment)
+                .frame(width: 2)
+        }
+        .padding(12)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Renderer recovery")
+        .accessibilityHint("Painting is paused. Try Again rebuilds the renderer from your saved work.")
     }
 
     private var inspector: some View {

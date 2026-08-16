@@ -1238,6 +1238,21 @@ public final class StudioModel: ObservableObject {
         }
     }
 
+    /// Rebuilds the renderer from the committed project after a renderer
+    /// failure, restoring painting without requiring a structural edit. A
+    /// failed rebuild keeps the recovery state and reports why.
+    public func retryRendererRecovery() {
+        guard rendererRecoveryError != nil else { return }
+        do {
+            let candidateRenderer = try makeRendererCandidate(project: project)
+            replaceRenderer(with: candidateRenderer)
+            refreshCapabilities()
+            error = nil
+        } catch {
+            self.error = StudioFailure.rendering(error: error, project: project)
+        }
+    }
+
     public func drySelectedLayer() {
         guard selectedLayerIndex != nil else { return }
         let layerID = selectedLayerID
