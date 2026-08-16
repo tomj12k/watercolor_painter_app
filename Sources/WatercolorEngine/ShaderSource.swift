@@ -141,7 +141,7 @@ enum ShaderSource {
     ) {
         if (shape == 0u) {
             float antialias = proportionalShapeAntialias(radius);
-            return smoothstep(antialias, -antialias, length(normalized) - 1.0f);
+            return 1.0f - smoothstep(-antialias, antialias, length(normalized) - 1.0f);
         }
 
         float2 axis = orientation.xy;
@@ -180,7 +180,7 @@ enum ShaderSource {
             }
         }
         float antialias = proportionalShapeAntialias(radius);
-        return smoothstep(antialias, -antialias, distance);
+        return 1.0f - smoothstep(-antialias, antialias, distance);
     }
 
     float shapeCoverage(

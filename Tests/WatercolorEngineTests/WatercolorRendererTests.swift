@@ -1166,6 +1166,132 @@ import WatercolorCore
         #expect(try renderer.compositeChecksum() == freshCompleted.compositeChecksum())
     }
 
+    @Test func versionOneTrailingDuplicateRunKeepsDirectionAcrossPreviewBatchBoundary() async throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let project = PaintingProject.testCanvas(128, paper: .hotPress)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var complete = StrokeCommand.testDot(
+            id: UUID(uuidString: "C234A065-D195-4225-9494-CCF62F1D3A91")!,
+            layerID: project.layers[0].id
+        )
+        complete.brush.shape = .rigger
+        complete.brush.hair = .sable
+        complete.brush.texture = .smooth
+        complete.brush.style = .transparentWash
+        complete.brush.size = 30
+        complete.brush.opacity = 1
+        complete.brush.flow = 1
+        complete.brush.water = 0.1
+        complete.brush.granulation = 0
+        complete.brush.edgeBloom = 0
+        complete.points = []
+        for index in 0..<17 {
+            let y = index < 4 ? Double(32 + index * 8) : 64
+            complete.points.append(StrokePoint(
+                x: 64,
+                y: y,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 60
+            ))
+        }
+        var initial = complete
+        initial.points = [complete.points[0]]
+
+        let token = try renderer.beginStrokePreview(initial)
+        // Point 8 is the retained lookahead for the first canonical block and
+        // is coincident with its tail. The later block is also entirely
+        // coincident, so direction has to cross the eight-point boundary.
+        try await renderer.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points[1...8]),
+            token: token
+        )
+        try await renderer.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points[9...]),
+            token: token
+        )
+        try await renderer.finishStrokePreview(complete, token: token)
+
+        var replayProject = project
+        replayProject.commands = [.stroke(complete)]
+        let fresh = try WatercolorRenderer(project: replayProject, device: device)
+        var explicitlyVertical = complete
+        explicitlyVertical.points = complete.points.map {
+            StrokePoint(
+                x: $0.x,
+                y: $0.y,
+                pressure: $0.pressure,
+                tiltX: 0,
+                tiltY: 1,
+                time: $0.time
+            )
+        }
+        var verticalProject = project
+        verticalProject.commands = [.stroke(explicitlyVertical)]
+        let vertical = try WatercolorRenderer(project: verticalProject, device: device)
+        let expectedChecksum = try vertical.compositeChecksum()
+
+        #expect(try renderer.compositeChecksum() == expectedChecksum)
+        #expect(try fresh.compositeChecksum() == expectedChecksum)
+    }
+
+    @Test func versionOneCurvedDuplicateRunHasCanonicalPreviewReplayDirection() async throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let project = PaintingProject.testCanvas(160, paper: .hotPress)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var complete = StrokeCommand.testDot(
+            id: UUID(uuidString: "8C6B7A4B-4892-4234-B08C-7D6A066E5D3A")!,
+            layerID: project.layers[0].id
+        )
+        complete.brush.shape = .rigger
+        complete.brush.hair = .sable
+        complete.brush.texture = .smooth
+        complete.brush.style = .transparentWash
+        complete.brush.size = 24
+        complete.points = []
+        for index in 0..<17 {
+            let coordinate: (Double, Double)
+            if index < 4 {
+                coordinate = (Double(32 + index * 8), 64)
+            } else if index < 10 {
+                coordinate = (64, 64)
+            } else {
+                coordinate = (64, Double(72 + (index - 10) * 8))
+            }
+            complete.points.append(shapePoint(
+                x: coordinate.0,
+                y: coordinate.1,
+                time: Double(index) / 60
+            ))
+        }
+        var initial = complete
+        initial.points = [complete.points[0]]
+
+        let token = try renderer.beginStrokePreview(initial)
+        try await renderer.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points[1...8]),
+            token: token
+        )
+        // The first noncoincident point after the run arrives only after the
+        // first canonical block has rendered.
+        try await renderer.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points[9...]),
+            token: token
+        )
+        try await renderer.finishStrokePreview(complete, token: token)
+
+        var replayProject = project
+        replayProject.commands = [.stroke(complete)]
+        let fresh = try WatercolorRenderer(project: replayProject, device: device)
+
+        #expect(try renderer.compositeChecksum() == fresh.compositeChecksum())
+    }
+
     @Test func incrementalPreviewKeepsOnlyCanonicalRemainderUntilFinish() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(256)
@@ -2746,6 +2872,38 @@ import WatercolorCore
         #expect(fallbackDot.metrics == horizontalTiltDot.metrics)
     }
 
+    @Test func versionOneLongDuplicateRunUsesNearestSemanticNeighbors() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let verticalRun = [
+            shapePoint(x: 64, y: 48, time: 0),
+            shapePoint(x: 64, y: 64, time: 0.1),
+            shapePoint(x: 64, y: 64, time: 0.2),
+            shapePoint(x: 64, y: 64, time: 0.3),
+            shapePoint(x: 64, y: 64, time: 0.4),
+            shapePoint(x: 64, y: 64, time: 0.5),
+            shapePoint(x: 64, y: 80, time: 0.6)
+        ]
+        let explicitlyVertical = verticalRun.map {
+            shapePoint(x: $0.x, y: $0.y, tiltY: 1, time: $0.time)
+        }
+        let tangent = try renderShapeSample(
+            shape: .rigger,
+            points: verticalRun,
+            size: 30,
+            device: device
+        )
+        let tilt = try renderShapeSample(
+            shape: .rigger,
+            points: explicitlyVertical,
+            size: 30,
+            device: device
+        )
+
+        #expect(tangent.checksum == tilt.checksum)
+        #expect(tangent.metrics == tilt.metrics)
+        #expect(orientationDistance(tangent.metrics.orientation, .pi / 2) < 0.25)
+    }
+
     @Test func versionOneRoundFootprintIsDirectionInvariant() throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let horizontal = [shapePoint(x: 64, y: 64, tiltX: 0.9, tiltY: 0)]
@@ -2860,6 +3018,51 @@ import WatercolorCore
         #expect(samples[1].area <= samples[2].area)
         #expect(samples[0].pigmentMass < samples[1].pigmentMass)
         #expect(samples[1].pigmentMass < samples[2].pigmentMass)
+    }
+
+    @Test func versionOneAntialiasCoverageFallsFromInteriorToExterior() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let round = try renderShapeSample(
+            shape: .round,
+            points: [shapePoint(x: 64, y: 64)],
+            device: device
+        )
+        let flat = try renderShapeSample(
+            shape: .flat,
+            points: [shapePoint(x: 64, y: 64, tiltX: 1)],
+            device: device
+        )
+        let roundInterior = try round.fields.pigmentColor(x: 64, y: 64).alpha
+        let roundTransition = try round.fields.pigmentColor(x: 83, y: 64).alpha
+        let roundExterior = try round.fields.pigmentColor(x: 90, y: 64).alpha
+        let flatInterior = try flat.fields.pigmentColor(x: 64, y: 64).alpha
+        let flatTransition = try flat.fields.pigmentColor(x: 73, y: 64).alpha
+        let flatExterior = try flat.fields.pigmentColor(x: 82, y: 64).alpha
+
+        // Paper grain can make a particular transition pixel slightly darker
+        // than the center. The portable semantic contract is that both remain
+        // materially more covered than a point beyond the footprint.
+        #expect(roundInterior > roundExterior * 3)
+        #expect(roundTransition > roundExterior)
+        #expect(flatInterior > flatExterior * 3)
+        #expect(flatTransition > flatExterior)
+    }
+
+    @Test func versionOneShaderUsesPortableAscendingSmoothstepBounds() throws {
+        let source = ShaderSource.watercolor
+        let start = try #require(source.range(of: "float versionOneShapeCoverage("))
+        let end = try #require(
+            source.range(of: "float shapeCoverage(", range: start.upperBound..<source.endIndex)
+        )
+        let versionOneCoverage = source[start.lowerBound..<end.lowerBound]
+
+        // MSL leaves smoothstep undefined when edge0 >= edge1. This narrow
+        // source contract is appropriate because driver-visible behavior cannot
+        // prove portability when the local driver happens to define that case.
+        #expect(!versionOneCoverage.contains("smoothstep(antialias, -antialias"))
+        #expect(
+            versionOneCoverage.ranges(of: "1.0f - smoothstep(-antialias, antialias").count == 2
+        )
     }
 
     @Test func layerVisibilityOpacityAndOrderAffectComposite() throws {
@@ -3717,11 +3920,11 @@ import WatercolorCore
         )
         let renderer = try WatercolorRenderer(project: project, device: device)
         try renderer.renderAndWait(stroke: stroke)
+        let fields = try renderer.debugLayerFields(layerID: project.layers[0].id)
         return ShapeRenderSample(
             checksum: try renderer.compositeChecksum(),
-            metrics: BrushPhenotypeMetrics.measure(
-                try renderer.debugLayerFields(layerID: project.layers[0].id)
-            )
+            metrics: BrushPhenotypeMetrics.measure(fields),
+            fields: fields
         )
     }
 
@@ -3823,6 +4026,7 @@ private struct CanonicalPhenotypeFixture {
 private struct ShapeRenderSample {
     let checksum: UInt64
     let metrics: BrushPhenotypeMetrics
+    let fields: RendererDebugLayerFields
 }
 
 private actor RendererPreviewCallSuspension {
