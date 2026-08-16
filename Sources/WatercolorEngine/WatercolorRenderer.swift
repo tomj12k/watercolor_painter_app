@@ -73,6 +73,9 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private static let simulationStepsPerStroke = 2
     private static let stampBatchSize = 8
     private static let activeRegionLifetimeSteps = 256
+    /// How far beyond the freshest stamp the wet simulation window extends,
+    /// sized to the lifetime's maximum diffusion travel plus headroom.
+    private static let activeRegionTrailingWindowPadding = 384
     private static let allLayers = UInt32.max
 
     public private(set) var project: PaintingProject
@@ -2037,13 +2040,35 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     }
 
     private func registerActiveSimulationRegion(_ region: CanvasRegion, slice: Int) {
+        let stampRegion = region.padded(by: 2, canvas: project.canvas)
         let newRegion = ActiveSimulationRegion(
-            region: region.padded(by: 2, canvas: project.canvas),
+            region: stampRegion,
             remainingSteps: Self.activeRegionLifetimeSteps
         )
-        activeSimulationRegions[slice] = coalescedActiveRegions(
+        let coalesced = coalescedActiveRegions(
             (activeSimulationRegions[slice] ?? []) + [newRegion]
         )
+        // Coalescing merges the fresh stamp into every wet region it touches
+        // and the merge inherits a full lifetime, so a continuous stroke
+        // would otherwise keep its entire path in simulation forever and
+        // every batch would grow more expensive than the last. Bound the
+        // region that contains the fresh stamp to a trailing window around
+        // it: diffusion advances at most one pixel per step and wet regions
+        // live 256 steps, so paint beyond the window is at the end of its
+        // influence. The tail freezes exactly as any region does when its
+        // lifetime expires.
+        activeSimulationRegions[slice] = coalesced.map { active in
+            guard active.region.intersectsOrTouches(stampRegion) else { return active }
+            let trailingWindow = stampRegion.padded(
+                by: Self.activeRegionTrailingWindowPadding,
+                canvas: project.canvas
+            )
+            guard let bounded = active.region.intersection(trailingWindow) else { return active }
+            return ActiveSimulationRegion(
+                region: bounded.union(stampRegion),
+                remainingSteps: active.remainingSteps
+            )
+        }
     }
 
     private var simulationStateSnapshot: SimulationStateSnapshot {
@@ -3155,6 +3180,19 @@ private struct CanvasRegion: Equatable {
             maxX: min(maxX + amount, canvas.width),
             maxY: min(maxY + amount, canvas.height)
         )
+    }
+
+    func intersection(_ other: Self) -> Self? {
+        let candidate = Self(
+            minX: max(minX, other.minX),
+            minY: max(minY, other.minY),
+            maxX: min(maxX, other.maxX),
+            maxY: min(maxY, other.maxY)
+        )
+        guard candidate.maxX > candidate.minX, candidate.maxY > candidate.minY else {
+            return nil
+        }
+        return candidate
     }
 
     func intersectsOrTouches(_ other: Self) -> Bool {

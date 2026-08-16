@@ -1702,6 +1702,43 @@ import WatercolorCore
         #expect(try splitRenderer.compositeChecksum() == checksumBefore)
     }
 
+    @Test func longContinuousStrokeSimulatesABoundedTrailingWindow() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let layer = PaintLayer(name: "Layer 1")
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 1_600, height: 1_200),
+            paper: .coldPress,
+            layers: [layer]
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let points: [StrokePoint] = (0..<360).map { (index: Int) -> StrokePoint in
+            StrokePoint(
+                x: 40 + Double(index) * 4,
+                y: 600,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
+            )
+        }
+        let stroke = StrokeCommand(
+            layerID: layer.id,
+            tool: .brush,
+            brush: .default,
+            points: points
+        )
+
+        try renderer.renderAndWait(stroke: stroke)
+
+        // The wet simulation follows the brush in a bounded trailing window.
+        // Without the bound, the region spans the whole stroke path and every
+        // batch re-simulates everything drawn so far, so long strokes lag
+        // more the longer the customer keeps painting.
+        let largestRegion = renderer.debugLastStrokeDispatch.simulationRegion
+        #expect(largestRegion.width > 0)
+        #expect(largestRegion.width <= 1_000)
+    }
+
     @Test func oversizedPreviewAppendSplitsAcrossBoundedSubmissions() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
