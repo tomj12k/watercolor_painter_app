@@ -14,6 +14,9 @@ cleanup_active=0
 liveness_seconds="${WATERCOLOR_LIVENESS_SECONDS:-5}"
 termination_grace_seconds="${WATERCOLOR_TERMINATION_GRACE_SECONDS:-2}"
 optimized_timeout_seconds="${WATERCOLOR_OPTIMIZED_TIMEOUT_SECONDS:-30}"
+launch_registration_delay_seconds="${WATERCOLOR_TEST_LAUNCH_REGISTRATION_DELAY_SECONDS:-0}"
+signals_are_deferred=0
+pending_signal_exit_code=0
 
 record() {
     printf '%s\n' "$1" | tee -a "${working_report}"
@@ -21,6 +24,37 @@ record() {
 
 run_logged() {
     "$@" 2>&1 | tee -a "${working_report}"
+}
+
+handle_signal() {
+    local signal_exit_code="$1"
+    if [[ "${signals_are_deferred}" -eq 1 ]]; then
+        pending_signal_exit_code="${signal_exit_code}"
+        return
+    fi
+    exit "${signal_exit_code}"
+}
+
+launch_tracked_process() {
+    local output_path="$1"
+    shift
+    local launched_pid
+    local deferred_exit_code
+
+    signals_are_deferred=1
+    "$@" > "${output_path}" 2>&1 &
+    launched_pid=$!
+    if [[ "${launch_registration_delay_seconds}" -gt 0 ]]; then
+        /bin/sleep "${launch_registration_delay_seconds}"
+    fi
+    qualification_pid="${launched_pid}"
+    signals_are_deferred=0
+    if [[ "${pending_signal_exit_code}" -ne 0 ]]; then
+        deferred_exit_code="${pending_signal_exit_code}"
+        pending_signal_exit_code=0
+        record "WATERCOLOR_RELEASE_QUALIFICATION gate=process_registration status=INTERRUPTED exit_code=${deferred_exit_code}"
+        exit "${deferred_exit_code}"
+    fi
 }
 
 publish_report() {
@@ -103,9 +137,10 @@ run_optimized_qualification() {
     local termination_status=0
     local poll_count=$((optimized_timeout_seconds * 10))
 
-    "${application_executable}" --qualify-customer-input \
-        > "${optimized_log}" 2>&1 &
-    qualification_pid=$!
+    launch_tracked_process \
+        "${optimized_log}" \
+        "${application_executable}" \
+        --qualify-customer-input
     for ((poll = 0; poll < poll_count; poll += 1)); do
         if ! kill -0 "${qualification_pid}" 2>/dev/null; then
             break
@@ -146,7 +181,7 @@ cleanup() {
     if [[ -n "${qualification_pid}" ]]; then
         terminate_qualification_process
         termination_status=$?
-        if [[ "${termination_status}" -ne 0 ]]; then
+        if [[ "${termination_status}" -ne 0 && "${exit_status}" -eq 0 ]]; then
             exit_status=3
         fi
     fi
@@ -166,15 +201,16 @@ cleanup() {
     exit "${exit_status}"
 }
 trap cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'handle_signal 129' HUP
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
 
 cd "${repository_root}"
 record "WATERCOLOR_RELEASE_QUALIFICATION status=STARTED"
 if [[ ! "${liveness_seconds}" =~ ^[1-9][0-9]*$ ]] \
     || [[ ! "${termination_grace_seconds}" =~ ^[1-9][0-9]*$ ]] \
-    || [[ ! "${optimized_timeout_seconds}" =~ ^[1-9][0-9]*$ ]]; then
+    || [[ ! "${optimized_timeout_seconds}" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "${launch_registration_delay_seconds}" =~ ^(0|[1-9][0-9]*)$ ]]; then
     echo "Qualification timing values must be positive whole seconds." >&2
     exit 2
 fi
@@ -234,8 +270,9 @@ else
 fi
 
 record "WATERCOLOR_RELEASE_QUALIFICATION gate=liveness status=RUNNING"
-"${application_executable}" > "${working_directory}/liveness.log" 2>&1 &
-qualification_pid=$!
+launch_tracked_process \
+    "${working_directory}/liveness.log" \
+    "${application_executable}"
 for ((liveness_second = 1; liveness_second <= liveness_seconds; liveness_second += 1)); do
     /bin/sleep 1
     if ! kill -0 "${qualification_pid}" 2>/dev/null; then

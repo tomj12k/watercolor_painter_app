@@ -215,6 +215,7 @@ set +e
         WATERCOLOR_LIVENESS_SECONDS=1 \
         WATERCOLOR_TERMINATION_GRACE_SECONDS=1 \
         WATERCOLOR_OPTIMIZED_TIMEOUT_SECONDS=10 \
+        WATERCOLOR_TEST_LAUNCH_REGISTRATION_DELAY_SECONDS=2 \
         WATERCOLOR_TEST_PID_FILE="${test_root}/liveness-process.pid" \
         WATERCOLOR_TEST_QUALIFIER_PID_FILE="${test_root}/qualifier-process.pid" \
         FAKE_QUALIFIER_HANG=1 \
@@ -222,6 +223,7 @@ set +e
 ) > "${test_root}/signal-qualifier.log" 2>&1 &
 signal_runner_pid=$!
 set -e
+SECONDS=0
 for ((poll = 0; poll < 100; poll += 1)); do
     if [[ -s "${test_root}/qualifier-process.pid" ]]; then break; fi
     /bin/sleep 0.05
@@ -237,10 +239,18 @@ if [[ "${signal_status}" -eq 0 ]]; then
     echo "interrupted qualifier unexpectedly passed" >&2
     exit 1
 fi
+if (( SECONDS >= 5 )); then
+    echo "signal cleanup fell through to the optimized timeout" >&2
+    exit 1
+fi
 if kill -0 "${signal_qualifier_pid}" 2>/dev/null; then
     echo "interrupted qualifier process was left running" >&2
     exit 1
 fi
+grep -q 'gate=process_registration status=INTERRUPTED exit_code=143' \
+    "${signal_qualifier_fixture}/.build/qualification/report.txt"
+grep -q 'WATERCOLOR_RELEASE_QUALIFICATION status=FAIL exit_code=143' \
+    "${signal_qualifier_fixture}/.build/qualification/report.txt"
 rm "${test_root}/qualifier-process.pid"
 
 wedged_qualifier_fixture="${test_root}/wedged-qualifier"
