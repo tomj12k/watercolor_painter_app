@@ -52,8 +52,16 @@ enum StudioPNGExportPanel {
 struct StudioAppCommands: Commands {
     @FocusedValue(\.studioModel) private var model
     @FocusedValue(\.studioTextEntryIsFocused) private var textEntryIsFocused
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
+        CommandGroup(replacing: .help) {
+            Button("Watercolor Studio Help") {
+                openWindow(id: StudioHelp.windowIdentifier)
+            }
+            .keyboardShortcut("?", modifiers: [.command])
+        }
+
         CommandGroup(replacing: .undoRedo) {
             Button("Undo") { model?.undo() }
                 .keyboardShortcut("z", modifiers: [.command])
