@@ -99,78 +99,216 @@ final class WatercolorStudioApplicationDelegate: NSObject, NSApplicationDelegate
     }
 }
 
-struct InitialDocumentFlowCoordinator {
+@MainActor
+final class InitialDocumentFlowCoordinator: ObservableObject {
+    typealias Schedule = (_ action: @escaping @MainActor () -> Void) -> Void
+    typealias RequestSaveAs = @MainActor () -> Bool
+
     private enum State {
         case existingDocument
         case configuring
         case awaitingConfigurationDismissal
-        case saveAsRequested
+        case pendingInitialSave
+        case completed
     }
 
-    private var state: State
+    @Published private var state: State
+    @Published private(set) var initialSaveFailure: StudioFailure?
+    private let schedule: Schedule
+    private let requestSaveAs: RequestSaveAs
+    private var saveRequestIsScheduled = false
 
-    init(needsInitialConfiguration: Bool) {
+    init(
+        needsInitialConfiguration: Bool,
+        schedule: @escaping Schedule,
+        requestSaveAs: @escaping RequestSaveAs
+    ) {
         state = needsInitialConfiguration ? .configuring : .existingDocument
+        initialSaveFailure = nil
+        self.schedule = schedule
+        self.requestSaveAs = requestSaveAs
     }
 
     var presentsConfiguration: Bool {
         state == .configuring
     }
 
-    mutating func configurationSucceeded() {
+    var hasPendingInitialSave: Bool {
+        state == .pendingInitialSave
+    }
+
+    func configurationSucceeded() {
         guard state == .configuring else { return }
         state = .awaitingConfigurationDismissal
     }
 
-    mutating func configurationFailed() {
+    func configurationFailed() {
         // A failed allocation leaves the in-app configuration in place.
     }
 
-    mutating func configurationSheetDidDismiss(requestSaveAs: () -> Void) {
+    func configurationSheetDidDismiss() {
         guard state == .awaitingConfigurationDismissal else { return }
-        state = .saveAsRequested
-        requestSaveAs()
+        state = .pendingInitialSave
+        schedulePendingSaveRequest()
+    }
+
+    func retryInitialSaveAs() {
+        guard state == .pendingInitialSave else { return }
+        initialSaveFailure = nil
+        schedulePendingSaveRequest()
+    }
+
+    func dismissInitialSaveFailure() {
+        initialSaveFailure = nil
+    }
+
+    private func schedulePendingSaveRequest() {
+        guard state == .pendingInitialSave, !saveRequestIsScheduled else { return }
+        saveRequestIsScheduled = true
+        schedule { [weak self] in
+            self?.performPendingSaveRequest()
+        }
+    }
+
+    private func performPendingSaveRequest() {
+        guard state == .pendingInitialSave else {
+            saveRequestIsScheduled = false
+            return
+        }
+        let requested = requestSaveAs()
+        saveRequestIsScheduled = false
+        if requested {
+            state = .completed
+            initialSaveFailure = nil
+        } else {
+            initialSaveFailure = StudioFailure(
+                message: "Watercolor Studio could not open Save As for this painting. Try again, or choose File > Save As."
+            )
+        }
     }
 }
 
 @MainActor
 struct NativeDocumentSaveAsRequester {
     typealias SendAction = (_ selector: Selector, _ target: Any?, _ sender: Any?) -> Bool
+    typealias WindowProvider = @MainActor () -> NSWindow?
+    typealias DocumentForWindow = @MainActor (NSWindow) -> NSDocument?
+    typealias FocusWindow = @MainActor (NSWindow) -> Void
 
+    private let owningWindow: WindowProvider
+    private let keyWindow: WindowProvider
+    private let mainWindow: WindowProvider
+    private let documentForWindow: DocumentForWindow
+    private let focusWindow: FocusWindow
     private let sendAction: SendAction
 
-    init(sendAction: @escaping SendAction = { selector, target, sender in
-        NSApplication.shared.sendAction(selector, to: target, from: sender)
-    }) {
+    init(
+        owningWindow: @escaping WindowProvider,
+        keyWindow: @escaping WindowProvider = { NSApplication.shared.keyWindow },
+        mainWindow: @escaping WindowProvider = { NSApplication.shared.mainWindow },
+        documentForWindow: @escaping DocumentForWindow = {
+            NSDocumentController.shared.document(for: $0)
+        },
+        focusWindow: @escaping FocusWindow = { $0.makeKey() },
+        sendAction: @escaping SendAction = { selector, target, sender in
+            NSApplication.shared.sendAction(selector, to: target, from: sender)
+        }
+    ) {
+        self.owningWindow = owningWindow
+        self.keyWindow = keyWindow
+        self.mainWindow = mainWindow
+        self.documentForWindow = documentForWindow
+        self.focusWindow = focusWindow
         self.sendAction = sendAction
     }
 
     @discardableResult
     func request() -> Bool {
-        sendAction(#selector(NSDocument.saveAs(_:)), nil, nil)
+        var visitedWindows = Set<ObjectIdentifier>()
+        let candidates = [owningWindow(), keyWindow(), mainWindow()]
+        for case let window? in candidates {
+            guard !(window is NSPanel), visitedWindows.insert(ObjectIdentifier(window)).inserted,
+                  let document = documentForWindow(window)
+            else { continue }
+            focusWindow(window)
+            return sendAction(#selector(NSDocument.saveAs(_:)), document, nil)
+        }
+        return false
     }
+}
+
+@MainActor
+final class StudioDocumentWindowLocator: ObservableObject {
+    private weak var owner: StudioDocumentWindowProbe?
+    private(set) weak var window: NSWindow?
+
+    fileprivate func receive(window: NSWindow?, from owner: StudioDocumentWindowProbe) {
+        if let window {
+            self.owner = owner
+            self.window = window
+        } else if self.owner === owner {
+            self.owner = nil
+            self.window = nil
+        }
+    }
+}
+
+@MainActor
+final class StudioDocumentWindowProbe: NSView {
+    private weak var locator: StudioDocumentWindowLocator?
+
+    init(locator: StudioDocumentWindowLocator) {
+        self.locator = locator
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        locator?.receive(window: window, from: self)
+    }
+}
+
+private struct StudioDocumentWindowReader: NSViewRepresentable {
+    let locator: StudioDocumentWindowLocator
+
+    func makeNSView(context: Context) -> StudioDocumentWindowProbe {
+        StudioDocumentWindowProbe(locator: locator)
+    }
+
+    func updateNSView(_ nsView: StudioDocumentWindowProbe, context: Context) {}
 }
 
 struct StudioDocumentView: View {
     @Binding private var document: PaintingDocument
     @StateObject private var host: StudioDocumentHost
-    @State private var initialDocumentFlow: InitialDocumentFlowCoordinator
-    private let requestInitialSaveAs: @MainActor () -> Void
+    @StateObject private var initialDocumentFlow: InitialDocumentFlowCoordinator
+    @StateObject private var documentWindowLocator: StudioDocumentWindowLocator
 
     init(
         document: Binding<PaintingDocument>,
-        requestInitialSaveAs: @escaping @MainActor () -> Void = {
-            NativeDocumentSaveAsRequester().request()
+        scheduleInitialSaveAs: @escaping InitialDocumentFlowCoordinator.Schedule = { action in
+            DispatchQueue.main.async { action() }
+        },
+        requestInitialSaveAs: @escaping @MainActor (NSWindow?) -> Bool = { owningWindow in
+            NativeDocumentSaveAsRequester(owningWindow: { owningWindow }).request()
         }
     ) {
+        let windowLocator = StudioDocumentWindowLocator()
         _document = document
         _host = StateObject(wrappedValue: StudioDocumentHost(document: document))
-        _initialDocumentFlow = State(
-            initialValue: InitialDocumentFlowCoordinator(
-                needsInitialConfiguration: document.wrappedValue.needsInitialConfiguration
+        _documentWindowLocator = StateObject(wrappedValue: windowLocator)
+        _initialDocumentFlow = StateObject(
+            wrappedValue: InitialDocumentFlowCoordinator(
+                needsInitialConfiguration: document.wrappedValue.needsInitialConfiguration,
+                schedule: scheduleInitialSaveAs,
+                requestSaveAs: { requestInitialSaveAs(windowLocator.window) }
             )
         )
-        self.requestInitialSaveAs = requestInitialSaveAs
     }
 
     var body: some View {
@@ -195,17 +333,29 @@ struct StudioDocumentView: View {
         .onChange(of: document.project) { _, project in
             host.receiveDocumentProject(project)
         }
+        .background(StudioDocumentWindowReader(locator: documentWindowLocator))
         .alert(item: failureBinding) { failure in
-            Alert(
-                title: Text("Studio issue"),
-                message: Text(failure.message),
-                dismissButton: .default(Text("Dismiss")) { host.dismissFailure() }
-            )
+            if initialDocumentFlow.initialSaveFailure?.id == failure.id {
+                Alert(
+                    title: Text("Choose a save location"),
+                    message: Text(failure.message),
+                    primaryButton: .default(Text("Try Again")) {
+                        initialDocumentFlow.retryInitialSaveAs()
+                    },
+                    secondaryButton: .cancel(Text("Not Now")) {
+                        initialDocumentFlow.dismissInitialSaveFailure()
+                    }
+                )
+            } else {
+                Alert(
+                    title: Text("Studio issue"),
+                    message: Text(failure.message),
+                    dismissButton: .default(Text("Dismiss")) { host.dismissFailure() }
+                )
+            }
         }
         .sheet(isPresented: configurationPresentation, onDismiss: {
-            initialDocumentFlow.configurationSheetDidDismiss {
-                requestInitialSaveAs()
-            }
+            initialDocumentFlow.configurationSheetDidDismiss()
         }) {
             NewCanvasConfigurationView(
                 create: { configuration in
@@ -235,9 +385,15 @@ struct StudioDocumentView: View {
 
     private var failureBinding: Binding<StudioFailure?> {
         Binding(
-            get: { host.failure },
+            get: { initialDocumentFlow.initialSaveFailure ?? host.failure },
             set: { value in
-                if value == nil { host.dismissFailure() }
+                if value == nil {
+                    if initialDocumentFlow.initialSaveFailure != nil {
+                        initialDocumentFlow.dismissInitialSaveFailure()
+                    } else {
+                        host.dismissFailure()
+                    }
+                }
             }
         )
     }
