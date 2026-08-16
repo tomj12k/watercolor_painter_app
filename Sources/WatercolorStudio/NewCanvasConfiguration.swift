@@ -148,14 +148,21 @@ struct NewCanvasConfigurationView: View {
 
             HStack {
                 Button("Use Default", action: useDefault)
+                    .accessibilityLabel("Use Default Canvas")
+                    .accessibilityIdentifier("new-watercolor-use-default")
                 Spacer()
                 Button("Create") { create(configuration) }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!isValid)
+                    .accessibilityLabel("Create Watercolor Canvas")
+                    .accessibilityIdentifier("new-watercolor-create")
             }
         }
         .padding(24)
         .frame(width: 430)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("New Watercolor")
+        .accessibilityIdentifier("new-watercolor-configuration")
         .interactiveDismissDisabled()
     }
 }

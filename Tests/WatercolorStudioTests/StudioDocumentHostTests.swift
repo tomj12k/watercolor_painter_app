@@ -119,6 +119,44 @@ import WatercolorCore
         #expect(host.failure?.message.contains("canvas texture allocation failed") == true)
     }
 
+    @Test func useDefaultCompletesInitialConfigurationOnlyWhenTheRendererIsAvailable() {
+        let document = StudioDocumentBox(PaintingDocument())
+        let binding = Binding(
+            get: { document.value },
+            set: { document.value = $0 }
+        )
+        let host = StudioDocumentHost(document: binding)
+
+        let configured = host.useDefaultCanvas()
+
+        #expect(configured)
+        #expect(!document.value.needsInitialConfiguration)
+        #expect(host.failure == nil)
+    }
+
+    @Test func useDefaultFailureKeepsInitialConfigurationActive() {
+        let document = StudioDocumentBox(PaintingDocument())
+        let binding = Binding(
+            get: { document.value },
+            set: { document.value = $0 }
+        )
+        let expected = NSError(
+            domain: "StudioDocumentHostTests",
+            code: 29,
+            userInfo: [NSLocalizedDescriptionKey: "default canvas allocation failed"]
+        )
+        let host = StudioDocumentHost(
+            document: binding,
+            modelFactory: { _, _ in throw expected }
+        )
+
+        let configured = host.useDefaultCanvas()
+
+        #expect(!configured)
+        #expect(document.value.needsInitialConfiguration)
+        #expect(host.failure?.message == "default canvas allocation failed")
+    }
+
     @Test func resourceRejectionKeepsTheExistingDocumentAndRendererUsable() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioHostTestProject(layerName: "Initial")
