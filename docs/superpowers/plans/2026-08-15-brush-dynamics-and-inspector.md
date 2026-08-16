@@ -20,6 +20,46 @@
 
 ---
 
+### Task 0: Resolve carried preview terminal races
+
+**Files:**
+- Modify: `Sources/WatercolorEngine/WatercolorRenderer.swift`
+- Modify: `Sources/WatercolorStudio/StudioModel.swift`
+- Modify: `Sources/WatercolorStudio/CanvasEventView.swift`
+- Modify: `Tests/WatercolorEngineTests/WatercolorRendererTests.swift`
+- Modify: `Tests/WatercolorStudioTests/StudioModelTests.swift`
+- Modify: `Tests/WatercolorStudioTests/CanvasEventViewTests.swift`
+
+**Interfaces:**
+- Keeps one trailing canonical batch of 1...8 points unrendered until pointer-up fields are final.
+- Makes asynchronous cancel/finish cleanup object- and phase-owned; stale cleanup cannot clear a later transaction.
+- Preserves typed point-capacity exhaustion through exactly one cancellation.
+
+- [ ] **Step 1: Write deterministic RED tests for the three carried findings**
+
+Cover an exact 8/16-point stroke whose same-position pointer-up changes pressure, tilt, and time; live pixels after finish must equal fresh replay and save/reopen. Suspend a real renderer append while capacity cancellation starts and assert the drain cannot start a second cancellation or replace the actionable error. Suspend actual GPU finish completion, cancel it, begin a later stroke after restoration, and assert stale finish/restore work cannot clear or poison the later transaction. Use continuations or command-completion seams, never sleeps.
+
+- [ ] **Step 2: Keep the trailing canonical batch until finish**
+
+Preview only canonical batches strictly before the final batch, so `StrokePreviewTransaction` retains 1...8 trailing points. Finish renders that bounded batch after same-position endpoint fields are finalized. Do not restore or re-encode the earlier canonical prefix. Prove brush, smudge, smear, wet non-selected layers, cumulative work budget, and absolute seed/direction indices remain exact.
+
+- [ ] **Step 3: Make cancellation phase and transaction owned**
+
+Renderer async finish/cancel/replay may clear `strokePreview` only when the exact transaction object and expected phase still own it. Studio drain failure during `.cancelling` is stale cleanup and must not initiate cancellation again or replace the pending exhaustion reason. Keep painting/project edits disabled until the authoritative cancellation resolves.
+
+- [ ] **Step 4: Run focused, full, Metal, and latency gates**
+
+Run: `swift test --filter WatercolorRendererTests && swift test --filter StudioModelTests && swift test --filter CanvasEventViewTests && swift test`
+
+Then run Metal validation and the configured-maximum preview latency fixture. Require exact replay, no duplicate cancellation, stable exhaustion text, and continued painting.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Sources/WatercolorEngine Sources/WatercolorStudio Tests/WatercolorEngineTests Tests/WatercolorStudioTests
+git commit -m "fix: serialize preview terminal ownership"
+```
+
 ### Task 1: Schema-version-3 brush dynamics and migration
 
 **Files:**
