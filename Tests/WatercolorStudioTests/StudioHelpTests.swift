@@ -41,6 +41,25 @@ struct StudioHelpTests {
         }
     }
 
+    @Test func adviceNamesOnlyActionsTheAppOffers() {
+        // The app has no command that removes history, so no customer-facing
+        // text may advise one. Undo and starting a new document are the real
+        // recovery paths.
+        let codes: [StudioFailure.Code] = [
+            .resourceBudget, .workBudget, .capacity, .metalUnavailable,
+            .gpuExecution, .malformedDocument, .newerDocument, .export, .unknown
+        ]
+        let meanings = codes.map(StudioHelp.meaning(of:)).joined(separator: "\n")
+        let codecMessages = [
+            DocumentCodecError.malformedData,
+            DocumentCodecError.unsupportedSchema(99),
+            DocumentCodecError.validationFailed(.commandLimitExceeded(1))
+        ].compactMap(\.errorDescription).joined(separator: "\n")
+        let text = (allHelpText + "\n" + meanings + "\n" + codecMessages).lowercased()
+        #expect(!text.contains("remove history"))
+        #expect(!text.contains("remove painting history"))
+    }
+
     @Test func helpCoversTheCoreCustomerTopics() {
         let text = allHelpText
         for topic in [

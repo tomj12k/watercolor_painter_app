@@ -167,7 +167,7 @@ public struct StudioFailure: Identifiable, Equatable, Sendable {
             return Self(
                 code: code,
                 message: "The project has reached one of its capacity limits. Your painting is unchanged.",
-                recoverySuggestion: "Undo or remove painting history, or continue in a new document.",
+                recoverySuggestion: "Undo strokes, or continue in a new document.",
                 diagnostic: diagnostic
             )
         case .workBudget:
@@ -880,7 +880,7 @@ public final class StudioModel: ObservableObject {
     private func reportCommandCapacityFailure() {
         error = StudioFailure.capacity(
             message: "The project has reached its command capacity of \(projectAdmissionLimits.maximumCommandCount).",
-            recoverySuggestion: "Undo or remove painting history, or continue in a new document.",
+            recoverySuggestion: "Undo strokes, or continue in a new document.",
             project: project
         )
     }
@@ -903,13 +903,13 @@ public final class StudioModel: ObservableObject {
             case .totalStrokePointLimitExceeded:
                 error = StudioFailure.capacity(
                     message: "The project has reached its point capacity of \(projectAdmissionLimits.maximumTotalStrokePointCount).",
-                    recoverySuggestion: "Undo or remove painting history, or continue in a new document.",
+                    recoverySuggestion: "Undo strokes, or continue in a new document.",
                     project: project
                 )
             case .documentByteLimitExceeded:
                 error = StudioFailure.capacity(
                     message: "The project has reached its document storage capacity.",
-                    recoverySuggestion: "Use a shorter stroke, or undo and remove painting history before continuing.",
+                    recoverySuggestion: "Use a shorter stroke, or undo strokes before continuing.",
                     project: project
                 )
             default:
@@ -1710,7 +1710,7 @@ public final class StudioModel: ObservableObject {
         )
         guard usage >= 0.9 else { return nil }
         let percent = min(Int((usage * 100).rounded(.down)), 100)
-        return "Painting history is \(percent)% full. Undo or remove history, or continue in a new document."
+        return "Painting history is \(percent)% full. Undo strokes, or continue in a new document."
     }
 
 }

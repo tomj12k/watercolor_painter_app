@@ -17,7 +17,7 @@ extension DocumentCodecError: LocalizedError {
             switch error {
             case .layerLimitExceeded, .commandLimitExceeded, .documentByteLimitExceeded,
                  .totalStrokePointLimitExceeded:
-                "This painting is too large to open safely. Open a smaller copy or remove history in the version that created it."
+                "This painting is too large to open safely. Open a smaller copy, or undo strokes in the app that created it and save again."
             default:
                 "The file contains invalid painting data and was not opened. Open a different copy or restore it from a backup."
             }

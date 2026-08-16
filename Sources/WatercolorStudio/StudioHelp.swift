@@ -65,8 +65,8 @@ enum StudioHelp {
             the way back. A painting holds up to 100,000 commands, 2,000,000 \
             stroke points, and 256 MB of history. When any limit passes 90%, \
             a capacity indicator appears next to the wetness readout naming \
-            how full the painting is; undo or remove history, or continue in \
-            a new document, to keep painting.
+            how full the painting is; undo strokes, or continue in a new \
+            document, to keep painting.
             """
         ),
         Section(
@@ -99,7 +99,7 @@ enum StudioHelp {
         case .workBudget:
             "One rendering step was too large to run safely. Use fewer drying steps or a smaller canvas."
         case .capacity:
-            "The painting reached a document limit. Undo or remove history, or continue in a new document."
+            "The painting reached a document limit. Undo strokes, or continue in a new document."
         case .metalUnavailable:
             "The Mac's graphics system was unavailable. Restart the app and check for macOS updates."
         case .gpuExecution:
