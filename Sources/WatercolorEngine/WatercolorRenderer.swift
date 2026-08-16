@@ -153,6 +153,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     #if DEBUG
     private var replayCount = 0
     private var lastStrokeDispatch = RendererDebugStrokeDispatch.empty
+    private var lastPreviewSemanticContextWork = RendererDebugPreviewSemanticContextWork.empty
     private var lastPreviewFinishEncodedPointCount = 0
     private var synchronousPreviewCancellationWaitCount = 0
     private var synchronousPreviewCancellationReplayCount = 0
@@ -520,6 +521,9 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         else {
             throw RendererError.invalidStrokePreview
         }
+        #if DEBUG
+        lastPreviewSemanticContextWork = .empty
+        #endif
         guard !points.isEmpty else { return }
 
         let (pointCount, didOverflow) = transaction.absolutePointCount.addingReportingOverflow(
@@ -554,10 +558,25 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
 
         let canonicalPoints = Array(stagedRemainder.prefix(canonicalPointCount))
         let nextRemainder = Array(stagedRemainder.dropFirst(canonicalPointCount))
-        let finalSemanticNextPoint = canonicalPoints.last.flatMap { point in
-            nextRemainder.first.flatMap {
-                Self.pointsAreCoincident($0, point) ? nil : $0
+        let preparesStampOrientations = Self.preparesStampOrientations(
+            for: transaction.strokeTemplate
+        )
+        #if DEBUG
+        var nextBoundaryPointCount = 0
+        var predecessorSearchPointCount = 0
+        #endif
+        let finalSemanticNextPoint: StrokePoint?
+        if preparesStampOrientations {
+            #if DEBUG
+            nextBoundaryPointCount = nextRemainder.first == nil ? 0 : 1
+            #endif
+            finalSemanticNextPoint = canonicalPoints.last.flatMap { point in
+                nextRemainder.first.flatMap {
+                    Self.pointsAreCoincident($0, point) ? nil : $0
+                }
             }
+        } else {
+            finalSemanticNextPoint = nil
         }
         let capturesCommittedState = transaction.renderedPointCount == 0
         if capturesCommittedState {
@@ -571,7 +590,9 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                 stroke: appendedStroke,
                 pointIndexOffset: transaction.renderedPointCount,
                 initialPreviousPoint: transaction.lastRenderedPoint,
-                initialSemanticPreviousPoint: transaction.lastSemanticPreviousPoint,
+                initialSemanticPreviousPoint: preparesStampOrientations
+                    ? transaction.lastSemanticPreviousPoint
+                    : nil,
                 finalSemanticNextPoint: finalSemanticNextPoint,
                 capturesCommittedState: capturesCommittedState,
                 transaction: transaction,
@@ -592,18 +613,44 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         transaction.remainder = nextRemainder
         transaction.renderedPointCount += canonicalPointCount
         if let lastRenderedPoint = canonicalPoints.last {
-            transaction.lastSemanticPreviousPoint = Self.firstNoncoincidentPoint(
-                to: lastRenderedPoint,
-                in: canonicalPoints.dropLast().reversed()
-            ) ?? Self.firstNoncoincidentPoint(
-                to: lastRenderedPoint,
-                in: [
-                    transaction.lastRenderedPoint,
-                    transaction.lastSemanticPreviousPoint
-                ].compactMap { $0 }
-            )
+            if preparesStampOrientations {
+                let canonicalPredecessors = canonicalPoints.dropLast().reversed()
+                #if DEBUG
+                predecessorSearchPointCount += Self.noncoincidentSearchInspectionCount(
+                    to: lastRenderedPoint,
+                    in: canonicalPredecessors
+                )
+                #endif
+                var semanticPreviousPoint = Self.firstNoncoincidentPoint(
+                    to: lastRenderedPoint,
+                    in: canonicalPredecessors
+                )
+                if semanticPreviousPoint == nil {
+                    let carriedPredecessors = [
+                        transaction.lastRenderedPoint,
+                        transaction.lastSemanticPreviousPoint
+                    ].compactMap { $0 }
+                    #if DEBUG
+                    predecessorSearchPointCount += Self.noncoincidentSearchInspectionCount(
+                        to: lastRenderedPoint,
+                        in: carriedPredecessors
+                    )
+                    #endif
+                    semanticPreviousPoint = Self.firstNoncoincidentPoint(
+                        to: lastRenderedPoint,
+                        in: carriedPredecessors
+                    )
+                }
+                transaction.lastSemanticPreviousPoint = semanticPreviousPoint
+            }
             transaction.lastRenderedPoint = lastRenderedPoint
         }
+        #if DEBUG
+        lastPreviewSemanticContextWork = RendererDebugPreviewSemanticContextWork(
+            nextBoundaryPointCount: nextBoundaryPointCount,
+            predecessorSearchPointCount: predecessorSearchPointCount
+        )
+        #endif
         transaction.commitStagedWorkBudget()
         transaction.phase = .idle
     }
@@ -1791,9 +1838,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         var simulationThreadCount = 0
         var largestDispatchedRegion: CanvasRegion?
         var simulatedSlices = Set<Int>()
-        let preparesStampOrientations = stroke.brush.behaviorVersion > 0
-            && stroke.tool != .smudge
-            && stroke.tool != .smear
+        let preparesStampOrientations = Self.preparesStampOrientations(for: stroke)
         var semanticPreviousPoint = preparesStampOrientations
             ? initialSemanticPreviousPoint
             : nil
@@ -2688,12 +2733,34 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         return orientations
     }
 
+    private static func preparesStampOrientations(for stroke: StrokeCommand) -> Bool {
+        stroke.brush.behaviorVersion > 0
+            && stroke.tool != .smudge
+            && stroke.tool != .smear
+    }
+
     private static func firstNoncoincidentPoint<C: Sequence>(
         to point: StrokePoint,
         in candidates: C
     ) -> StrokePoint? where C.Element == StrokePoint {
         candidates.first { !pointsAreCoincident($0, point) }
     }
+
+    #if DEBUG
+    private static func noncoincidentSearchInspectionCount<C: Sequence>(
+        to point: StrokePoint,
+        in candidates: C
+    ) -> Int where C.Element == StrokePoint {
+        var inspectionCount = 0
+        for candidate in candidates {
+            inspectionCount += 1
+            if !pointsAreCoincident(candidate, point) {
+                break
+            }
+        }
+        return inspectionCount
+    }
+    #endif
 
     private static func pointsAreCoincident(_ lhs: StrokePoint, _ rhs: StrokePoint) -> Bool {
         lhs.x == rhs.x && lhs.y == rhs.y
@@ -3250,6 +3317,16 @@ struct RendererDebugStrokeDispatch: Equatable {
     )
 }
 
+struct RendererDebugPreviewSemanticContextWork: Equatable {
+    let nextBoundaryPointCount: Int
+    let predecessorSearchPointCount: Int
+
+    static let empty = Self(
+        nextBoundaryPointCount: 0,
+        predecessorSearchPointCount: 0
+    )
+}
+
 struct RendererDebugPigmentMoments: Equatable {
     let mass: Double
     let centroidX: Double
@@ -3368,6 +3445,10 @@ extension WatercolorRenderer {
 
     var debugLastStrokeDispatch: RendererDebugStrokeDispatch {
         lastStrokeDispatch
+    }
+
+    var debugLastPreviewSemanticContextWork: RendererDebugPreviewSemanticContextWork {
+        lastPreviewSemanticContextWork
     }
 
     var debugLastPreviewFinishEncodedPointCount: Int {

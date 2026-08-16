@@ -908,6 +908,69 @@ import WatercolorCore
         }
     }
 
+    @Test func previewSemanticContextRunsOnlyForVersionOneStampTools() async throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let project = PaintingProject.testCanvas(128)
+        let xCoordinates: [Double] = [
+            32, 36, 40, 44, 48, 52,
+            56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+            64
+        ]
+        let points = xCoordinates.enumerated().map { index, x in
+            StrokePoint(
+                x: x,
+                y: 64,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
+            )
+        }
+        let cases: [(PaintTool, Int, Int, Int)] = [
+            (.brush, 1, 1, 9),
+            (.smudge, 1, 0, 0),
+            (.smear, 1, 0, 0),
+            (.brush, 0, 0, 0)
+        ]
+
+        for (
+            tool,
+            behaviorVersion,
+            expectedNextBoundaryPointCount,
+            expectedPredecessorSearchPointCount
+        ) in cases {
+            let renderer = try WatercolorRenderer(project: project, device: device)
+            var stroke = StrokeCommand.testDot(layerID: project.layers[0].id)
+            stroke.tool = tool
+            stroke.brush.behaviorVersion = behaviorVersion
+            stroke.points = points
+            var initial = stroke
+            initial.points = [points[0]]
+
+            let token = try renderer.beginStrokePreview(initial)
+            try await renderer.appendStrokePreview(
+                id: stroke.id,
+                points: Array(points[1..<9]),
+                token: token
+            )
+            try await renderer.appendStrokePreview(
+                id: stroke.id,
+                points: Array(points[9...]),
+                token: token
+            )
+
+            let work = renderer.debugLastPreviewSemanticContextWork
+            #expect(
+                work.nextBoundaryPointCount == expectedNextBoundaryPointCount,
+                "\(tool.rawValue) behavior \(behaviorVersion) inspected unexpected lookahead"
+            )
+            #expect(
+                work.predecessorSearchPointCount == expectedPredecessorSearchPointCount,
+                "\(tool.rawValue) behavior \(behaviorVersion) performed unexpected predecessor work"
+            )
+        }
+    }
+
     @Test func distantStrokesKeepSeparateDirtyRegionsAndAdvanceOnlyExplicitWetSlices() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let layers = [PaintLayer(name: "First wet layer"), PaintLayer(name: "Dry layer"), PaintLayer(name: "Second wet layer")]
