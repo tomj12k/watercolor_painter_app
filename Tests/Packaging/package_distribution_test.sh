@@ -2,6 +2,7 @@
 set -euo pipefail
 
 test_directory="$(mktemp -d "${TMPDIR:-/tmp}/watercolor-distribution-test.XXXXXX")"
+test_directory="$(cd "${test_directory}" && pwd)"
 trap 'rm -rf "${test_directory}"' EXIT
 
 source_repository="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -63,7 +64,7 @@ make_fixture() {
         '  for tool_argument in "$@"; do archive_path="${tool_argument}"; done' \
         '  : > "${archive_path}"' \
         'fi' \
-        'if [[ "${tool_name}" == "spctl" && -e "${TEST_FINAL_BUNDLE}" ]]; then' \
+        'if [[ "${tool_name}" == "spctl" && -e "${TEST_FINAL_BUNDLE}" && "${ALLOW_EXISTING_FINAL:-}" != "1" ]]; then' \
         '  echo "Final bundle was published before assessment" >&2' \
         '  exit 71' \
         'fi' \
@@ -131,6 +132,63 @@ done < "${fixture_log}"
 [[ "${command_lines[8]}" == spctl'|--assess|--type|execute|'* ]]
 published_entries="$(find "${fixture_repository}/.build/distribution" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')"
 [[ "${published_entries}" == "1" ]]
+
+make_fixture "failed-publication-restores-existing"
+mkdir -p "${fixture_final}/Contents"
+printf 'known-good-distribution\n' > "${fixture_final}/Contents/SENTINEL"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'destination_path="${2:-}"' \
+    'if [[ "${destination_path}" == "${TEST_FINAL_BUNDLE}" ]]; then' \
+    '  count_file="${COMMAND_LOG}.publication-count"' \
+    '  publication_count=0' \
+    '  if [[ -f "${count_file}" ]]; then publication_count="$(cat "${count_file}")"; fi' \
+    '  publication_count=$((publication_count + 1))' \
+    '  printf "%s\n" "${publication_count}" > "${count_file}"' \
+    '  if [[ "${publication_count}" -eq 1 ]]; then exit 72; fi' \
+    'fi' \
+    'exec /bin/mv "$@"' \
+    > "${fixture_bin}/mv"
+chmod +x "${fixture_bin}/mv"
+if run_distribution \
+    DEVELOPER_ID_APPLICATION="Developer ID Application: Watercolor Test (ABCDE12345)" \
+    NOTARYTOOL_PROFILE="watercolor-test-profile" \
+    ALLOW_EXISTING_FINAL="1";
+then
+    echo "Distribution unexpectedly survived publication failure" >&2
+    exit 1
+fi
+if [[ ! -f "${fixture_final}/Contents/SENTINEL" ]] || \
+   [[ "$(cat "${fixture_final}/Contents/SENTINEL")" != "known-good-distribution" ]];
+then
+    echo "Known-good distribution was not restored after publication failure" >&2
+    exit 1
+fi
+if [[ -e "${fixture_final}/Contents/MacOS/WatercolorStudio" ]]; then
+    echo "Failed replacement remained published" >&2
+    exit 1
+fi
+staging_entries="$(find "${fixture_repository}/.build/distribution" -mindepth 1 -maxdepth 1 -name '.package.*' -print | wc -l | tr -d ' ')"
+if [[ "${staging_entries}" != "0" ]]; then
+    echo "Publication failure left staging directories behind" >&2
+    exit 1
+fi
+run_distribution \
+    DEVELOPER_ID_APPLICATION="Developer ID Application: Watercolor Test (ABCDE12345)" \
+    NOTARYTOOL_PROFILE="watercolor-test-profile" \
+    ALLOW_EXISTING_FINAL="1"
+if [[ ! -x "${fixture_final}/Contents/MacOS/WatercolorStudio" ]] || \
+   [[ -e "${fixture_final}/Contents/SENTINEL" ]];
+then
+    echo "Successful publication did not replace the previous distribution" >&2
+    exit 1
+fi
+published_entries="$(find "${fixture_repository}/.build/distribution" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')"
+if [[ "${published_entries}" != "1" ]]; then
+    echo "Successful replacement left publication residue" >&2
+    exit 1
+fi
 
 for failure_stage in codesign-sign codesign-verify ditto notarytool stapler-staple stapler-validate codesign-post-verify spctl; do
     make_fixture "failure-${failure_stage}"

@@ -24,13 +24,46 @@ local_application="${repository_root}/.build/release/Watercolor Studio.app"
 distribution_directory="${repository_root}/.build/distribution"
 final_application="${distribution_directory}/Watercolor Studio.app"
 working_directory=""
+previous_application=""
+publication_started=false
+publication_complete=false
+had_previous_application=false
 
 cleanup() {
-    if [[ -n "${working_directory}" && -d "${working_directory}" ]]; then
+    local exit_status=$?
+    local restoration_failed=false
+    trap - EXIT INT TERM HUP
+    set +e
+
+    if [[ "${publication_started}" == true && "${publication_complete}" != true ]]; then
+        if [[ "${had_previous_application}" == true ]]; then
+            if [[ -e "${previous_application}" ]]; then
+                if [[ -e "${final_application}" ]]; then
+                    rm -rf "${final_application}"
+                fi
+                if ! mv "${previous_application}" "${final_application}"; then
+                    echo "Failed to restore the previous verified distribution at: ${previous_application}" >&2
+                    restoration_failed=true
+                fi
+            fi
+        elif [[ -e "${final_application}" ]]; then
+            rm -rf "${final_application}"
+        fi
+    fi
+
+    if [[ "${restoration_failed}" != true && -n "${working_directory}" && -d "${working_directory}" ]]; then
         rm -rf "${working_directory}"
     fi
+
+    if [[ "${restoration_failed}" == true ]]; then
+        exit 5
+    fi
+    exit "${exit_status}"
 }
 trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 cd "${repository_root}"
 "${repository_root}/scripts/package_app.sh"
@@ -66,9 +99,19 @@ xcrun stapler validate "${staged_application}"
 codesign --verify --deep --strict --verbose=2 "${staged_application}"
 spctl --assess --type execute --verbose=4 "${staged_application}"
 
+previous_application="${working_directory}/Previous Watercolor Studio.app"
 if [[ -e "${final_application}" ]]; then
-    rm -rf "${final_application}"
+    had_previous_application=true
+    publication_started=true
+    mv "${final_application}" "${previous_application}"
+else
+    publication_started=true
 fi
 mv "${staged_application}" "${final_application}"
+publication_complete=true
+
+if [[ -e "${previous_application}" ]]; then
+    rm -rf "${previous_application}"
+fi
 
 echo "Signed and notarized distribution created at: ${final_application}"
