@@ -53,6 +53,22 @@ import WatercolorCore
         }
     }
 
+    @Test func newCanvasActionValidityMatchesTheExactSupportedDimensionBounds() {
+        let valid = [
+            NewCanvasConfiguration(width: 256, height: 256, paper: .coldPress),
+            NewCanvasConfiguration(width: 4096, height: 4096, paper: .rough)
+        ]
+        let invalid = [
+            NewCanvasConfiguration(width: 255, height: 256, paper: .coldPress),
+            NewCanvasConfiguration(width: 256, height: 255, paper: .coldPress),
+            NewCanvasConfiguration(width: 4097, height: 4096, paper: .rough),
+            NewCanvasConfiguration(width: 4096, height: 4097, paper: .rough)
+        ]
+
+        #expect(valid.allSatisfy { $0.isValid })
+        #expect(invalid.allSatisfy { !$0.isValid })
+    }
+
     @Test func onlyDocumentGroupNewDocumentsRequestInitialConfiguration() {
         let newDocument = PaintingDocument()
         let suppliedDocument = PaintingDocument(project: .newDefault())

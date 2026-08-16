@@ -50,6 +50,10 @@ struct NewCanvasConfiguration: Equatable, Sendable {
         CanvasSize(width: width, height: height)
     }
 
+    var isValid: Bool {
+        Self.dimensionRange.contains(width) && Self.dimensionRange.contains(height)
+    }
+
     init(width: Int, height: Int, paper: PaperTexture) {
         self.width = width
         self.height = height
@@ -90,11 +94,6 @@ struct NewCanvasConfigurationView: View {
 
     private var configuration: NewCanvasConfiguration {
         NewCanvasConfiguration(width: width, height: height, paper: paper)
-    }
-
-    private var isValid: Bool {
-        NewCanvasConfiguration.dimensionRange.contains(width)
-            && NewCanvasConfiguration.dimensionRange.contains(height)
     }
 
     var body: some View {
@@ -158,6 +157,7 @@ struct NewCanvasConfigurationView: View {
                         .foregroundStyle(.secondary)
                     HStack {
                         Button("Try Again") { create(configuration) }
+                            .disabled(!configuration.isValid)
                         Button("Copy Details") { copyDetails(failure) }
                         Button("Dismiss", action: dismissFailure)
                     }
@@ -174,7 +174,7 @@ struct NewCanvasConfigurationView: View {
                 Spacer()
                 Button("Create") { create(configuration) }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(!isValid)
+                    .disabled(!configuration.isValid)
                     .accessibilityLabel("Create Watercolor Canvas")
                     .accessibilityIdentifier("new-watercolor-create")
             }
