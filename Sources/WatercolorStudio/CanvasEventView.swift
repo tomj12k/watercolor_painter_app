@@ -548,9 +548,17 @@ public final class CanvasEventView: MTKView {
         let model = model
         deferredStrokeDrainTask = Task { @MainActor [weak self] in
             while let self, self.model === model, !self.deferredStrokeQueue.isEmpty {
-                let deadline = ContinuousClock.now.advanced(by: self.deferredStrokeCompletionTimeout)
+                var deadline = ContinuousClock.now.advanced(by: self.deferredStrokeCompletionTimeout)
                 while !model.canModifyProject, ContinuousClock.now < deadline {
                     try? await Task.sleep(for: .milliseconds(8))
+                    // A surface change replays the whole painting on
+                    // purpose; its duration says nothing about a stuck
+                    // renderer, so the timeout clock restarts after it.
+                    if model.isApplyingSurfaceChange {
+                        deadline = ContinuousClock.now.advanced(
+                            by: self.deferredStrokeCompletionTimeout
+                        )
+                    }
                 }
                 guard model.canModifyProject else {
                     // The renderer never freed up; dropping the queue keeps

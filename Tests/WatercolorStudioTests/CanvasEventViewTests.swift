@@ -871,6 +871,67 @@ import WatercolorCore
         #expect(model.project.commands.count == 1)
     }
 
+    @Test func strokeDrawnDuringAPaperChangeLandsInsteadOfTimingOut() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let layer = PaintLayer(name: "Layer 1")
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 1_600, height: 1_200),
+            paper: .coldPress,
+            layers: [layer]
+        )
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device)
+        )
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 1_600, height: 1_200)
+        model.configureCanvas(view)
+        // Far shorter than the paper replay below, so a timeout clock that
+        // keeps running through the surface change would drop the stroke.
+        view.deferredStrokeCompletionTimeout = .milliseconds(20)
+
+        let points: [StrokePoint] = (0..<240).map { (index: Int) -> StrokePoint in
+            StrokePoint(
+                x: 40 + Double(index) * 5.5,
+                y: 600 + sin(Double(index) * 0.2) * 120,
+                pressure: 0.8,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 240
+            )
+        }
+        let stroke = StrokeCommand(layerID: layer.id, tool: .brush, brush: .default, points: points)
+        var initial = stroke
+        initial.points = [stroke.points[0]]
+        #expect(model.beginStrokePreview(initial) == .accepted)
+        model.appendStrokePreview(id: stroke.id, points: Array(stroke.points.dropFirst()))
+        await model.waitForStrokePreviewIdle()
+        await model.commitStrokePreview(stroke)
+        #expect(model.project.commands.count == 1)
+
+        // The customer keeps painting while the new surface prepares. The
+        // stroke cannot preview yet, so it defers — and it must land once
+        // the surface is ready, never silently expire.
+        model.selectPaper(.rough)
+        #expect(model.isApplyingSurfaceChange)
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown, timestamp: 1, eventNumber: 1, location: .init(x: 300, y: 500)
+        )))
+        view.mouseUp(with: try #require(canvasMouseEvent(
+            .leftMouseUp, timestamp: 2, eventNumber: 2, location: .init(x: 340, y: 540)
+        )))
+
+        await model.waitForStructuralChanges()
+        // The paper change edits the surface without appending a command, so
+        // the painting ends with the first stroke plus the deferred one.
+        for _ in 0..<4_000 where model.project.commands.count < 2 {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        #expect(model.error == nil)
+        #expect(model.project.paper == .rough)
+        #expect(model.project.commands.count == 2)
+    }
+
     @Test func losingFocusClearsSpacePanAndCancelsTransientStrokeState() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject(
