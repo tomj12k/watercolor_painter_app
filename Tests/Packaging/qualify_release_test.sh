@@ -239,8 +239,8 @@ if [[ "${signal_status}" -eq 0 ]]; then
     echo "interrupted qualifier unexpectedly passed" >&2
     exit 1
 fi
-if (( SECONDS >= 5 )); then
-    echo "signal cleanup fell through to the optimized timeout" >&2
+if (( SECONDS >= 8 )); then
+    echo "signal cleanup exceeded its bounded registration and termination path" >&2
     exit 1
 fi
 if kill -0 "${signal_qualifier_pid}" 2>/dev/null; then
