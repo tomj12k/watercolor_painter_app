@@ -5,6 +5,21 @@ import WatercolorCore
 @testable import WatercolorEngine
 
 @Suite @MainActor struct WatercolorRendererTests {
+    @Test func metalUnavailableIsReported() {
+        #expect(throws: RendererError.metalUnavailable) {
+            _ = try WatercolorRenderer(project: .testCanvas(64), device: nil)
+        }
+    }
+
+    @Test func requiredMetalQualificationEnvironmentHasADevice() throws {
+        guard ProcessInfo.processInfo.environment["WATERCOLOR_REQUIRE_METAL"] == "1" else {
+            return
+        }
+        guard MTLCreateSystemDefaultDevice() != nil else {
+            throw RendererError.metalUnavailable
+        }
+    }
+
     @Test func redAndBlueWetStrokesMix() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)

@@ -21,6 +21,7 @@ make test    # run the Swift test suite
 make build   # build the debug executable
 make app     # build the unsigned, local-only release .app bundle
 make distribution # build a signed and notarized customer .app bundle
+make qualify # run the complete local customer-release qualification lane
 ```
 
 ## Studio tools and shortcuts
@@ -82,5 +83,17 @@ Only after every gate succeeds does it publish:
 ```
 
 Missing credentials or any signing, notarization, stapling, or Gatekeeper failure exits nonzero and does not publish an incomplete replacement.
+
+### Release qualification
+
+Run `make qualify` on the release Mac before distributing a build. It performs a clean test run, requires a real Metal device, enables Metal API and shader validation, records 30-sample p50/p95 performance measurements, packages and validates the local app, runs an exact-process five-second liveness check, terminates that exact test process, and checks the Git diff. Results and machine-readable `WATERCOLOR_QUALIFICATION` lines are written to:
+
+```text
+.build/qualification/report.txt
+```
+
+The measured release thresholds are preview p95 at or below 16.7 ms, pointer-up commit p95 at or below 33.3 ms, and main-actor heartbeat gaps at or below 100 ms. The benchmark covers 1600×1200 canvases with 1, 8, and 12 layers.
+
+Signing and notarization are reported as `NOT_RUN` unless both `DEVELOPER_ID_APPLICATION` and `NOTARYTOOL_PROFILE` are supplied. The qualification report never treats missing signing credentials as a pass.
 
 The reference development platform is macOS 14 or later on Apple Silicon. The release bundle is built for the architecture of the Mac that runs `make app`.

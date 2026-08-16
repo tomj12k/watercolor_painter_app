@@ -1,4 +1,4 @@
-.PHONY: test build app distribution run
+.PHONY: test build app distribution qualify run
 
 test:
 	swift test
@@ -11,6 +11,9 @@ app:
 
 distribution:
 	scripts/package_distribution.sh
+
+qualify:
+	scripts/qualify_release.sh
 
 run:
 	swift run WatercolorStudio
