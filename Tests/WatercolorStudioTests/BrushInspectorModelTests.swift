@@ -165,6 +165,26 @@ import WatercolorCore
         #expect(Set(allAccessibility.map(\.label)).count == allAccessibility.count)
     }
 
+    @Test func resetLabelMeetsNormalTextContrastAgainstInspectorBackground() {
+        let contrast = StudioPalette.contrastRatio(
+            foreground: BrushInspectorPresentation.resetDynamicsLabelColor,
+            background: StudioPalette.carbonSRGB
+        )
+
+        #expect(contrast >= 4.5)
+    }
+
+    @Test func paletteContrastUsesWCAGRelativeLuminance() {
+        let black = StudioPaletteSRGB(red: 0, green: 0, blue: 0)
+        let white = StudioPaletteSRGB(red: 1, green: 1, blue: 1)
+
+        #expect(abs(StudioPalette.contrastRatio(foreground: black, background: white) - 21) < 1e-12)
+        #expect(
+            StudioPalette.contrastRatio(foreground: black, background: white)
+                == StudioPalette.contrastRatio(foreground: white, background: black)
+        )
+    }
+
     private func makeModel() throws -> StudioModel {
         let device = try #require(MTLCreateSystemDefaultDevice())
         let project = PaintingProject(

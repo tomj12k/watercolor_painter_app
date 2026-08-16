@@ -119,6 +119,8 @@ enum BrushInspectorPresentation {
         help: "Restore spacing, rotation, bristle, and texture strength to their defaults."
     )
 
+    static let resetDynamicsLabelColor = StudioPalette.fiberSRGB
+
     static func description(for style: WatercolorStyle) -> String {
         switch style {
         case .transparentWash:
@@ -434,10 +436,15 @@ struct BrushInspector: View {
                 display: Self.percent
             )
 
-            Button("Reset dynamics", action: model.resetBrushDynamics)
+            Button(action: model.resetBrushDynamics) {
+                Text("Reset dynamics")
+                    .foregroundStyle(
+                        BrushInspectorPresentation.resetDynamicsLabelColor.swiftUIColor
+                    )
+            }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .tint(StudioPalette.fiber)
+                .tint(StudioPalette.cobalt)
                 .help(BrushInspectorPresentation.resetDynamicsAccessibility.help)
                 .accessibilityLabel(BrushInspectorPresentation.resetDynamicsAccessibility.label)
                 .accessibilityValue("Defaults: 18% spacing, 0° rotation, 50% bristle, 50% texture strength")

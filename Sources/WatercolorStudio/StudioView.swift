@@ -1,13 +1,54 @@
+import Foundation
 import SwiftUI
 import WatercolorCore
 
+struct StudioPaletteSRGB: Equatable, Sendable {
+    let red: Double
+    let green: Double
+    let blue: Double
+
+    var swiftUIColor: Color {
+        Color(red: red, green: green, blue: blue)
+    }
+
+    var relativeLuminance: Double {
+        0.2126 * Self.linearized(red)
+            + 0.7152 * Self.linearized(green)
+            + 0.0722 * Self.linearized(blue)
+    }
+
+    private static func linearized(_ value: Double) -> Double {
+        let value = value.isFinite ? min(max(value, 0), 1) : 0
+        if value <= 0.04045 {
+            return value / 12.92
+        }
+        return pow((value + 0.055) / 1.055, 2.4)
+    }
+}
+
 enum StudioPalette {
-    static let carbon = Color(red: 28 / 255, green: 27 / 255, blue: 25 / 255)
-    static let easel = Color(red: 41 / 255, green: 39 / 255, blue: 36 / 255)
-    static let fiber = Color(red: 245 / 255, green: 240 / 255, blue: 230 / 255)
-    static let graphite = Color(red: 184 / 255, green: 178 / 255, blue: 167 / 255)
-    static let cobalt = Color(red: 91 / 255, green: 127 / 255, blue: 147 / 255)
-    static let pigment = Color(red: 201 / 255, green: 104 / 255, blue: 75 / 255)
+    static let carbonSRGB = StudioPaletteSRGB(red: 28 / 255, green: 27 / 255, blue: 25 / 255)
+    static let easelSRGB = StudioPaletteSRGB(red: 41 / 255, green: 39 / 255, blue: 36 / 255)
+    static let fiberSRGB = StudioPaletteSRGB(red: 245 / 255, green: 240 / 255, blue: 230 / 255)
+    static let graphiteSRGB = StudioPaletteSRGB(red: 184 / 255, green: 178 / 255, blue: 167 / 255)
+    static let cobaltSRGB = StudioPaletteSRGB(red: 91 / 255, green: 127 / 255, blue: 147 / 255)
+    static let pigmentSRGB = StudioPaletteSRGB(red: 201 / 255, green: 104 / 255, blue: 75 / 255)
+
+    static let carbon = carbonSRGB.swiftUIColor
+    static let easel = easelSRGB.swiftUIColor
+    static let fiber = fiberSRGB.swiftUIColor
+    static let graphite = graphiteSRGB.swiftUIColor
+    static let cobalt = cobaltSRGB.swiftUIColor
+    static let pigment = pigmentSRGB.swiftUIColor
+
+    static func contrastRatio(
+        foreground: StudioPaletteSRGB,
+        background: StudioPaletteSRGB
+    ) -> Double {
+        let lighter = max(foreground.relativeLuminance, background.relativeLuminance)
+        let darker = min(foreground.relativeLuminance, background.relativeLuminance)
+        return (lighter + 0.05) / (darker + 0.05)
+    }
 }
 
 struct StudioSectionTitle: View {
