@@ -211,6 +211,7 @@ public final class CanvasEventView: MTKView {
 
     private var model: StudioModel
     private var strokeBuilder: CanvasStrokeBuilder?
+    private var strokePreviewStarted = false
     private var panAnchor: CGPoint?
     private var spaceKeyDown = false
 
@@ -266,6 +267,7 @@ public final class CanvasEventView: MTKView {
 
         self.model.cancelStrokePreview()
         strokeBuilder = nil
+        strokePreviewStarted = false
         panAnchor = nil
         spaceKeyDown = false
         self.model = model
@@ -394,53 +396,117 @@ public final class CanvasEventView: MTKView {
             brush: model.brush,
             point: strokePoint(from: event)
         )
-        guard let stroke = builder.currentStroke,
-              model.beginStrokePreview(stroke) == .accepted
-        else {
+        strokeBuilder = builder
+        strokePreviewStarted = false
+        startPendingStrokePreviewIfNeeded()
+    }
+
+    /// Attaches the accumulating stroke to a live renderer preview. When the
+    /// renderer is still finishing the previous stroke, the builder keeps
+    /// collecting points and the next input event retries, so quick
+    /// successive strokes never silently drop.
+    private func startPendingStrokePreviewIfNeeded() {
+        guard !strokePreviewStarted,
+              let stroke = strokeBuilder?.currentStroke,
+              let firstPoint = stroke.points.first
+        else { return }
+        var initial = stroke
+        initial.points = [firstPoint]
+        switch model.beginStrokePreview(initial) {
+        case .accepted:
+            strokePreviewStarted = true
+            let queuedPoints = Array(stroke.points.dropFirst())
+            if !queuedPoints.isEmpty {
+                model.appendStrokePreview(id: stroke.id, points: queuedPoints)
+            }
+        case .busy:
+            updateInputAvailability()
+        case .unavailable:
             strokeBuilder = nil
             updateInputAvailability()
-            return
         }
-        strokeBuilder = builder
     }
 
     private func appendStrokePoint(from event: NSEvent) {
         guard strokeBuilder != nil else { return }
         let appendResult = strokeBuilder!.append(strokePoint(from: event))
-        guard let exhaustionReason = appendResult.exhaustionReason else {
-            guard !appendResult.points.isEmpty else { return }
-            if let strokeID = strokeBuilder?.strokeID {
-                model.appendStrokePreview(id: strokeID, points: appendResult.points)
+        if let exhaustionReason = appendResult.exhaustionReason {
+            let truncatedStroke = strokeBuilder?.currentStroke
+            let started = strokePreviewStarted
+            strokeBuilder = nil
+            strokePreviewStarted = false
+            if started {
+                commitExhaustedStroke(
+                    truncatedStroke,
+                    newPoints: appendResult.points,
+                    reason: exhaustionReason
+                )
+            } else {
+                completeDeferredStroke(truncatedStroke, reason: exhaustionReason)
             }
             return
         }
-        let truncatedStroke = strokeBuilder?.currentStroke
-        strokeBuilder = nil
-        commitExhaustedStroke(
-            truncatedStroke,
-            newPoints: appendResult.points,
-            reason: exhaustionReason
-        )
+        guard strokePreviewStarted else {
+            startPendingStrokePreviewIfNeeded()
+            return
+        }
+        guard !appendResult.points.isEmpty else { return }
+        if let strokeID = strokeBuilder?.strokeID {
+            model.appendStrokePreview(id: strokeID, points: appendResult.points)
+        }
     }
 
     private func completeStroke(with event: NSEvent) {
         guard strokeBuilder != nil else { return }
+        let started = strokePreviewStarted
         let completion = strokeBuilder!.finish(at: strokePoint(from: event))
         strokeBuilder = nil
+        strokePreviewStarted = false
         if let exhaustionReason = completion.exhaustionReason {
-            commitExhaustedStroke(
-                completion.stroke,
-                newPoints: completion.points,
-                reason: exhaustionReason
-            )
+            if started {
+                commitExhaustedStroke(
+                    completion.stroke,
+                    newPoints: completion.points,
+                    reason: exhaustionReason
+                )
+            } else {
+                completeDeferredStroke(completion.stroke, reason: exhaustionReason)
+            }
             return
         }
         guard let stroke = completion.stroke else { return }
+        guard started else {
+            completeDeferredStroke(stroke, reason: nil)
+            return
+        }
         model.appendStrokePreview(id: stroke.id, points: completion.points)
         let model = model
         Task { @MainActor [weak self] in
             await model.commitStrokePreview(stroke)
             self?.requestCanvasDraw()
+        }
+    }
+
+    /// Renders a stroke whose preview never obtained the renderer — the
+    /// previous stroke was still finishing for its whole, brief lifetime —
+    /// as soon as the renderer frees up, so the quick stroke still lands.
+    private func completeDeferredStroke(
+        _ stroke: StrokeCommand?,
+        reason: StrokeExhaustionReason?
+    ) {
+        guard let stroke else { return }
+        let model = model
+        Task { @MainActor [weak self] in
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while !model.canModifyProject, ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(8))
+            }
+            model.completeStroke(stroke)
+            if let reason {
+                model.noteStrokeExhaustion(reason)
+            }
+            self?.requestCanvasDraw()
+            self?.updateInputAvailability()
         }
     }
 
@@ -472,6 +538,7 @@ public final class CanvasEventView: MTKView {
     private func beginPan(with event: NSEvent) {
         model.cancelStrokePreview()
         strokeBuilder = nil
+        strokePreviewStarted = false
         panAnchor = convert(event.locationInWindow, from: nil)
     }
 
@@ -495,6 +562,7 @@ public final class CanvasEventView: MTKView {
     private func resetTransientInputState() {
         model.cancelStrokePreview()
         strokeBuilder = nil
+        strokePreviewStarted = false
         panAnchor = nil
         spaceKeyDown = false
     }
