@@ -14,13 +14,14 @@ import Testing
 /// angle in radians in [-pi/2, pi/2), and aspect ratio uses pixel-center moments
 /// plus a pixel's intrinsic 1/12 variance on both axes. Roughness is four-neighbor
 /// perimeter divided by the circumference of an equal-area circle. Voids are
-/// enclosed four-connected background pixels. A candidate lane is a maximal run
-/// of adjacent occupied minor-axis bins whose neighboring longitudinal bins
-/// overlap or touch. It is persistent when the candidate's combined occupied
-/// major-axis bins cover at least 60% of the stroke and span at least 75% of its
-/// longitudinal extent. Spread is pigment-weighted RMS distance from the pigment
-/// centroid, and edge concentration is the fraction of in-mask pigment on the
-/// four-neighbor boundary.
+/// enclosed four-connected background pixels. Projected cells form candidate
+/// lanes by eight-neighbor digital connectivity: each minor-axis bin is split
+/// into contiguous longitudinal runs, and runs connect across adjacent minor
+/// bins only when their longitudinal ranges overlap or touch. A component is
+/// persistent when its combined major-axis bins cover at least 60% of the stroke
+/// and span at least 75% of its longitudinal extent. Spread is pigment-weighted
+/// RMS distance from the pigment centroid, and edge concentration is the fraction
+/// of in-mask pigment on the four-neighbor boundary.
 struct BrushPhenotypeMetrics: Equatable {
     let area: Double
     let aspectRatio: Double
@@ -37,6 +38,11 @@ struct BrushPhenotypeMetrics: Equatable {
     private static let pixelVariance = 1.0 / 12.0
     private static let minimumLaneOccupancyRatio = 0.60
     private static let minimumLaneSpanRatio = 0.75
+
+    private struct LaneRun {
+        let firstLongitudinalBin: Int
+        let lastLongitudinalBin: Int
+    }
 
     static func measure(
         width: Int,
@@ -295,10 +301,10 @@ struct BrushPhenotypeMetrics: Equatable {
         }
         let longitudinalBinCount = lastLongitudinalBin - firstLongitudinalBin + 1
         guard longitudinalBinCount > 0 else { return 0 }
-        let candidateBands = candidateLaneBands(
+        let candidateComponents = candidateLaneComponents(
             longitudinalBinsByMinorBin: longitudinalBinsByMinorBin
         )
-        return candidateBands.reduce(into: 0) { count, bins in
+        return candidateComponents.reduce(into: 0) { count, bins in
             guard let first = bins.min(), let last = bins.max() else { return }
             let occupancyRatio = Double(bins.count) / Double(longitudinalBinCount)
             let spanRatio = Double(last - first + 1) / Double(longitudinalBinCount)
@@ -309,36 +315,91 @@ struct BrushPhenotypeMetrics: Equatable {
         }
     }
 
-    private static func candidateLaneBands(
+    private static func candidateLaneComponents(
         longitudinalBinsByMinorBin: [Int: Set<Int>]
     ) -> [Set<Int>] {
-        var bands: [Set<Int>] = []
-        var currentBand: Set<Int> = []
-        var previousMinorBin: Int?
-        var previousLongitudinalBins: Set<Int> = []
-
+        var runs: [LaneRun] = []
+        var runIndicesByMinorBin: [Int: [Int]] = [:]
         for minorBin in longitudinalBinsByMinorBin.keys.sorted() {
-            guard let longitudinalBins = longitudinalBinsByMinorBin[minorBin] else { continue }
-            let joinsCurrentBand = previousMinorBin == minorBin - 1
-                && longitudinalBinsTouch(previousLongitudinalBins, longitudinalBins)
-            if !joinsCurrentBand, !currentBand.isEmpty {
-                bands.append(currentBand)
-                currentBand = []
+            guard let longitudinalBins = longitudinalBinsByMinorBin[minorBin] else {
+                continue
             }
-            currentBand.formUnion(longitudinalBins)
-            previousMinorBin = minorBin
-            previousLongitudinalBins = longitudinalBins
+            for run in contiguousLaneRuns(longitudinalBins) {
+                runIndicesByMinorBin[minorBin, default: []].append(runs.count)
+                runs.append(run)
+            }
         }
-        if !currentBand.isEmpty {
-            bands.append(currentBand)
+
+        var adjacency = Array(repeating: [Int](), count: runs.count)
+        for minorBin in runIndicesByMinorBin.keys.sorted() {
+            let (previousMinorBin, didOverflow) = minorBin.subtractingReportingOverflow(1)
+            guard let currentIndices = runIndicesByMinorBin[minorBin],
+                  !didOverflow,
+                  let previousIndices = runIndicesByMinorBin[previousMinorBin] else {
+                continue
+            }
+            for currentIndex in currentIndices {
+                for previousIndex in previousIndices
+                where laneRunsOverlapOrTouch(runs[currentIndex], runs[previousIndex]) {
+                    adjacency[currentIndex].append(previousIndex)
+                    adjacency[previousIndex].append(currentIndex)
+                }
+            }
         }
-        return bands
+
+        var components: [Set<Int>] = []
+        var visited = Array(repeating: false, count: runs.count)
+        for startIndex in runs.indices where !visited[startIndex] {
+            var component: Set<Int> = []
+            var pending = [startIndex]
+            visited[startIndex] = true
+            while let index = pending.popLast() {
+                let run = runs[index]
+                component.formUnion(run.firstLongitudinalBin...run.lastLongitudinalBin)
+                for neighbor in adjacency[index] where !visited[neighbor] {
+                    visited[neighbor] = true
+                    pending.append(neighbor)
+                }
+            }
+            components.append(component)
+        }
+        return components
     }
 
-    private static func longitudinalBinsTouch(_ lhs: Set<Int>, _ rhs: Set<Int>) -> Bool {
-        lhs.contains { bin in
-            rhs.contains(bin - 1) || rhs.contains(bin) || rhs.contains(bin + 1)
+    private static func contiguousLaneRuns(_ bins: Set<Int>) -> [LaneRun] {
+        guard var first = bins.min() else { return [] }
+        var last = first
+        var runs: [LaneRun] = []
+        for bin in bins.sorted().dropFirst() {
+            let (next, didOverflow) = last.addingReportingOverflow(1)
+            if !didOverflow, bin == next {
+                last = bin
+            } else {
+                runs.append(LaneRun(
+                    firstLongitudinalBin: first,
+                    lastLongitudinalBin: last
+                ))
+                first = bin
+                last = bin
+            }
         }
+        runs.append(LaneRun(
+            firstLongitudinalBin: first,
+            lastLongitudinalBin: last
+        ))
+        return runs
+    }
+
+    private static func laneRunsOverlapOrTouch(_ lhs: LaneRun, _ rhs: LaneRun) -> Bool {
+        if lhs.lastLongitudinalBin < rhs.firstLongitudinalBin {
+            let (next, didOverflow) = lhs.lastLongitudinalBin.addingReportingOverflow(1)
+            return !didOverflow && next == rhs.firstLongitudinalBin
+        }
+        if rhs.lastLongitudinalBin < lhs.firstLongitudinalBin {
+            let (next, didOverflow) = rhs.lastLongitudinalBin.addingReportingOverflow(1)
+            return !didOverflow && next == lhs.firstLongitudinalBin
+        }
+        return true
     }
 
     private static func pigmentMetrics(
@@ -553,6 +614,29 @@ struct BrushPhenotypeMetrics: Equatable {
         )
 
         #expect(metrics.area == 12)
+        #expect(abs(metrics.orientation) < 0.000_001)
+        #expect(metrics.laneCount == 0)
+    }
+
+    @Test func transitiveSameRowFragmentsDoNotConnectSeparateLaneComponents() {
+        let metrics = BrushPhenotypeMetrics.measure(
+            width: 8,
+            height: 7,
+            alpha: [
+                1, 1, 1, 0, 0, 0, 0, 0,
+                0, 0, 1, 0, 0, 1, 0, 0,
+                0, 0, 0, 0, 0, 1, 1, 1,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 1, 1, 1,
+                0, 0, 1, 0, 0, 1, 0, 0,
+                1, 1, 1, 0, 0, 0, 0, 0
+            ],
+            pigment: [],
+            wetness: [],
+            coverageThreshold: 0.5
+        )
+
+        #expect(metrics.area == 16)
         #expect(abs(metrics.orientation) < 0.000_001)
         #expect(metrics.laneCount == 0)
     }
