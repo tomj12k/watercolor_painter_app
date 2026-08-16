@@ -1366,6 +1366,11 @@ public final class StudioModel: ObservableObject {
     public func exportPNG(to destinationURL: URL) async {
         let exportID = UUID()
         latestPNGExportID = exportID
+        // A paper change the customer already chose must be in the file:
+        // wait for the in-flight replacement renderer before snapshotting,
+        // so the export can never write the old surface to disk.
+        await waitForStructuralChanges()
+        guard latestPNGExportID == exportID else { return }
         let capturedFailureID = error?.id
         let capturedExportFailureID = currentPNGExportFailureID
         let exportTicket = await pngExportCoordinator.beginExport(to: destinationURL)
