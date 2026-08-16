@@ -1594,13 +1594,21 @@ import WatercolorCore
     @Test func failedCanonicalAppendRejectsFinishUntilCancelledAndDoesNotPoisonRecovery() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
+        let injectedError = NSError(
+            domain: "WatercolorRendererTests",
+            code: 51,
+            userInfo: [NSLocalizedDescriptionKey: "canonical append execution failed"]
+        )
+        var shouldFailAppend = false
         let renderer = try WatercolorRenderer(
             project: project,
             device: device,
-            debugWorkPolicy: RendererWorkPolicy(
-                maximumCommandThreads: 12_000,
-                maximumProjectThreads: 1_000_000
-            )
+            debugCommandBufferError: { commandBuffer in
+                if shouldFailAppend, commandBuffer.label == "Watercolor stroke preview" {
+                    return injectedError
+                }
+                return commandBuffer.error
+            }
         )
         let checksumBefore = try renderer.compositeChecksum()
         var failedStroke = StrokeCommand.testDot(layerID: project.layers[0].id)
@@ -1619,15 +1627,15 @@ import WatercolorCore
         initial.points = [failedStroke.points[0]]
 
         let failedToken = try renderer.beginStrokePreview(initial)
-        await #expect(
-            throws: RendererError.workBudgetExceeded(required: 131_072, available: 12_000)
-        ) {
+        shouldFailAppend = true
+        await #expect(throws: RendererError.self) {
             try await renderer.appendStrokePreview(
                 id: failedStroke.id,
                 points: Array(failedStroke.points[1...]),
                 token: failedToken
             )
         }
+        shouldFailAppend = false
         await #expect(throws: RendererError.invalidStrokePreview) {
             try await renderer.finishStrokePreview(failedStroke, token: failedToken)
         }
@@ -1692,9 +1700,13 @@ import WatercolorCore
         #expect(splitSubmissions == 2)
         try splitRenderer.cancelStrokePreview(splitToken)
         #expect(try splitRenderer.compositeChecksum() == checksumBefore)
+    }
 
-        var singleSubmissionCount = 0
-        let singleRenderer = try WatercolorRenderer(
+    @Test func oversizedPreviewAppendSplitsAcrossBoundedSubmissions() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(64)
+        var previewSubmissions = 0
+        let renderer = try WatercolorRenderer(
             project: project,
             device: device,
             debugWorkPolicy: RendererWorkPolicy(
@@ -1703,24 +1715,43 @@ import WatercolorCore
             ),
             debugCommandBufferError: { commandBuffer in
                 if commandBuffer.label == "Watercolor stroke preview" {
-                    singleSubmissionCount += 1
+                    previewSubmissions += 1
                 }
                 return commandBuffer.error
             }
         )
-        let singleToken = try singleRenderer.beginStrokePreview(initial)
-        await #expect(
-            throws: RendererError.workBudgetExceeded(required: 262_144, available: 140_000)
-        ) {
-            try await singleRenderer.appendStrokePreview(
-                id: complete.id,
-                points: Array(complete.points[1..<17]),
-                token: singleToken
+        var complete = StrokeCommand.testDot(layerID: project.layers[0].id)
+        complete.points = (0..<17).map { index in
+            StrokePoint(
+                x: 32,
+                y: 32,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
             )
         }
-        #expect(singleSubmissionCount == 0)
-        #expect(try singleRenderer.compositeChecksum() == checksumBefore)
-        try singleRenderer.cancelStrokePreview(singleToken)
+        var initial = complete
+        initial.points = [complete.points[0]]
+        let token = try renderer.beginStrokePreview(initial)
+
+        // One large append exceeds a single submission budget; it must split
+        // into bounded submissions instead of failing, so a queued backlog
+        // can catch up to the cursor in one append call.
+        try await renderer.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points[1..<17]),
+            token: token
+        )
+        #expect(previewSubmissions == 2)
+
+        try await renderer.finishStrokePreview(complete, token: token)
+        try renderer.recordRenderedStroke(complete)
+
+        var replayProject = project
+        replayProject.commands = [.stroke(complete)]
+        let replayRenderer = try WatercolorRenderer(project: replayProject, device: device)
+        #expect(try renderer.compositeChecksum() == replayRenderer.compositeChecksum())
     }
 
     @Test func previewCommandBudgetResetsForFinishSubmission() async throws {

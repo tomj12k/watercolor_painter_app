@@ -399,9 +399,13 @@ actor StudioPNGExportCoordinator {
 public final class StudioModel: ObservableObject {
     public static let brushSizeRange = 1.0...300.0
     private static let dryStepCount = 24
-    // Keep each queued preview update within one renderer stamp batch. This
-    // bounds GPU work per submission when input arrives faster than Metal.
-    private static let previewPointBatchSize = 8
+    // Drain the queued input backlog in large adaptive appends so paint
+    // catches up to a fast cursor: the renderer splits each append into
+    // bounded GPU submissions itself, so per-submission safety no longer
+    // limits the drain size. The cap keeps cancellation responsive and the
+    // canvas refreshing every append while a backlog drains, instead of
+    // one long append that repaints only at its end.
+    private static let previewPointDrainLimit = 64
     private static let maximumRendererCheckpointCount = 2
     private static let defaultRendererCheckpointByteBudget = 256 * 1024 * 1024
 
@@ -737,7 +741,7 @@ public final class StudioModel: ObservableObject {
               isCurrentStrokePreview(token),
               renderer === token.renderer,
               !pendingStrokePreviewPoints.isEmpty {
-            let pointCount = min(Self.previewPointBatchSize, pendingStrokePreviewPoints.count)
+            let pointCount = min(Self.previewPointDrainLimit, pendingStrokePreviewPoints.count)
             let points = Array(pendingStrokePreviewPoints.prefix(pointCount))
             pendingStrokePreviewPoints = Array(pendingStrokePreviewPoints.dropFirst(pointCount))
             do {

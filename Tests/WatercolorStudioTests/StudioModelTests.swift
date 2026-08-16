@@ -546,7 +546,7 @@ import WatercolorCore
         #expect(updates == [model.project])
     }
 
-    @Test func queuedPreviewPointsSplitIntoBoundedRendererSubmissions() async throws {
+    @Test func queuedPreviewPointsDrainInAdaptiveBoundedSubmissions() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
         let renderer = try WatercolorRenderer(project: project, device: device)
@@ -569,22 +569,33 @@ import WatercolorCore
         )
         #expect(model.beginStrokePreview(stroke) == .accepted)
 
-        let queuedIndices: [Int] = Array(1...33)
-        let queuedPoints: [StrokePoint] = queuedIndices.map { index in
-            StrokePoint(
-                x: Double(48 + index * 3),
-                y: Double(96 + (index % 5) * 2),
-                pressure: 1,
-                tiltX: 0,
-                tiltY: 0,
-                time: Double(index) / 120
-            )
+        // A queued backlog drains in one submission, so paint catches up to
+        // the cursor instead of trickling out eight points per GPU round-trip.
+        let queuedPoints: [StrokePoint] = (1...33).map { (index: Int) -> StrokePoint in
+            let x = Double(48 + index * 3)
+            let y = Double(96 + (index % 5) * 2)
+            let time = Double(index) / 120
+            return StrokePoint(x: x, y: y, pressure: 1, tiltX: 0, tiltY: 0, time: time)
         }
         model.appendStrokePreview(id: stroke.id, points: queuedPoints)
         await model.waitForStrokePreviewIdle()
 
-        #expect(submittedPointCounts == [8, 8, 8, 8, 1])
-        #expect(submittedPointCounts.allSatisfy { $0 <= 8 })
+        #expect(submittedPointCounts == [33])
+        #expect(model.error == nil)
+
+        // An extreme backlog is still bounded per submission, so cancellation
+        // never waits behind one enormous in-flight append.
+        let hugeBacklog: [StrokePoint] = (34...400).map { (index: Int) -> StrokePoint in
+            let x = Double(48 + (index % 100) * 3)
+            let y = Double(96 + (index % 5) * 2)
+            let time = Double(index) / 120
+            return StrokePoint(x: x, y: y, pressure: 1, tiltX: 0, tiltY: 0, time: time)
+        }
+        submittedPointCounts = []
+        model.appendStrokePreview(id: stroke.id, points: hugeBacklog)
+        await model.waitForStrokePreviewIdle()
+
+        #expect(submittedPointCounts == [64, 64, 64, 64, 64, 47])
         #expect(model.error == nil)
     }
 

@@ -1052,24 +1052,46 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.unknownLayer(stroke.layerID)
         }
 
-        // Every append is its own bounded GPU submission, so each one draws
-        // from a fresh submission budget. Stroke length alone can then never
-        // exhaust a cumulative budget mid-stroke.
-        var workBudget = workPolicy.makeProjectBudget()
-        workBudget.beginCommand()
+        // An append of any size stays GPU-safe: like replay, it encodes into
+        // bounded submissions with a fresh budget each, rotating whenever the
+        // next simulation chunk would exceed one submission's safety budget.
+        // A queued input backlog can then catch up in a single append call
+        // instead of trickling out one small round-trip at a time. Nothing
+        // commits until every submission encoded, so a failed encode leaves
+        // the GPU untouched and the transaction cleanly rolled back.
         let previousSimulationState = simulationStateSnapshot
-        let commandBuffer = try makeCommandBuffer(label: "Watercolor stroke preview")
+        var commandBuffer = try makeCommandBuffer(label: "Watercolor stroke preview")
         if capturesCommittedState {
             try encodeStrokePreviewSnapshotCapture(transaction, with: commandBuffer)
         }
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+        guard let initialEncoder = commandBuffer.makeComputeCommandEncoder() else {
             throw RendererError.allocation("a live stroke preview encoder")
         }
-        encoder.label = "Live watercolor stroke preview"
+        initialEncoder.label = "Live watercolor stroke preview"
+        var encoder = initialEncoder
+        var previewCommandBuffers: [MTLCommandBuffer] = []
         let previewsNonSelectedSlices = activeSimulationRegions.keys.contains {
             $0 != transaction.layerSlice
         }
-        let stream = RenderCommandStream(encoder: encoder, budget: workBudget)
+        var initialBudget = workPolicy.makeProjectBudget()
+        initialBudget.beginCommand()
+        let stream = RenderCommandStream(
+            encoder: encoder,
+            budget: initialBudget
+        ) { [self] in
+            let nextCommandBuffer = try makeCommandBuffer(label: "Watercolor stroke preview")
+            guard let nextEncoder = nextCommandBuffer.makeComputeCommandEncoder() else {
+                throw RendererError.allocation("a live stroke preview encoder")
+            }
+            nextEncoder.label = "Live watercolor stroke preview"
+            encoder.endEncoding()
+            previewCommandBuffers.append(commandBuffer)
+            commandBuffer = nextCommandBuffer
+            encoder = nextEncoder
+            var nextBudget = workPolicy.makeProjectBudget()
+            nextBudget.beginCommand()
+            return (nextEncoder, nextBudget)
+        }
         do {
             try encodeStrokeAndSimulation(
                 stroke: stroke,
@@ -1085,17 +1107,26 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             restoreSimulationState(previousSimulationState)
             throw error
         }
-        encodeComposite(with: encoder)
-        encoder.endEncoding()
+        encodeComposite(with: stream.encoder)
+        stream.encoder.endEncoding()
+        previewCommandBuffers.append(commandBuffer)
+
         let provider = commandBufferErrorProvider
-        trackCommandBuffer(commandBuffer)
+        let finalBuffer = previewCommandBuffers[previewCommandBuffers.count - 1]
+        trackCommandBuffer(finalBuffer)
         await withCheckedContinuation { continuation in
-            commandBuffer.addCompletedHandler { completed in
-                if capturesCommittedState, completed.status == .completed {
-                    transaction.markSnapshotCaptureCompleted()
+            for (index, buffer) in previewCommandBuffers.enumerated() {
+                let isFirst = index == 0
+                let isLast = index == previewCommandBuffers.count - 1
+                buffer.addCompletedHandler { completed in
+                    if isFirst, capturesCommittedState, completed.status == .completed {
+                        transaction.markSnapshotCaptureCompleted()
+                    }
+                    transaction.record(provider.error(for: completed))
+                    if isLast {
+                        continuation.resume()
+                    }
                 }
-                transaction.record(provider.error(for: completed))
-                continuation.resume()
             }
             if capturesCommittedState {
                 transaction.markSnapshotCaptureSubmitted()
@@ -1103,12 +1134,14 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             if previewsNonSelectedSlices {
                 transaction.requireReplayOnCancel()
             }
-            commandBuffer.commit()
+            for buffer in previewCommandBuffers {
+                buffer.commit()
+            }
         }
         #if DEBUG
         await previewAppendWillCommit?()
         #endif
-        if lastCommandBuffer === commandBuffer {
+        if lastCommandBuffer === finalBuffer {
             lastCommandBuffer = nil
             lastCommandBufferCompletion = nil
         }

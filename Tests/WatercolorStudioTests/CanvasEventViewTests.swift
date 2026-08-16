@@ -557,7 +557,9 @@ import WatercolorCore
         )))
         await model.waitForStrokePreviewIdle()
         #expect(!submittedBatches.isEmpty)
-        #expect(submittedBatches.allSatisfy { $0.count <= 8 })
+        // Drained appends are bounded only by the adaptive drain limit; the
+        // renderer splits each append into safe GPU submissions itself.
+        #expect(submittedBatches.allSatisfy { $0.count <= 64 })
         view.mouseUp(with: try #require(canvasMouseEvent(
             .leftMouseUp,
             timestamp: 2,
