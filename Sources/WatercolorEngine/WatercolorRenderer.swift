@@ -505,8 +505,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             stroke: stroke,
             token: token,
             layerSlice: layerSlice,
-            committedSimulationRegions: activeSimulationRegions,
-            workBudget: workPolicy.makeProjectBudget()
+            committedSimulationRegions: activeSimulationRegions
         )
         return token
     }
@@ -588,7 +587,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         appendedStroke.points = canonicalPoints
         transaction.phase = .updating
         do {
-            let updatedWorkBudget = try await renderPreview(
+            try await renderPreview(
                 stroke: appendedStroke,
                 pointIndexOffset: transaction.renderedPointCount,
                 initialPreviousPoint: transaction.lastRenderedPoint,
@@ -597,10 +596,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                     : nil,
                 finalSemanticNextPoint: finalSemanticNextPoint,
                 capturesCommittedState: capturesCommittedState,
-                transaction: transaction,
-                workBudget: transaction.workBudget
+                transaction: transaction
             )
-            transaction.stagedWorkBudget = updatedWorkBudget
         } catch {
             if strokePreview === transaction, transaction.phase == .updating {
                 transaction.phase = .failed
@@ -653,7 +650,6 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             predecessorSearchPointCount: predecessorSearchPointCount
         )
         #endif
-        transaction.commitStagedWorkBudget()
         transaction.phase = .idle
     }
 
@@ -732,7 +728,9 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         #if DEBUG
         lastPreviewFinishEncodedPointCount = 0
         #endif
-        var workBudget = transaction.workBudget
+        // The finish remainder is one bounded submission with its own budget,
+        // matching the per-submission budgets used for preview appends.
+        var workBudget = workPolicy.makeProjectBudget()
         workBudget.beginCommand()
         let previousSimulationState = simulationStateSnapshot
         let commandBuffer = try makeCommandBuffer(label: "Commit watercolor stroke preview")
@@ -750,6 +748,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         guard let slice = layerSlices[stroke.layerID] else {
             throw RendererError.unknownLayer(stroke.layerID)
         }
+        let stream = RenderCommandStream(encoder: encoder, budget: workBudget)
         do {
             var remainder = transaction.strokeTemplate
             remainder.points = transaction.remainder
@@ -766,8 +765,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                 pointIndexOffset: transaction.renderedPointCount,
                 initialPreviousPoint: transaction.lastRenderedPoint,
                 initialSemanticPreviousPoint: transaction.lastSemanticPreviousPoint,
-                workBudget: &workBudget,
-                with: encoder
+                stream: stream
             )
         } catch {
             encoder.endEncoding()
@@ -1006,19 +1004,21 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.unknownLayer(stroke.layerID)
         }
 
-        var workBudget = workPolicy.makeProjectBudget()
         let previousSimulationState = simulationStateSnapshot
         let commandBuffer = try makeCommandBuffer(label: "Watercolor stroke")
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw RendererError.allocation("a stroke command encoder")
         }
         encoder.label = "Watercolor stroke and simulation"
+        let stream = RenderCommandStream(
+            encoder: encoder,
+            budget: workPolicy.makeProjectBudget()
+        )
         do {
             try encodeStrokeAndSimulation(
                 stroke: stroke,
                 slice: slice,
-                workBudget: &workBudget,
-                with: encoder
+                stream: stream
             )
         } catch {
             encoder.endEncoding()
@@ -1044,16 +1044,18 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         initialSemanticPreviousPoint: StrokePoint?,
         finalSemanticNextPoint: StrokePoint?,
         capturesCommittedState: Bool,
-        transaction: StrokePreviewTransaction,
-        workBudget initialWorkBudget: RenderWorkBudget
-    ) async throws -> RenderWorkBudget {
+        transaction: StrokePreviewTransaction
+    ) async throws {
         guard project.layers.contains(where: { $0.id == stroke.layerID }),
               let slice = layerSlices[stroke.layerID]
         else {
             throw RendererError.unknownLayer(stroke.layerID)
         }
 
-        var workBudget = initialWorkBudget
+        // Every append is its own bounded GPU submission, so each one draws
+        // from a fresh submission budget. Stroke length alone can then never
+        // exhaust a cumulative budget mid-stroke.
+        var workBudget = workPolicy.makeProjectBudget()
         workBudget.beginCommand()
         let previousSimulationState = simulationStateSnapshot
         let commandBuffer = try makeCommandBuffer(label: "Watercolor stroke preview")
@@ -1067,6 +1069,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         let previewsNonSelectedSlices = activeSimulationRegions.keys.contains {
             $0 != transaction.layerSlice
         }
+        let stream = RenderCommandStream(encoder: encoder, budget: workBudget)
         do {
             try encodeStrokeAndSimulation(
                 stroke: stroke,
@@ -1075,8 +1078,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                 initialPreviousPoint: initialPreviousPoint,
                 initialSemanticPreviousPoint: initialSemanticPreviousPoint,
                 finalSemanticNextPoint: finalSemanticNextPoint,
-                workBudget: &workBudget,
-                with: encoder
+                stream: stream
             )
         } catch {
             encoder.endEncoding()
@@ -1113,7 +1115,6 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         if let failure = transaction.failureDescription {
             throw RendererError.allocation("GPU execution: \(failure)")
         }
-        return workBudget
     }
 
     private func encodeStrokePreviewSnapshotCapture(
@@ -1219,8 +1220,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             admittingResources: admittingResources
         )
         try synchronizeGPU(readback: false)
-        let commandBuffer = try encodeReplay(project: newProject, plan: replayPlan)
-        try submit(commandBuffer, wait: true)
+        let commandBuffers = try encodeReplay(project: newProject, plan: replayPlan)
+        try submitReplay(commandBuffers)
         readCanvasWetnessMeasurement()
     }
 
@@ -1234,8 +1235,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         )
         try await synchronizeGPUAsynchronously(readback: false)
         await Task.yield()
-        let commandBuffer = try encodeReplay(project: newProject, plan: replayPlan)
-        try await submitAndWait(commandBuffer)
+        let commandBuffers = try encodeReplay(project: newProject, plan: replayPlan)
+        try await submitReplayAndWait(commandBuffers)
         readCanvasWetnessMeasurement()
     }
 
@@ -1255,12 +1256,52 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         guard ownsStrokePreview(transaction, phase: .cancelling) else {
             throw RendererError.invalidStrokePreview
         }
-        let commandBuffer = try encodeReplay(project: newProject, plan: replayPlan)
+        let commandBuffers = try encodeReplay(project: newProject, plan: replayPlan)
         guard ownsStrokePreview(transaction, phase: .cancelling) else {
             throw RendererError.invalidStrokePreview
         }
-        try await submitAndWait(commandBuffer)
+        try await submitReplayAndWait(commandBuffers)
         readCanvasWetnessMeasurement()
+    }
+
+    /// Commits the ordered replay submissions and waits for the final one.
+    /// Nothing is committed until every submission encoded successfully, so a
+    /// failed encode leaves the GPU state untouched.
+    private func submitReplay(_ commandBuffers: [MTLCommandBuffer]) throws {
+        guard let finalBuffer = commandBuffers.last else { return }
+        for commandBuffer in commandBuffers.dropLast() {
+            commandBuffer.commit()
+        }
+        trackCommandBuffer(finalBuffer)
+        finalBuffer.commit()
+        finalBuffer.waitUntilCompleted()
+        lastCommandBuffer = nil
+        lastCommandBufferCompletion = nil
+        for commandBuffer in commandBuffers {
+            if let error = commandBufferErrorProvider.error(for: commandBuffer) {
+                throw RendererError.allocation("GPU execution: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func submitReplayAndWait(_ commandBuffers: [MTLCommandBuffer]) async throws {
+        guard let finalBuffer = commandBuffers.last else { return }
+        let provider = commandBufferErrorProvider
+        for commandBuffer in commandBuffers.dropLast() {
+            commandBuffer.commit()
+        }
+        let completion = trackCommandBuffer(finalBuffer)
+        finalBuffer.commit()
+        await completion.wait()
+        if lastCommandBuffer === finalBuffer {
+            lastCommandBuffer = nil
+            lastCommandBufferCompletion = nil
+        }
+        for commandBuffer in commandBuffers {
+            if let error = provider.error(for: commandBuffer) {
+                throw RendererError.allocation("GPU execution: \(error.localizedDescription)")
+            }
+        }
     }
 
     private func admittedReplayPlan(
@@ -1286,7 +1327,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private func encodeReplay(
         project newProject: PaintingProject,
         plan replayPlan: ReplayPlan
-    ) throws -> MTLCommandBuffer {
+    ) throws -> [MTLCommandBuffer] {
         let replacementTextures: (
             pigment: [MTLTexture],
             wetness: [MTLTexture],
@@ -1321,11 +1362,13 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             replacementWetnessTileMaximumBuffer = nil
         }
 
-        let commandBuffer = try makeCommandBuffer(label: "Watercolor replay")
-        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+        var commandBuffer = try makeCommandBuffer(label: "Watercolor replay")
+        guard let initialEncoder = commandBuffer.makeComputeCommandEncoder() else {
             throw RendererError.allocation("a replay command encoder")
         }
-        encoder.label = "Deterministic watercolor replay"
+        initialEncoder.label = "Deterministic watercolor replay"
+        var encoder = initialEncoder
+        var completedCommandBuffers: [MTLCommandBuffer] = []
 
         let previousPigmentTextures = pigmentTextures
         let previousWetnessTextures = wetnessTextures
@@ -1361,35 +1404,55 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             activeSimulationRegions = [:]
             updateLayerMetadata()
 
-            encodeClear(targetSlice: Self.allLayers, texturesAt: 0, with: encoder)
-            encodeClear(targetSlice: Self.allLayers, texturesAt: 1, with: encoder)
+            var initialBudget = workPolicy.makeProjectBudget()
+            initialBudget.beginCommand()
+            let stream = RenderCommandStream(
+                encoder: encoder,
+                budget: initialBudget
+            ) { [self] in
+                let nextCommandBuffer = try makeCommandBuffer(label: "Watercolor replay")
+                guard let nextEncoder = nextCommandBuffer.makeComputeCommandEncoder() else {
+                    throw RendererError.allocation("a replay command encoder")
+                }
+                nextEncoder.label = "Deterministic watercolor replay"
+                encoder.endEncoding()
+                completedCommandBuffers.append(commandBuffer)
+                commandBuffer = nextCommandBuffer
+                encoder = nextEncoder
+                var nextBudget = workPolicy.makeProjectBudget()
+                nextBudget.beginCommand()
+                return (nextEncoder, nextBudget)
+            }
+            encodeClear(targetSlice: Self.allLayers, texturesAt: 0, with: stream.encoder)
+            encodeClear(targetSlice: Self.allLayers, texturesAt: 1, with: stream.encoder)
 
-            var workBudget = workPolicy.makeProjectBudget()
             for action in replayPlan.actions {
-                workBudget.beginCommand()
                 switch action {
                 case let .stroke(stroke, slice):
                     try encodeStrokeAndSimulation(
                         stroke: stroke,
                         slice: slice,
-                        workBudget: &workBudget,
-                        with: encoder
+                        stream: stream
                     )
                 case let .simulateDiscardedStroke(pointCount):
                     _ = try encodeActiveSimulation(
                         steps: Self.simulationStepsPerStroke * pointCount,
-                        workBudget: &workBudget,
-                        with: encoder
+                        stream: stream
                     )
                 case let .clear(slice):
-                    encodeClear(targetSlice: UInt32(slice), texturesAt: 0, with: encoder)
-                    encodeClear(targetSlice: UInt32(slice), texturesAt: 1, with: encoder)
+                    encodeClear(targetSlice: UInt32(slice), texturesAt: 0, with: stream.encoder)
+                    encodeClear(targetSlice: UInt32(slice), texturesAt: 1, with: stream.encoder)
                     activeSimulationRegions.removeValue(forKey: slice)
                 case let .duplicate(source, destination):
-                    encodeCopy(source: source, destination: destination, with: encoder)
+                    encodeCopy(source: source, destination: destination, with: stream.encoder)
                     activeSimulationRegions[destination] = activeSimulationRegions[source]
                 case let .merge(command, source, destination):
-                    encodeMerge(command: command, source: source, destination: destination, with: encoder)
+                    encodeMerge(
+                        command: command,
+                        source: source,
+                        destination: destination,
+                        with: stream.encoder
+                    )
                     let mergedRegions = (activeSimulationRegions[destination] ?? [])
                         + (activeSimulationRegions[source] ?? [])
                     activeSimulationRegions[destination] = coalescedActiveRegions(mergedRegions)
@@ -1398,16 +1461,15 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                     _ = try encodeActiveSimulation(
                         steps: steps,
                         restrictingTo: Set([slice]),
-                        workBudget: &workBudget,
-                        with: encoder
+                        stream: stream
                     )
                 }
             }
 
-            encodeComposite(with: encoder)
+            encodeComposite(with: stream.encoder)
             prepareCanvasWetnessMeasurement()
-            encodeCanvasWetnessMeasurement(with: encoder)
-            encoder.endEncoding()
+            encodeCanvasWetnessMeasurement(with: stream.encoder)
+            stream.encoder.endEncoding()
         } catch {
             encoder.endEncoding()
             pigmentTextures = previousPigmentTextures
@@ -1427,7 +1489,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             updateLayerMetadata()
             throw error
         }
-        return commandBuffer
+        completedCommandBuffers.append(commandBuffer)
+        return completedCommandBuffers
     }
 
     public func applyMetadata(project updatedProject: PaintingProject) throws {
@@ -1461,18 +1524,20 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             throw RendererError.unknownLayer(layerID)
         }
 
-        var workBudget = workPolicy.makeProjectBudget()
         let previousSimulationState = simulationStateSnapshot
         let commandBuffer = try makeCommandBuffer(label: "Dry watercolor layer")
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw RendererError.allocation("a drying command encoder")
         }
+        let stream = RenderCommandStream(
+            encoder: encoder,
+            budget: workPolicy.makeProjectBudget()
+        )
         do {
             _ = try encodeActiveSimulation(
                 steps: min(max(0, steps), PaintingProject.maximumDryStepCount),
                 restrictingTo: Set([slice]),
-                workBudget: &workBudget,
-                with: encoder
+                stream: stream
             )
         } catch {
             encoder.endEncoding()
@@ -1833,8 +1898,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         initialSemanticPreviousPoint: StrokePoint? = nil,
         finalSemanticNextPoint: StrokePoint? = nil,
         restrictingSimulationTo restrictedSimulationSlices: Set<Int>? = nil,
-        workBudget: inout RenderWorkBudget,
-        with encoder: MTLComputeCommandEncoder
+        stream: RenderCommandStream
     ) throws {
         guard !stroke.points.isEmpty else { return }
         var stampBatchCount = 0
@@ -1889,7 +1953,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                 pointIndexOffset: pointIndexOffset + batchStart,
                 previousPoint: immediatePreviousPoint,
                 orientations: orientations,
-                with: encoder
+                with: stream.encoder
             )
             if preparesStampOrientations, let lastPoint = batch.points.last {
                 semanticPreviousPoint = Self.firstNoncoincidentPoint(
@@ -1907,8 +1971,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             let dispatches = try encodeActiveSimulation(
                 steps: stepCount,
                 restrictingTo: restrictedSimulationSlices,
-                workBudget: &workBudget,
-                with: encoder
+                stream: stream
             )
             stampBatchCount += 1
             simulationStepCount += stepCount
@@ -1960,8 +2023,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private func encodeActiveSimulation(
         steps: Int,
         restrictingTo restrictedSlices: Set<Int>? = nil,
-        workBudget: inout RenderWorkBudget,
-        with encoder: MTLComputeCommandEncoder
+        stream: RenderCommandStream
     ) throws -> [SimulationDispatch] {
         guard steps > 0 else { return [] }
         let slices = activeSimulationRegions.keys
@@ -1978,8 +2040,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                     steps: steps,
                     targetSlice: UInt32(slice),
                     region: simulationRegion,
-                    workBudget: &workBudget,
-                    with: encoder
+                    stream: stream
                 )
                 dispatches.append(SimulationDispatch(
                     slice: slice,
@@ -2179,18 +2240,10 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         steps: Int,
         targetSlice: UInt32,
         region: CanvasRegion?,
-        workBudget: inout RenderWorkBudget,
-        with encoder: MTLComputeCommandEncoder
+        stream: RenderCommandStream
     ) throws {
         guard steps > 0, let region, region.width > 0, region.height > 0 else { return }
         let sliceDepth = targetSlice == Self.allLayers ? layerCapacity : 1
-        try workBudget.consume(
-            regionArea: region.area,
-            steps: steps,
-            sliceDepth: sliceDepth,
-            passCount: 2
-        )
-        encoder.setComputePipelineState(simulationPipeline)
         var parameters = SimulationParameters(
             rates: SIMD4(0.24, 0.055, 0.985, 0),
             selection: SIMD4(
@@ -2200,27 +2253,69 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
                 UInt32(region.minY)
             )
         )
-        encoder.setBytes(&parameters, length: MemoryLayout<SimulationParameters>.stride, index: 0)
 
-        for _ in 0..<steps {
-            let destination = 1 - frontTextureIndex
-            encoder.setTexture(pigmentTextures[frontTextureIndex], index: 0)
-            encoder.setTexture(wetnessTextures[frontTextureIndex], index: 1)
-            encoder.setTexture(pigmentTextures[destination], index: 2)
-            encoder.setTexture(wetnessTextures[destination], index: 3)
-            encoder.dispatchThreads(
-                MTLSize(
-                    width: region.width,
-                    height: region.height,
-                    depth: sliceDepth
-                ),
-                threadsPerThreadgroup: threadgroupSize(for: simulationPipeline)
+        var remainingSteps = steps
+        while remainingSteps > 0 {
+            let chunkSteps: Int
+            if stream.splitsAcrossSubmissions {
+                var availableSteps = stream.maximumConsumableSteps(
+                    regionArea: region.area,
+                    sliceDepth: sliceDepth,
+                    passCount: 2
+                )
+                if availableSteps == 0 {
+                    try stream.rotateSubmission()
+                    availableSteps = stream.maximumConsumableSteps(
+                        regionArea: region.area,
+                        sliceDepth: sliceDepth,
+                        passCount: 2
+                    )
+                }
+                guard availableSteps > 0 else {
+                    // Even one step exceeds a fresh submission budget; report
+                    // the irreducible dispatch that cannot run safely.
+                    try stream.consume(
+                        regionArea: region.area,
+                        steps: 1,
+                        sliceDepth: sliceDepth,
+                        passCount: 2
+                    )
+                    return
+                }
+                chunkSteps = min(remainingSteps, availableSteps)
+            } else {
+                chunkSteps = remainingSteps
+            }
+            try stream.consume(
+                regionArea: region.area,
+                steps: chunkSteps,
+                sliceDepth: sliceDepth,
+                passCount: 2
             )
-            encoder.memoryBarrier(scope: .textures)
-            frontTextureIndex = destination
-            encodeSynchronize(region: region, targetSlice: targetSlice, with: encoder)
+            let encoder = stream.encoder
             encoder.setComputePipelineState(simulationPipeline)
             encoder.setBytes(&parameters, length: MemoryLayout<SimulationParameters>.stride, index: 0)
+            for _ in 0..<chunkSteps {
+                let destination = 1 - frontTextureIndex
+                encoder.setTexture(pigmentTextures[frontTextureIndex], index: 0)
+                encoder.setTexture(wetnessTextures[frontTextureIndex], index: 1)
+                encoder.setTexture(pigmentTextures[destination], index: 2)
+                encoder.setTexture(wetnessTextures[destination], index: 3)
+                encoder.dispatchThreads(
+                    MTLSize(
+                        width: region.width,
+                        height: region.height,
+                        depth: sliceDepth
+                    ),
+                    threadsPerThreadgroup: threadgroupSize(for: simulationPipeline)
+                )
+                encoder.memoryBarrier(scope: .textures)
+                frontTextureIndex = destination
+                encodeSynchronize(region: region, targetSlice: targetSlice, with: encoder)
+                encoder.setComputePipelineState(simulationPipeline)
+                encoder.setBytes(&parameters, length: MemoryLayout<SimulationParameters>.stride, index: 0)
+            }
+            remainingSteps -= chunkSteps
         }
     }
 
@@ -3104,6 +3199,62 @@ private final class CommandBufferCompletion: @unchecked Sendable {
     }
 }
 
+/// The encoding destination for budgeted GPU work. Live paths use a fixed
+/// stream that throws when one submission would exceed the work budget.
+/// Replay uses a rotating stream that closes the current command buffer and
+/// continues identical work in a fresh, fully budgeted one, so document size
+/// never makes replay exceed a single submission's safe budget.
+@MainActor
+private final class RenderCommandStream {
+    private(set) var encoder: MTLComputeCommandEncoder
+    private var budget: RenderWorkBudget
+    private let rotation: (() throws -> (MTLComputeCommandEncoder, RenderWorkBudget))?
+
+    init(encoder: MTLComputeCommandEncoder, budget: RenderWorkBudget) {
+        self.encoder = encoder
+        self.budget = budget
+        rotation = nil
+    }
+
+    init(
+        encoder: MTLComputeCommandEncoder,
+        budget: RenderWorkBudget,
+        rotation: @escaping () throws -> (MTLComputeCommandEncoder, RenderWorkBudget)
+    ) {
+        self.encoder = encoder
+        self.budget = budget
+        self.rotation = rotation
+    }
+
+    var splitsAcrossSubmissions: Bool {
+        rotation != nil
+    }
+
+    func consume(regionArea: Int, steps: Int, sliceDepth: Int, passCount: Int) throws {
+        try budget.consume(
+            regionArea: regionArea,
+            steps: steps,
+            sliceDepth: sliceDepth,
+            passCount: passCount
+        )
+    }
+
+    func maximumConsumableSteps(regionArea: Int, sliceDepth: Int, passCount: Int) -> Int {
+        budget.maximumConsumableSteps(
+            regionArea: regionArea,
+            sliceDepth: sliceDepth,
+            passCount: passCount
+        )
+    }
+
+    func rotateSubmission() throws {
+        guard let rotation else {
+            throw RendererError.invalidStrokePreview
+        }
+        (encoder, budget) = try rotation()
+    }
+}
+
 private final class StrokePreviewTransaction: @unchecked Sendable {
     let strokeID: UUID
     let token: RendererStrokePreviewToken
@@ -3118,8 +3269,6 @@ private final class StrokePreviewTransaction: @unchecked Sendable {
     var lastRenderedPoint: StrokePoint?
     var lastSemanticPreviousPoint: StrokePoint?
     var phase = StrokePreviewPhase.idle
-    var workBudget: RenderWorkBudget
-    var stagedWorkBudget: RenderWorkBudget?
 
     private let lock = NSLock()
     private var failure: String?
@@ -3132,8 +3281,7 @@ private final class StrokePreviewTransaction: @unchecked Sendable {
         stroke: StrokeCommand,
         token: RendererStrokePreviewToken,
         layerSlice: Int,
-        committedSimulationRegions: [Int: [ActiveSimulationRegion]],
-        workBudget: RenderWorkBudget
+        committedSimulationRegions: [Int: [ActiveSimulationRegion]]
     ) {
         strokeID = stroke.id
         self.token = token
@@ -3148,14 +3296,6 @@ private final class StrokePreviewTransaction: @unchecked Sendable {
         absolutePointCount = stroke.points.count
         lastRenderedPoint = nil
         lastSemanticPreviousPoint = nil
-        self.workBudget = workBudget
-        stagedWorkBudget = nil
-    }
-
-    func commitStagedWorkBudget() {
-        guard let stagedWorkBudget else { return }
-        workBudget = stagedWorkBudget
-        self.stagedWorkBudget = nil
     }
 
     func matchesFinalStroke(_ stroke: StrokeCommand) -> Bool {

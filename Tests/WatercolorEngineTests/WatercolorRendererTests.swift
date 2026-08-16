@@ -1640,7 +1640,7 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 32, y: 32).alpha > 0.1)
     }
 
-    @Test func previewProjectBudgetSpansEveryDeltaInOneSemanticStroke() async throws {
+    @Test func previewAppendsEachDrawFromAFreshSubmissionBudget() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
         let workPolicy = RendererWorkPolicy(
@@ -1680,18 +1680,16 @@ import WatercolorCore
             points: Array(complete.points[1..<9]),
             token: splitToken
         )
-        let admittedPrefixChecksum = try splitRenderer.compositeChecksum()
         #expect(splitSubmissions == 1)
 
-        await #expect(throws: RendererError.self) {
-            try await splitRenderer.appendStrokePreview(
-                id: complete.id,
-                points: Array(complete.points[9..<17]),
-                token: splitToken
-            )
-        }
-        #expect(splitSubmissions == 1)
-        #expect(try splitRenderer.compositeChecksum() == admittedPrefixChecksum)
+        // A stroke of any length keeps painting: the second append draws from
+        // a fresh submission budget instead of exhausting a per-stroke total.
+        try await splitRenderer.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points[9..<17]),
+            token: splitToken
+        )
+        #expect(splitSubmissions == 2)
         try splitRenderer.cancelStrokePreview(splitToken)
         #expect(try splitRenderer.compositeChecksum() == checksumBefore)
 
@@ -1750,13 +1748,12 @@ import WatercolorCore
             token: finishToken
         )
 
-        await #expect(
-            throws: RendererError.workBudgetExceeded(required: 147_456, available: 145_000)
-        ) {
-            try await finishRenderer.finishStrokePreview(prefixThenTail, token: finishToken)
-        }
-        #expect(finishSubmissionCount == 0)
-        #expect(try finishRenderer.compositeChecksum() == checksumBefore)
+        // The finish remainder draws from its own fresh submission budget, so
+        // budget consumed by earlier appends can never make finishing fail.
+        try await finishRenderer.finishStrokePreview(prefixThenTail, token: finishToken)
+        #expect(finishSubmissionCount == 1)
+        try finishRenderer.recordRenderedStroke(prefixThenTail)
+        #expect(finishRenderer.project.commands.count == project.commands.count + 1)
     }
 
     @Test func previewCommandBudgetResetsBetweenAppendSubmissions() async throws {
@@ -2415,7 +2412,7 @@ import WatercolorCore
         ]
 
         #expect(
-            throws: RendererError.workBudgetExceeded(required: 819_200, available: 6_000)
+            throws: RendererError.workBudgetExceeded(required: 8_192, available: 6_000)
         ) {
             try renderer.replay(project: hostile)
         }
@@ -2570,7 +2567,7 @@ import WatercolorCore
         var replaySubmissions = 0
 
         #expect(
-            throws: RendererError.workBudgetExceeded(required: 819_200, available: 6_000)
+            throws: RendererError.workBudgetExceeded(required: 8_192, available: 6_000)
         ) {
             _ = try WatercolorRenderer(
                 project: hostile,
@@ -2623,7 +2620,7 @@ import WatercolorCore
         ]
 
         #expect(
-            throws: RendererError.workBudgetExceeded(required: 819_200, available: 6_000)
+            throws: RendererError.workBudgetExceeded(required: 8_192, available: 6_000)
         ) {
             _ = try renderer.makeCandidate(project: hostile)
         }
@@ -2635,7 +2632,7 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 32, y: 32).alpha > 0.1)
     }
 
-    @Test func replayCommandBudgetAccumulatesAcrossStrokeBatches() throws {
+    @Test func replayStrokeBatchWorkSplitsAcrossBoundedSubmissions() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let original = PaintingProject.testCanvas(64)
         var replaySubmissions = 0
@@ -2665,21 +2662,17 @@ import WatercolorCore
                 time: Double(index)
             )
         }
-        var hostile = original
-        hostile.commands = [.stroke(batchedStroke)]
+        var heavy = original
+        heavy.commands = [.stroke(batchedStroke)]
 
-        #expect(
-            throws: RendererError.workBudgetExceeded(required: 147_456, available: 140_000)
-        ) {
-            try renderer.replay(project: hostile)
-        }
+        try renderer.replay(project: heavy)
 
-        #expect(replaySubmissions == 0)
-        #expect(renderer.project == original)
+        #expect(replaySubmissions > 1)
+        #expect(renderer.project == heavy)
         try renderer.renderAndWait(stroke: .testDot(layerID: original.layers[0].id))
     }
 
-    @Test func replayProjectBudgetAccumulatesAcrossPaintingCommands() throws {
+    @Test func replayWorkAcrossPaintingCommandsSplitsIntoBoundedSubmissions() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let original = PaintingProject.testCanvas(64)
         var replaySubmissions = 0
@@ -2687,7 +2680,7 @@ import WatercolorCore
             project: original,
             device: device,
             debugWorkPolicy: RendererWorkPolicy(
-                maximumCommandThreads: 6_000,
+                maximumCommandThreads: 8_000,
                 maximumProjectThreads: 10_000
             ),
             debugCommandBufferError: { commandBuffer in
@@ -2698,21 +2691,17 @@ import WatercolorCore
             }
         )
         replaySubmissions = 0
-        var hostile = original
-        hostile.commands = [
+        var heavy = original
+        heavy.commands = [
             .stroke(.testDot(layerID: original.layers[0].id)),
             .clearLayer(LayerCommand(layerID: original.layers[0].id)),
             .stroke(.testDot(layerID: original.layers[0].id))
         ]
 
-        #expect(
-            throws: RendererError.workBudgetExceeded(required: 11_552, available: 10_000)
-        ) {
-            try renderer.replay(project: hostile)
-        }
+        try renderer.replay(project: heavy)
 
-        #expect(replaySubmissions == 0)
-        #expect(renderer.project == original)
+        #expect(replaySubmissions > 1)
+        #expect(renderer.project == heavy)
         try renderer.renderAndWait(stroke: .testDot(layerID: original.layers[0].id))
     }
 
