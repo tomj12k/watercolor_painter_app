@@ -92,6 +92,34 @@ public struct StudioView: View {
         .frame(minWidth: 1_050, minHeight: 680)
         .focusedSceneValue(\.studioModel, model)
         .toolbar { studioToolbar }
+        // Status changes must reach assistive technology as announcements —
+        // a VoiceOver user otherwise discovers a pause or a limit only by
+        // finding controls unexpectedly disabled.
+        .onChange(of: model.isApplyingSurfaceChange) { _, isApplying in
+            if isApplying {
+                announce("Painting paused while the paper surface prepares.")
+            } else {
+                announce("Painting resumed.")
+            }
+        }
+        .onChange(of: model.rendererRecoveryError != nil) { _, isRecovering in
+            if isRecovering {
+                announce(
+                    "Painting is paused after a renderer problem. "
+                        + "Your work is safe. Use Try Again to resume."
+                )
+            }
+        }
+        .onChange(of: model.capacityWarning) { _, warning in
+            if let warning { announce(warning) }
+        }
+        .onChange(of: model.notice?.id) { _, _ in
+            if let notice = model.notice { announce(notice.message) }
+        }
+    }
+
+    private func announce(_ message: String) {
+        AccessibilityNotification.Announcement(message).post()
     }
 
     private var paperStage: some View {

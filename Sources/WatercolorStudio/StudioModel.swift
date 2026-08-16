@@ -405,7 +405,12 @@ public final class StudioModel: ObservableObject {
     // limits the drain size. The cap keeps cancellation responsive and the
     // canvas refreshing every append while a backlog drains, instead of
     // one long append that repaints only at its end.
-    private static let previewPointDrainLimit = 64
+    //
+    // Must stay a whole multiple of WatercolorRenderer.stampBatchSize: wet
+    // simulation runs between stamp batches, so a drain size off the batch
+    // stride would shift batch boundaries and make live-preview pixels
+    // diverge from replay and reopen. A test pins this relationship.
+    static let previewPointDrainLimit = 64
     private static let maximumRendererCheckpointCount = 2
     private static let defaultRendererCheckpointByteBudget = 256 * 1024 * 1024
 

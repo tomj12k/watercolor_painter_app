@@ -71,7 +71,11 @@ public struct RendererStrokePreviewToken: Hashable, Sendable {
 public final class WatercolorRenderer: NSObject, MTKViewDelegate {
     private static let maximumLayerCapacity = PaintingProject.maximumLayerCount
     private static let simulationStepsPerStroke = 2
-    private static let stampBatchSize = 8
+    // Wet simulation runs between stamp batches, so every consumer that
+    // splits stroke points into GPU submissions must split on this stride —
+    // StudioModel.previewPointDrainLimit stays a whole multiple of it, and
+    // a test pins that relationship.
+    static let stampBatchSize = 8
     private static let activeRegionLifetimeSteps = 256
     /// How far beyond the freshest stamp the wet simulation window extends,
     /// sized to the lifetime's maximum diffusion travel plus headroom.

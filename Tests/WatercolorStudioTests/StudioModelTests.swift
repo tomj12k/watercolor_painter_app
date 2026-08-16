@@ -56,6 +56,14 @@ import WatercolorCore
         )
     }
 
+    @Test @MainActor func previewDrainSizeAlignsWithTheRendererStampBatchStride() {
+        // Wet simulation runs between stamp batches. A drain size off the
+        // batch stride would shift batch boundaries between live preview
+        // and replay, so live pixels would diverge from reopen.
+        #expect(StudioModel.previewPointDrainLimit % WatercolorRenderer.stampBatchSize == 0)
+        #expect(StudioModel.previewPointDrainLimit > 0)
+    }
+
     @Test @MainActor func routineLimitsRaiseANoticeInsteadOfAModalError() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let maximumCommandCount = 2
