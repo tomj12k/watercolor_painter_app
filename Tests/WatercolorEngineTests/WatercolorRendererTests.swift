@@ -271,18 +271,24 @@ import WatercolorCore
         let project = PaintingProject.testCanvas(64)
         let finishWaitEvent = try #require(device.makeSharedEvent())
         let finishWaitValue: UInt64 = 1
-        let finishCommitted = RendererPreviewCommandBufferMilestone()
-        let cancellationBegan = RendererPreviewMilestone()
+        let overlapProbe = RendererPreviewGPUOverlapProbe(
+            event: finishWaitEvent,
+            value: finishWaitValue
+        )
+        let cancellationSubmissionGate = RendererPreviewCallSuspension()
         let renderer = try WatercolorRenderer(
             project: project,
             device: device,
             debugPreviewFinishWaitEvent: finishWaitEvent,
             value: finishWaitValue,
             finishDidCommit: { commandBuffer in
-                finishCommitted.record(commandBuffer)
+                overlapProbe.recordFinishCommit(commandBuffer)
             },
             cancellationDidBegin: {
-                cancellationBegan.record()
+                overlapProbe.recordCancellationAndReleaseFinish()
+            },
+            cancellationWillSubmit: {
+                await cancellationSubmissionGate.suspend()
             }
         )
         let checksumBefore = try renderer.compositeChecksum()
@@ -296,29 +302,24 @@ import WatercolorCore
         let finishing = Task { @MainActor in
             try await renderer.finishStrokePreview(first, token: firstToken)
         }
-        let finishCommandBuffer = await finishCommitted.waitForCommandBuffer().commandBuffer
-        #expect(finishWaitEvent.signaledValue < finishWaitValue)
-        #expect(
-            finishCommandBuffer.status == .committed
-                || finishCommandBuffer.status == .scheduled
-        )
-
         let cancelling = Task { @MainActor in
+            _ = await overlapProbe.waitForFinishCommit()
             try await renderer.restoreStrokePreviewCancellation(firstToken)
         }
-        await cancellationBegan.waitUntilRecorded()
-        #expect(finishWaitEvent.signaledValue < finishWaitValue)
-        #expect(
-            finishCommandBuffer.status == .committed
-                || finishCommandBuffer.status == .scheduled
-        )
+        let finishCommit = await overlapProbe.waitForFinishCommit()
+        let cancellation = await overlapProbe.waitForCancellation()
+        await cancellationSubmissionGate.waitUntilSuspended()
+        #expect(finishCommit.signaledValue < finishWaitValue)
+        #expect(finishCommit.status == .committed || finishCommit.status == .scheduled)
+        #expect(cancellation.signaledValue < finishWaitValue)
+        #expect(cancellation.status == .committed || cancellation.status == .scheduled)
         #expect(throws: RendererError.invalidStrokePreview) {
             _ = try renderer.beginStrokePreview(
                 StrokeCommand.testDot(layerID: project.layers[0].id, x: 32, y: 32)
             )
         }
 
-        finishWaitEvent.signaledValue = finishWaitValue
+        await cancellationSubmissionGate.resume()
 
         await #expect(throws: RendererError.invalidStrokePreview) {
             try await finishing.value
@@ -5121,6 +5122,67 @@ private final class RendererPreviewCommandBufferMilestone {
 
 private struct RendererPreviewCommandBufferReference: @unchecked Sendable {
     let commandBuffer: MTLCommandBuffer
+}
+
+@MainActor
+private final class RendererPreviewGPUOverlapProbe {
+    struct Snapshot: Sendable {
+        let status: MTLCommandBufferStatus
+        let signaledValue: UInt64
+    }
+
+    private let event: MTLSharedEvent
+    private let value: UInt64
+    private var commandBuffer: MTLCommandBuffer?
+    private var finishSnapshot: Snapshot?
+    private var cancellationSnapshot: Snapshot?
+    private var finishWaiters: [CheckedContinuation<Snapshot, Never>] = []
+    private var cancellationWaiters: [CheckedContinuation<Snapshot, Never>] = []
+
+    init(event: MTLSharedEvent, value: UInt64) {
+        self.event = event
+        self.value = value
+    }
+
+    func recordFinishCommit(_ commandBuffer: MTLCommandBuffer) {
+        guard finishSnapshot == nil else { return }
+        self.commandBuffer = commandBuffer
+        let snapshot = Snapshot(
+            status: commandBuffer.status,
+            signaledValue: event.signaledValue
+        )
+        finishSnapshot = snapshot
+        let waiters = finishWaiters
+        finishWaiters.removeAll()
+        waiters.forEach { $0.resume(returning: snapshot) }
+    }
+
+    func recordCancellationAndReleaseFinish() {
+        guard cancellationSnapshot == nil, let commandBuffer else { return }
+        let snapshot = Snapshot(
+            status: commandBuffer.status,
+            signaledValue: event.signaledValue
+        )
+        cancellationSnapshot = snapshot
+        event.signaledValue = value
+        let waiters = cancellationWaiters
+        cancellationWaiters.removeAll()
+        waiters.forEach { $0.resume(returning: snapshot) }
+    }
+
+    func waitForFinishCommit() async -> Snapshot {
+        if let finishSnapshot { return finishSnapshot }
+        return await withCheckedContinuation { continuation in
+            finishWaiters.append(continuation)
+        }
+    }
+
+    func waitForCancellation() async -> Snapshot {
+        if let cancellationSnapshot { return cancellationSnapshot }
+        return await withCheckedContinuation { continuation in
+            cancellationWaiters.append(continuation)
+        }
+    }
 }
 
 @MainActor

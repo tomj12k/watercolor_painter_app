@@ -281,7 +281,8 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
         debugPreviewFinishWaitEvent: MTLSharedEvent,
         value: UInt64,
         finishDidCommit: @escaping (MTLCommandBuffer) -> Void,
-        cancellationDidBegin: @escaping () -> Void
+        cancellationDidBegin: @escaping () -> Void,
+        cancellationWillSubmit: @escaping () async -> Void
     ) throws {
         try self.init(
             project: project,
@@ -291,6 +292,7 @@ public final class WatercolorRenderer: NSObject, MTKViewDelegate {
             workPolicy: nil,
             performsResourceAdmission: true,
             commandBufferError: { $0.error },
+            previewCancellationWillSubmit: cancellationWillSubmit,
             previewFinishWaitEvent: debugPreviewFinishWaitEvent,
             previewFinishWaitValue: value,
             previewFinishDidCommit: finishDidCommit,
