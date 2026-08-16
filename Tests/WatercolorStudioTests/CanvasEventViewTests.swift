@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import CoreGraphics
 import Foundation
 import Metal
@@ -762,6 +763,110 @@ import WatercolorCore
         #expect(newModel.project.commands.count == 1)
         #expect(try oldRenderer.debugPixel(x: 128, y: 128, layerID: oldLayer.id).alpha == 0)
         #expect(try newRenderer.debugPixel(x: 128, y: 128, layerID: newLayer.id).alpha > 0.05)
+    }
+
+    @Test func modelReplacementDefersTheOldModelsCancellationOutOfTheViewUpdate() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let oldProject = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [PaintLayer(name: "Old")]
+        )
+        let newProject = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .rough,
+            layers: [PaintLayer(name: "New")]
+        )
+        let oldModel = StudioModel(
+            project: oldProject,
+            renderer: try WatercolorRenderer(project: oldProject, device: device)
+        )
+        let newModel = StudioModel(
+            project: newProject,
+            renderer: try WatercolorRenderer(project: newProject, device: device)
+        )
+        let view = CanvasEventView(model: oldModel)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        oldModel.configureCanvas(view)
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown, timestamp: 0, eventNumber: 0
+        )))
+        #expect(oldModel.isStrokePreviewActive)
+
+        // synchronize runs inside a SwiftUI view update; cancelling the old
+        // model there publishes its capabilities during the update. The
+        // cancellation must be deferred, then still happen.
+        var oldModelPublishedDuringUpdate = false
+        let subscription = oldModel.objectWillChange.sink { _ in
+            oldModelPublishedDuringUpdate = true
+        }
+        view.synchronize(with: newModel)
+        subscription.cancel()
+        #expect(!oldModelPublishedDuringUpdate)
+
+        for _ in 0..<2_000 where oldModel.isStrokePreviewActive {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        await oldModel.waitForStrokePreviewCancellation()
+        #expect(!oldModel.isStrokePreviewActive)
+        #expect(oldModel.project.commands.isEmpty)
+    }
+
+    @Test func deferredStrokesDroppedAtTheTimeoutAreReportedNotSilent() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [PaintLayer(name: "Layer")]
+        )
+        let finish = CanvasPreviewSuspension()
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device),
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, id, points, token in
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
+                },
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
+                    await finish.suspend()
+                }
+            )
+        )
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+        view.deferredStrokeCompletionTimeout = .milliseconds(40)
+        let first = StrokeCommand(
+            layerID: project.layers[0].id,
+            tool: .brush,
+            brush: .default,
+            points: [StrokePoint(x: 64, y: 64, pressure: 1, tiltX: 0, tiltY: 0, time: 0)]
+        )
+
+        #expect(model.beginStrokePreview(first) == .accepted)
+        let commit = Task { @MainActor in
+            await model.commitStrokePreview(first)
+        }
+        await finish.waitUntilSuspended()
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown, timestamp: 1, eventNumber: 1, location: .init(x: 40, y: 128)
+        )))
+        view.mouseUp(with: try #require(canvasMouseEvent(
+            .leftMouseUp, timestamp: 2, eventNumber: 2, location: .init(x: 40, y: 128)
+        )))
+
+        // The renderer never frees up within the timeout, so the deferred
+        // stroke is dropped — and the customer must be told, not left to
+        // wonder where the paint went.
+        for _ in 0..<2_000 where model.error == nil {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        #expect(model.error?.message.contains("could not be painted") == true)
+
+        await finish.resume()
+        await commit.value
+        #expect(model.project.commands.count == 1)
     }
 
     @Test func losingFocusClearsSpacePanAndCancelsTransientStrokeState() throws {

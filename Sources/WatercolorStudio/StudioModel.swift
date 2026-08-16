@@ -668,6 +668,16 @@ public final class StudioModel: ObservableObject {
         if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
     }
 
+    /// Reports strokes that waited for the renderer but never obtained it,
+    /// without disturbing a failure that explains why the renderer is stuck.
+    func noteDroppedDeferredStrokes(count: Int) {
+        guard count > 0, error == nil else { return }
+        let subject = count == 1 ? "A queued stroke" : "\(count) queued strokes"
+        error = StudioFailure(
+            message: "\(subject) could not be painted because the renderer stayed busy."
+        )
+    }
+
     /// Explains why a capacity-ended stroke stopped, without disturbing a
     /// failure that the commit itself already reported.
     func noteStrokeExhaustion(_ reason: StrokeExhaustionReason) {

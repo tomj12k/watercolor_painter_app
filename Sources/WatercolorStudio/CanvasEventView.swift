@@ -233,6 +233,9 @@ public final class CanvasEventView: MTKView {
     private var strokePreviewStarted = false
     private var deferredStrokeQueue: [(stroke: StrokeCommand, reason: StrokeExhaustionReason?)] = []
     private var deferredStrokeDrainTask: Task<Void, Never>?
+    /// How long a deferred stroke may wait for the renderer before it is
+    /// dropped and reported. Adjustable so tests need not wait five seconds.
+    var deferredStrokeCompletionTimeout: Duration = .seconds(5)
     private var panAnchor: CGPoint?
     private var spaceKeyDown = false
 
@@ -290,7 +293,13 @@ public final class CanvasEventView: MTKView {
             return
         }
 
-        self.model.cancelStrokePreview()
+        // Cancelling publishes the outgoing model's capabilities, and this
+        // path also runs inside a SwiftUI view update — defer it, like the
+        // pan clamp above.
+        let outgoingModel = self.model
+        Task { @MainActor in
+            outgoingModel.cancelStrokePreview()
+        }
         strokeBuilder = nil
         strokePreviewStarted = false
         deferredStrokeQueue.removeAll()
@@ -513,7 +522,10 @@ public final class CanvasEventView: MTKView {
         let model = model
         Task { @MainActor [weak self] in
             await model.commitStrokePreview(stroke)
-            self?.requestCanvasDraw()
+            // The commit belongs to its own model; the view refresh does not
+            // once the view has been handed a different model.
+            guard let self, self.model === model else { return }
+            self.requestCanvasDraw()
         }
     }
 
@@ -536,14 +548,17 @@ public final class CanvasEventView: MTKView {
         let model = model
         deferredStrokeDrainTask = Task { @MainActor [weak self] in
             while let self, self.model === model, !self.deferredStrokeQueue.isEmpty {
-                let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+                let deadline = ContinuousClock.now.advanced(by: self.deferredStrokeCompletionTimeout)
                 while !model.canModifyProject, ContinuousClock.now < deadline {
                     try? await Task.sleep(for: .milliseconds(8))
                 }
                 guard model.canModifyProject else {
                     // The renderer never freed up; dropping the queue keeps
-                    // new painting possible instead of blocking it forever.
+                    // new painting possible instead of blocking it forever —
+                    // and the customer is told the paint could not land.
+                    let droppedStrokeCount = self.deferredStrokeQueue.count
                     self.deferredStrokeQueue.removeAll()
+                    model.noteDroppedDeferredStrokes(count: droppedStrokeCount)
                     break
                 }
                 let entry = self.deferredStrokeQueue.removeFirst()
@@ -579,8 +594,9 @@ public final class CanvasEventView: MTKView {
         Task { @MainActor [weak self] in
             await model.commitStrokePreview(stroke)
             model.noteStrokeExhaustion(reason)
-            self?.requestCanvasDraw()
-            self?.updateInputAvailability()
+            guard let self, self.model === model else { return }
+            self.requestCanvasDraw()
+            self.updateInputAvailability()
         }
         updateInputAvailability()
     }
