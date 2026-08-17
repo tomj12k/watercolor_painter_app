@@ -168,7 +168,7 @@ public struct BrushSettings: Codable, Equatable, Sendable {
         water: Double,
         granulation: Double,
         edgeBloom: Double,
-        behaviorVersion: Int = 1,
+        behaviorVersion: Int = 2,
         spacing: Double = 0.18,
         rotation: Double = 0,
         bristleStrength: Double = 0.5,
@@ -273,7 +273,7 @@ public struct BrushSettings: Codable, Equatable, Sendable {
         water: 0.6,
         granulation: 0.2,
         edgeBloom: 0.15,
-        behaviorVersion: 1,
+        behaviorVersion: 2,
         spacing: 0.18,
         rotation: 0,
         bristleStrength: 0.5,
@@ -708,7 +708,7 @@ public struct PaintingProject: Codable, Equatable, Sendable {
         else {
             throw ProjectValidationError.invalidBrushParameter(stroke.id)
         }
-        guard (0...1).contains(brush.behaviorVersion),
+        guard (0...2).contains(brush.behaviorVersion),
               brush.spacing.isFinite,
               (0.08...0.60).contains(brush.spacing),
               brush.rotation.isFinite,

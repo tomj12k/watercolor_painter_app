@@ -27,7 +27,7 @@ import Testing
         #expect(BrushSettings.default.style == .transparentWash)
         #expect(BrushSettings.default.shape == .round)
         #expect(BrushSettings.default.hair == .sable)
-        #expect(BrushSettings.default.behaviorVersion == 1)
+        #expect(BrushSettings.default.behaviorVersion == 2)
         #expect(BrushSettings.default.spacing == 0.18)
         #expect(BrushSettings.default.rotation == 0)
         #expect(BrushSettings.default.bristleStrength == 0.5)
@@ -100,7 +100,7 @@ import Testing
         try projectFixture(brush: lowerBounds).validate()
 
         var upperBounds = BrushSettings.default
-        upperBounds.behaviorVersion = 1
+        upperBounds.behaviorVersion = 2
         upperBounds.spacing = 0.60
         upperBounds.rotation = 180
         upperBounds.bristleStrength = 1
@@ -111,7 +111,7 @@ import Testing
     @Test func invalidBrushDynamicsFailValidation() {
         let invalidBrushes: [BrushSettings] = [
             configuredBrush { $0.behaviorVersion = -1 },
-            configuredBrush { $0.behaviorVersion = 2 },
+            configuredBrush { $0.behaviorVersion = 3 },
             configuredBrush { $0.spacing = .nan },
             configuredBrush { $0.spacing = .infinity },
             configuredBrush { $0.spacing = 0.08.nextDown },

@@ -35,6 +35,32 @@ struct RenderWorkBudget: Sendable {
         commandThreads = 0
     }
 
+    /// The largest number of simulation steps of the given dispatch shape that
+    /// still fits this budget. Submission-splitting replay uses this to close a
+    /// bounded command buffer and continue identical work in the next one.
+    func maximumConsumableSteps(
+        regionArea: Int,
+        sliceDepth: Int,
+        passCount: Int
+    ) -> Int {
+        guard let area = UInt64(exactly: regionArea),
+              let depth = UInt64(exactly: sliceDepth),
+              let passes = UInt64(exactly: passCount)
+        else { return 0 }
+        let (perSlice, sliceDidOverflow) = area.multipliedReportingOverflow(by: depth)
+        guard !sliceDidOverflow else { return 0 }
+        let (perStepThreads, passDidOverflow) = perSlice.multipliedReportingOverflow(by: passes)
+        guard !passDidOverflow, perStepThreads > 0 else { return 0 }
+        let remainingCommandThreads = maximumCommandThreads >= commandThreads
+            ? maximumCommandThreads - commandThreads
+            : 0
+        let remainingProjectThreads = maximumProjectThreads >= projectThreads
+            ? maximumProjectThreads - projectThreads
+            : 0
+        let remainingThreads = min(remainingCommandThreads, remainingProjectThreads)
+        return Int(clamping: remainingThreads / perStepThreads)
+    }
+
     mutating func consume(
         regionArea: Int,
         steps: Int,

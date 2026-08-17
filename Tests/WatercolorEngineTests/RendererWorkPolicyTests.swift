@@ -67,7 +67,7 @@ import Testing
         }
     }
 
-    @Test func replayCommandsShareTheProjectBudget() throws {
+    @Test func projectThreadsPersistAcrossCommandBoundaries() throws {
         let policy = RendererWorkPolicy(
             maximumCommandThreads: 100,
             maximumProjectThreads: 150

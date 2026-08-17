@@ -16,6 +16,11 @@ struct WatercolorStudioApp: App {
         .commands {
             StudioAppCommands()
         }
+
+        Window("Watercolor Studio Help", id: StudioHelp.windowIdentifier) {
+            StudioHelpView()
+        }
+        .defaultSize(width: 540, height: 640)
     }
 }
 

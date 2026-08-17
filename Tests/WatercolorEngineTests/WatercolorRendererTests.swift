@@ -63,6 +63,118 @@ import WatercolorCore
         #expect(mixed.blue > 0.1)
     }
 
+    // Fixed stroke identities keep the per-stroke noise seed constant, so
+    // comparison runs differ only by the parameter under test.
+    private static let strengthBaseStrokeID = UUID(
+        uuidString: "6E0D3E7A-4B21-4E5C-9A34-0F4F4B6E1A01"
+    )!
+    private static let strengthToolStrokeID = UUID(
+        uuidString: "6E0D3E7A-4B21-4E5C-9A34-0F4F4B6E1A02"
+    )!
+
+    private func strengthDot(
+        layerID: UUID,
+        tool: PaintTool,
+        opacity: Double,
+        behaviorVersion: Int
+    ) -> StrokeCommand {
+        var stroke = StrokeCommand.testDot(
+            id: Self.strengthToolStrokeID, layerID: layerID, tool: tool, pressure: 1
+        )
+        stroke.brush.opacity = opacity
+        stroke.brush.behaviorVersion = behaviorVersion
+        return stroke
+    }
+
+    private func alphaAfterErase(
+        device: MTLDevice,
+        opacity: Double,
+        behaviorVersion: Int
+    ) throws -> Double {
+        let project = PaintingProject.testCanvas(64)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let layerID = project.layers[0].id
+        try renderer.render(stroke: .testDot(
+            id: Self.strengthBaseStrokeID, layerID: layerID, tool: .brush, pressure: 1
+        ))
+        try renderer.render(stroke: strengthDot(
+            layerID: layerID, tool: .eraser, opacity: opacity, behaviorVersion: behaviorVersion
+        ))
+        return try renderer.debugPixel(x: 32, y: 32).alpha
+    }
+
+    // Saved paintings must not change: version-one tool strokes ignore
+    // opacity exactly as they always have.
+    @Test func legacyEraserStrokesIgnoreOpacity() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let low = try alphaAfterErase(device: device, opacity: 0.2, behaviorVersion: 1)
+        let full = try alphaAfterErase(device: device, opacity: 1.0, behaviorVersion: 1)
+        #expect(low == full)
+    }
+
+    @Test func versionTwoEraserStrengthControlsHowMuchPigmentLifts() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let gentle = try alphaAfterErase(device: device, opacity: 0.35, behaviorVersion: 2)
+        let full = try alphaAfterErase(device: device, opacity: 1.0, behaviorVersion: 2)
+        // A gentler eraser leaves noticeably more pigment behind.
+        #expect(gentle > full * 1.2)
+        // And full strength keeps the exact behavior version one produced.
+        let legacy = try alphaAfterErase(device: device, opacity: 1.0, behaviorVersion: 1)
+        #expect(full == legacy)
+    }
+
+    @Test func versionTwoDryStrengthControlsHowMuchWaterLifts() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        func wetnessAfterDry(opacity: Double, behaviorVersion: Int) throws -> Double {
+            let project = PaintingProject.testCanvas(64)
+            let renderer = try WatercolorRenderer(project: project, device: device)
+            let layerID = project.layers[0].id
+            try renderer.render(stroke: .testDot(
+                id: Self.strengthBaseStrokeID, layerID: layerID, tool: .water, pressure: 1
+            ))
+            try renderer.render(stroke: strengthDot(
+                layerID: layerID, tool: .dry, opacity: opacity, behaviorVersion: behaviorVersion
+            ))
+            return try renderer.debugWetness(x: 32, y: 32, layerID: layerID)
+        }
+        let gentle = try wetnessAfterDry(opacity: 0.3, behaviorVersion: 2)
+        let full = try wetnessAfterDry(opacity: 1.0, behaviorVersion: 2)
+        #expect(gentle > full * 1.2)
+        let legacy = try wetnessAfterDry(opacity: 1.0, behaviorVersion: 1)
+        #expect(full == legacy)
+    }
+
+    @Test func versionTwoSmudgeStrengthControlsPigmentMovement() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        func pigmentAfterSmudge(opacity: Double, behaviorVersion: Int) throws -> Double {
+            let project = PaintingProject.testCanvas(64)
+            let renderer = try WatercolorRenderer(project: project, device: device)
+            let layerID = project.layers[0].id
+            try renderer.render(stroke: .testDot(
+                id: Self.strengthBaseStrokeID, layerID: layerID, tool: .brush, pressure: 1
+            ))
+            var smudge = StrokeCommand.testLine(
+                id: Self.strengthToolStrokeID,
+                layerID: layerID,
+                color: PaintColor(red: 0, green: 0, blue: 0),
+                y: 32,
+                water: 0
+            )
+            smudge.tool = .smudge
+            smudge.brush.opacity = opacity
+            smudge.brush.behaviorVersion = behaviorVersion
+            try renderer.render(stroke: smudge)
+            // The trailing side of the drag: stronger smudges carry more
+            // pigment forward into this pixel.
+            return try renderer.debugPixel(x: 44, y: 32, layerID: layerID).alpha
+        }
+        let gentle = try pigmentAfterSmudge(opacity: 0.2, behaviorVersion: 2)
+        let full = try pigmentAfterSmudge(opacity: 1.0, behaviorVersion: 2)
+        #expect(gentle != full)
+        let legacy = try pigmentAfterSmudge(opacity: 1.0, behaviorVersion: 1)
+        #expect(full == legacy)
+    }
+
     @Test func eraserLowersConcentration() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
@@ -1594,13 +1706,21 @@ import WatercolorCore
     @Test func failedCanonicalAppendRejectsFinishUntilCancelledAndDoesNotPoisonRecovery() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
+        let injectedError = NSError(
+            domain: "WatercolorRendererTests",
+            code: 51,
+            userInfo: [NSLocalizedDescriptionKey: "canonical append execution failed"]
+        )
+        var shouldFailAppend = false
         let renderer = try WatercolorRenderer(
             project: project,
             device: device,
-            debugWorkPolicy: RendererWorkPolicy(
-                maximumCommandThreads: 12_000,
-                maximumProjectThreads: 1_000_000
-            )
+            debugCommandBufferError: { commandBuffer in
+                if shouldFailAppend, commandBuffer.label == "Watercolor stroke preview" {
+                    return injectedError
+                }
+                return commandBuffer.error
+            }
         )
         let checksumBefore = try renderer.compositeChecksum()
         var failedStroke = StrokeCommand.testDot(layerID: project.layers[0].id)
@@ -1619,15 +1739,15 @@ import WatercolorCore
         initial.points = [failedStroke.points[0]]
 
         let failedToken = try renderer.beginStrokePreview(initial)
-        await #expect(
-            throws: RendererError.workBudgetExceeded(required: 131_072, available: 12_000)
-        ) {
+        shouldFailAppend = true
+        await #expect(throws: RendererError.self) {
             try await renderer.appendStrokePreview(
                 id: failedStroke.id,
                 points: Array(failedStroke.points[1...]),
                 token: failedToken
             )
         }
+        shouldFailAppend = false
         await #expect(throws: RendererError.invalidStrokePreview) {
             try await renderer.finishStrokePreview(failedStroke, token: failedToken)
         }
@@ -1640,7 +1760,7 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 32, y: 32).alpha > 0.1)
     }
 
-    @Test func previewProjectBudgetSpansEveryDeltaInOneSemanticStroke() async throws {
+    @Test func previewAppendsEachDrawFromAFreshSubmissionBudget() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
         let workPolicy = RendererWorkPolicy(
@@ -1680,86 +1800,198 @@ import WatercolorCore
             points: Array(complete.points[1..<9]),
             token: splitToken
         )
-        let admittedPrefixChecksum = try splitRenderer.compositeChecksum()
         #expect(splitSubmissions == 1)
 
-        await #expect(throws: RendererError.self) {
-            try await splitRenderer.appendStrokePreview(
-                id: complete.id,
-                points: Array(complete.points[9..<17]),
-                token: splitToken
-            )
-        }
-        #expect(splitSubmissions == 1)
-        #expect(try splitRenderer.compositeChecksum() == admittedPrefixChecksum)
+        // A stroke of any length keeps painting: the second append draws from
+        // a fresh submission budget instead of exhausting a per-stroke total.
+        try await splitRenderer.appendStrokePreview(
+            id: complete.id,
+            points: Array(complete.points[9..<17]),
+            token: splitToken
+        )
+        #expect(splitSubmissions == 2)
         try splitRenderer.cancelStrokePreview(splitToken)
         #expect(try splitRenderer.compositeChecksum() == checksumBefore)
-
-        var singleSubmissionCount = 0
-        let singleRenderer = try WatercolorRenderer(
-            project: project,
-            device: device,
-            debugWorkPolicy: RendererWorkPolicy(
-                maximumCommandThreads: 140_000,
-                maximumProjectThreads: 300_000
-            ),
-            debugCommandBufferError: { commandBuffer in
-                if commandBuffer.label == "Watercolor stroke preview" {
-                    singleSubmissionCount += 1
-                }
-                return commandBuffer.error
-            }
-        )
-        let singleToken = try singleRenderer.beginStrokePreview(initial)
-        await #expect(
-            throws: RendererError.workBudgetExceeded(required: 262_144, available: 140_000)
-        ) {
-            try await singleRenderer.appendStrokePreview(
-                id: complete.id,
-                points: Array(complete.points[1..<17]),
-                token: singleToken
-            )
-        }
-        #expect(singleSubmissionCount == 0)
-        #expect(try singleRenderer.compositeChecksum() == checksumBefore)
-        try singleRenderer.cancelStrokePreview(singleToken)
-
-        var finishSubmissionCount = 0
-        let finishRenderer = try WatercolorRenderer(
-            project: project,
-            device: device,
-            debugWorkPolicy: RendererWorkPolicy(
-                maximumCommandThreads: 140_000,
-                maximumProjectThreads: 145_000
-            ),
-            debugCommandBufferError: { commandBuffer in
-                if commandBuffer.label == "Commit watercolor stroke preview" {
-                    finishSubmissionCount += 1
-                }
-                return commandBuffer.error
-            }
-        )
-        var prefixThenTail = complete
-        prefixThenTail.points = Array(complete.points.prefix(9))
-        var finishInitial = prefixThenTail
-        finishInitial.points = [prefixThenTail.points[0]]
-        let finishToken = try finishRenderer.beginStrokePreview(finishInitial)
-        try await finishRenderer.appendStrokePreview(
-            id: prefixThenTail.id,
-            points: Array(prefixThenTail.points.dropFirst()),
-            token: finishToken
-        )
-
-        await #expect(
-            throws: RendererError.workBudgetExceeded(required: 147_456, available: 145_000)
-        ) {
-            try await finishRenderer.finishStrokePreview(prefixThenTail, token: finishToken)
-        }
-        #expect(finishSubmissionCount == 0)
-        #expect(try finishRenderer.compositeChecksum() == checksumBefore)
     }
 
-    @Test func previewCommandBudgetResetsBetweenAppendSubmissions() async throws {
+    @Test func repeatedStrokesSaturateEveryPixelToThePigmentColor() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(256)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var brush = BrushSettings.default
+        brush.size = 160
+        brush.opacity = 1
+        brush.flow = 1
+        brush.color = PaintColor(red: 0.02, green: 0.02, blue: 0.02)
+        for strokeIndex in 0..<12 {
+            let stroke = StrokeCommand(
+                layerID: project.layers[0].id,
+                tool: .brush,
+                brush: brush,
+                points: [StrokePoint(
+                    x: 128,
+                    y: 128,
+                    pressure: 1,
+                    tiltX: 0,
+                    tiltY: 0,
+                    time: Double(strokeIndex)
+                )]
+            )
+            try renderer.renderAndWait(stroke: stroke)
+        }
+
+        let image = try renderer.makeCGImage()
+        let data = try #require(image.dataProvider?.data)
+        let bytes = try #require(CFDataGetBytePtr(data))
+        let bytesPerRow = image.bytesPerRow
+        func luminance(_ x: Int, _ y: Int) -> Double {
+            let offset = y * bytesPerRow + x * 4
+            return (Double(bytes[offset]) + Double(bytes[offset + 1]) + Double(bytes[offset + 2]))
+                / (3 * 255)
+        }
+        var minimumLuminance = 1.0
+        var maximumLuminance = 0.0
+        for y in 100...156 {
+            for x in 100...156 {
+                let value = luminance(x, y)
+                minimumLuminance = min(minimumLuminance, value)
+                maximumLuminance = max(maximumLuminance, value)
+            }
+        }
+        // Paper tooth slows how fast pigment covers, but it must never cap
+        // coverage: enough passes saturate every pixel to the pigment color,
+        // with no fixed bright spots that paint can never conquer.
+        let saturatedPigment = PaintColor.sRGBComponent(fromLinear: 0.02)
+        #expect(maximumLuminance <= saturatedPigment + 0.03)
+        #expect(maximumLuminance - minimumLuminance <= 0.03)
+    }
+
+    @Test func densePaintCompositesWithoutPerPixelWhiteSpeckle() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(256)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var brush = BrushSettings.default
+        brush.size = 160
+        brush.opacity = 1
+        brush.flow = 1
+        brush.color = PaintColor(red: 0.05, green: 0.05, blue: 0.05)
+        for strokeIndex in 0..<3 {
+            let stroke = StrokeCommand(
+                layerID: project.layers[0].id,
+                tool: .brush,
+                brush: brush,
+                points: [StrokePoint(
+                    x: 128,
+                    y: 128,
+                    pressure: 1,
+                    tiltX: 0,
+                    tiltY: 0,
+                    time: Double(strokeIndex)
+                )]
+            )
+            try renderer.renderAndWait(stroke: stroke)
+        }
+
+        let image = try renderer.makeCGImage()
+        let data = try #require(image.dataProvider?.data)
+        let bytes = try #require(CFDataGetBytePtr(data))
+        let bytesPerRow = image.bytesPerRow
+        func luminance(_ x: Int, _ y: Int) -> Double {
+            let offset = y * bytesPerRow + x * 4
+            // BGRA little-endian: average the three color channels.
+            return (Double(bytes[offset]) + Double(bytes[offset + 1]) + Double(bytes[offset + 2]))
+                / (3 * 255)
+        }
+        var maximumAdjacentJump = 0.0
+        for y in 100...156 {
+            for x in 96...159 {
+                maximumAdjacentJump = max(
+                    maximumAdjacentJump,
+                    abs(luminance(x + 1, y) - luminance(x, y))
+                )
+            }
+        }
+        // The composite's paper grain must read as soft mottling, not
+        // per-pixel noise: in dense dark paint an uncorrelated grain lets
+        // single white pixels bleed through as speckle.
+        #expect(maximumAdjacentJump <= 0.031)
+    }
+
+    @Test func granulatingTextureModulatesDepositsSmoothlyWithoutHardCellEdges() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.testCanvas(256)
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var brush = BrushSettings.default
+        brush.size = 160
+        brush.texture = .granulating
+        brush.textureStrength = 1
+        brush.opacity = 0.9
+        brush.flow = 0.9
+        let stroke = StrokeCommand(
+            layerID: project.layers[0].id,
+            tool: .brush,
+            brush: brush,
+            points: [StrokePoint(x: 128, y: 128, pressure: 1, tiltX: 0, tiltY: 0, time: 0)]
+        )
+        try renderer.renderAndWait(stroke: stroke)
+
+        let fields = try renderer.debugLayerFields(layerID: project.layers[0].id)
+        var maximumDeposit = 0.0
+        var maximumAdjacentJump = 0.0
+        for y in 100...156 {
+            for x in 96...159 {
+                let here = try fields.pigmentColor(x: x, y: y).alpha
+                let right = try fields.pigmentColor(x: x + 1, y: y).alpha
+                maximumDeposit = max(maximumDeposit, here)
+                maximumAdjacentJump = max(maximumAdjacentJump, abs(right - here))
+            }
+        }
+        #expect(maximumDeposit > 0.01)
+        // Texture must modulate the deposit as a smooth field: a hard cell
+        // border changes the deposit by most of its range within one pixel,
+        // which reads as blocks of paint appearing or missing, especially
+        // where strokes overlap.
+        #expect(maximumAdjacentJump <= maximumDeposit * 0.35)
+    }
+
+    @Test func longContinuousStrokeSimulatesABoundedTrailingWindow() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let layer = PaintLayer(name: "Layer 1")
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 1_600, height: 1_200),
+            paper: .coldPress,
+            layers: [layer]
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let points: [StrokePoint] = (0..<360).map { (index: Int) -> StrokePoint in
+            StrokePoint(
+                x: 40 + Double(index) * 4,
+                y: 600,
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index)
+            )
+        }
+        let stroke = StrokeCommand(
+            layerID: layer.id,
+            tool: .brush,
+            brush: .default,
+            points: points
+        )
+
+        try renderer.renderAndWait(stroke: stroke)
+
+        // The wet simulation follows the brush in a bounded trailing window.
+        // Without the bound, the region spans the whole stroke path and every
+        // batch re-simulates everything drawn so far, so long strokes lag
+        // more the longer the customer keeps painting.
+        let largestRegion = renderer.debugLastStrokeDispatch.simulationRegion
+        #expect(largestRegion.width > 0)
+        #expect(largestRegion.width <= 1_000)
+    }
+
+    @Test func oversizedPreviewAppendSplitsAcrossBoundedSubmissions() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.testCanvas(64)
         var previewSubmissions = 0
@@ -1792,19 +2024,23 @@ import WatercolorCore
         initial.points = [complete.points[0]]
         let token = try renderer.beginStrokePreview(initial)
 
+        // One large append exceeds a single submission budget; it must split
+        // into bounded submissions instead of failing, so a queued backlog
+        // can catch up to the cursor in one append call.
         try await renderer.appendStrokePreview(
             id: complete.id,
-            points: Array(complete.points[1..<9]),
+            points: Array(complete.points[1..<17]),
             token: token
         )
-        try await renderer.appendStrokePreview(
-            id: complete.id,
-            points: Array(complete.points[9..<17]),
-            token: token
-        )
-
         #expect(previewSubmissions == 2)
-        try renderer.cancelStrokePreview(token)
+
+        try await renderer.finishStrokePreview(complete, token: token)
+        try renderer.recordRenderedStroke(complete)
+
+        var replayProject = project
+        replayProject.commands = [.stroke(complete)]
+        let replayRenderer = try WatercolorRenderer(project: replayProject, device: device)
+        #expect(try renderer.compositeChecksum() == replayRenderer.compositeChecksum())
     }
 
     @Test func previewCommandBudgetResetsForFinishSubmission() async throws {
@@ -2415,7 +2651,7 @@ import WatercolorCore
         ]
 
         #expect(
-            throws: RendererError.workBudgetExceeded(required: 819_200, available: 6_000)
+            throws: RendererError.workBudgetExceeded(required: 8_192, available: 6_000)
         ) {
             try renderer.replay(project: hostile)
         }
@@ -2570,7 +2806,7 @@ import WatercolorCore
         var replaySubmissions = 0
 
         #expect(
-            throws: RendererError.workBudgetExceeded(required: 819_200, available: 6_000)
+            throws: RendererError.workBudgetExceeded(required: 8_192, available: 6_000)
         ) {
             _ = try WatercolorRenderer(
                 project: hostile,
@@ -2623,7 +2859,7 @@ import WatercolorCore
         ]
 
         #expect(
-            throws: RendererError.workBudgetExceeded(required: 819_200, available: 6_000)
+            throws: RendererError.workBudgetExceeded(required: 8_192, available: 6_000)
         ) {
             _ = try renderer.makeCandidate(project: hostile)
         }
@@ -2635,7 +2871,7 @@ import WatercolorCore
         #expect(try renderer.debugPixel(x: 32, y: 32).alpha > 0.1)
     }
 
-    @Test func replayCommandBudgetAccumulatesAcrossStrokeBatches() throws {
+    @Test func replayWorkAcrossPaintingCommandsSplitsIntoBoundedSubmissions() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let original = PaintingProject.testCanvas(64)
         var replaySubmissions = 0
@@ -2643,51 +2879,7 @@ import WatercolorCore
             project: original,
             device: device,
             debugWorkPolicy: RendererWorkPolicy(
-                maximumCommandThreads: 140_000,
-                maximumProjectThreads: 200_000
-            ),
-            debugCommandBufferError: { commandBuffer in
-                if commandBuffer.label == "Watercolor replay" {
-                    replaySubmissions += 1
-                }
-                return commandBuffer.error
-            }
-        )
-        replaySubmissions = 0
-        var batchedStroke = StrokeCommand.testDot(layerID: original.layers[0].id)
-        batchedStroke.points = (0..<9).map { index in
-            StrokePoint(
-                x: 32,
-                y: 32,
-                pressure: 1,
-                tiltX: 0,
-                tiltY: 0,
-                time: Double(index)
-            )
-        }
-        var hostile = original
-        hostile.commands = [.stroke(batchedStroke)]
-
-        #expect(
-            throws: RendererError.workBudgetExceeded(required: 147_456, available: 140_000)
-        ) {
-            try renderer.replay(project: hostile)
-        }
-
-        #expect(replaySubmissions == 0)
-        #expect(renderer.project == original)
-        try renderer.renderAndWait(stroke: .testDot(layerID: original.layers[0].id))
-    }
-
-    @Test func replayProjectBudgetAccumulatesAcrossPaintingCommands() throws {
-        guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let original = PaintingProject.testCanvas(64)
-        var replaySubmissions = 0
-        let renderer = try WatercolorRenderer(
-            project: original,
-            device: device,
-            debugWorkPolicy: RendererWorkPolicy(
-                maximumCommandThreads: 6_000,
+                maximumCommandThreads: 8_000,
                 maximumProjectThreads: 10_000
             ),
             debugCommandBufferError: { commandBuffer in
@@ -2698,21 +2890,17 @@ import WatercolorCore
             }
         )
         replaySubmissions = 0
-        var hostile = original
-        hostile.commands = [
+        var heavy = original
+        heavy.commands = [
             .stroke(.testDot(layerID: original.layers[0].id)),
             .clearLayer(LayerCommand(layerID: original.layers[0].id)),
             .stroke(.testDot(layerID: original.layers[0].id))
         ]
 
-        #expect(
-            throws: RendererError.workBudgetExceeded(required: 11_552, available: 10_000)
-        ) {
-            try renderer.replay(project: hostile)
-        }
+        try renderer.replay(project: heavy)
 
-        #expect(replaySubmissions == 0)
-        #expect(renderer.project == original)
+        #expect(replaySubmissions > 1)
+        #expect(renderer.project == heavy)
         try renderer.renderAndWait(stroke: .testDot(layerID: original.layers[0].id))
     }
 
@@ -3591,7 +3779,9 @@ import WatercolorCore
 
         print("Salt stability characterization: \(phenotypeDiagnostics(salt.metrics))")
         #expect(salt.metrics.voidRatio >= 0.015)
-        #expect(salt.metrics.edgeRoughness >= 1.55)
+        // Floor calibrated with the smooth-grain field; salt's ringed edges
+        // stay far rougher than any smooth texture's.
+        #expect(salt.metrics.edgeRoughness >= 1.5)
     }
 
     @Test func versionOneStableFieldsRemainFiniteForTinyRotatedEdgeStampsOnEveryPaper() throws {

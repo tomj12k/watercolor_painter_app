@@ -56,6 +56,237 @@ import WatercolorCore
         )
     }
 
+    @Test @MainActor func eachToolRemembersItsOwnSettings() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device)
+        )
+
+        // The brush keeps its pigment defaults.
+        #expect(model.brush.opacity == BrushSettings.default.opacity)
+        model.setBrushSize(120)
+
+        // Strength tools start at full strength, matching how they always
+        // behaved before strength became adjustable.
+        model.selectedTool = .eraser
+        #expect(model.brush.opacity == 1)
+        model.setBrushSize(60)
+
+        // Each tool's changes survive switching away and back.
+        model.selectedTool = .water
+        model.selectedTool = .eraser
+        #expect(model.brush.size == 60)
+        model.selectedTool = .brush
+        #expect(model.brush.size == 120)
+        #expect(model.brush.opacity == BrushSettings.default.opacity)
+
+        // Every non-brush tool carries full default strength.
+        for tool in [PaintTool.smudge, .smear, .dry] {
+            model.selectedTool = tool
+            #expect(model.brush.opacity == 1, "tool \(tool) should default to full strength")
+        }
+
+        // New strokes carry the strength-capable behavior version.
+        #expect(model.brush.behaviorVersion == 2)
+    }
+
+    @Test @MainActor func previewDrainSizeAlignsWithTheRendererStampBatchStride() {
+        // Wet simulation runs between stamp batches. A drain size off the
+        // batch stride would shift batch boundaries between live preview
+        // and replay, so live pixels would diverge from reopen.
+        #expect(StudioModel.previewPointDrainLimit % WatercolorRenderer.stampBatchSize == 0)
+        #expect(StudioModel.previewPointDrainLimit > 0)
+    }
+
+    @Test @MainActor func routineLimitsRaiseANoticeInsteadOfAModalError() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let maximumCommandCount = 2
+        var project = PaintingProject.studioTestProject()
+        project.commands = (0..<maximumCommandCount).map { _ in
+            .clearLayer(LayerCommand(layerID: UUID()))
+        }
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugProjectAdmissionLimits: ProjectAdmissionLimits(
+                maximumCommandCount: maximumCommandCount,
+                maximumTotalStrokePointCount: 128,
+                maximumSerializedStorageBytes: 1_048_576
+            ),
+            debugCommandBufferError: { $0.error }
+        )
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            maximumCommandCount: maximumCommandCount,
+            maximumTotalStrokePointCount: 128,
+            maximumSerializedStorageBytes: 1_048_576
+        )
+
+        // A stroke refused at a document limit is a routine event: it must
+        // inform without interrupting, so it may never raise a modal alert.
+        model.completeStroke(.studioTestStroke(layerID: project.layers[0].id))
+        #expect(model.error == nil)
+        #expect(model.notice?.message.contains("command capacity") == true)
+        #expect(model.notice?.code == .capacity)
+
+        // A capacity-ended-but-saved stroke and dropped queued strokes are
+        // the same kind of event.
+        model.dismissNotice()
+        #expect(model.notice == nil)
+        model.noteStrokeExhaustion(.pointCapacity(maximumPointCount: 2))
+        #expect(model.error == nil)
+        #expect(model.notice?.message.contains("ended and saved") == true)
+
+        model.noteDroppedDeferredStrokes(count: 2)
+        #expect(model.error == nil)
+        #expect(model.notice?.message.contains("could not be painted") == true)
+    }
+
+    @Test @MainActor func capacityLimitsCarryTheCapacityCategoryAndAccurateRecovery() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let maximumCommandCount = 2
+        var project = PaintingProject.studioTestProject()
+        project.commands = (0..<maximumCommandCount).map { _ in
+            .clearLayer(LayerCommand(layerID: UUID()))
+        }
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugProjectAdmissionLimits: ProjectAdmissionLimits(
+                maximumCommandCount: maximumCommandCount,
+                maximumTotalStrokePointCount: 128,
+                maximumSerializedStorageBytes: 1_048_576
+            ),
+            debugCommandBufferError: { $0.error }
+        )
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            maximumCommandCount: maximumCommandCount,
+            maximumTotalStrokePointCount: 128,
+            maximumSerializedStorageBytes: 1_048_576
+        )
+
+        model.completeStroke(.studioTestStroke(layerID: project.layers[0].id))
+
+        let failure = try #require(model.notice)
+        #expect(failure.message.contains("command capacity"))
+        #expect(failure.code.rawValue == "WC-CAPACITY-001")
+        #expect(!failure.recoverySuggestion.contains("Try the operation again"))
+        #expect(failure.recoverySuggestion.contains("Undo"))
+        #expect(failure.diagnostic.errorCode == "WC-CAPACITY-001")
+        #expect(failure.diagnostic.canvasWidth == project.canvas.width)
+        #expect(failure.diagnostic.commandCount == project.commands.count)
+
+        let storageProject = PaintingProject.studioTestProject()
+        let storageModel = StudioModel(
+            project: storageProject,
+            renderer: try WatercolorRenderer(project: storageProject, device: device),
+            maximumSerializedStorageBytes: 6_000
+        )
+        storageModel.completeStroke(.studioTestStroke(layerID: storageProject.layers[0].id))
+        let storageFailure = try #require(storageModel.notice)
+        #expect(storageFailure.message.contains("document storage capacity"))
+        #expect(storageFailure.code.rawValue == "WC-CAPACITY-001")
+        #expect(!storageFailure.recoverySuggestion.contains("Try the operation again"))
+
+        let pointProject = PaintingProject.studioPointCapacityProject(pointCount: 3)
+        let pointModel = StudioModel(
+            project: pointProject,
+            renderer: try WatercolorRenderer(
+                project: pointProject,
+                device: device,
+                debugProjectAdmissionLimits: ProjectAdmissionLimits(
+                    maximumCommandCount: 8,
+                    maximumTotalStrokePointCount: 4,
+                    maximumSerializedStorageBytes: 1_048_576
+                ),
+                debugCommandBufferError: { $0.error }
+            ),
+            maximumCommandCount: 8,
+            maximumTotalStrokePointCount: 4,
+            maximumSerializedStorageBytes: 1_048_576
+        )
+        var pointStroke = StrokeCommand.studioTestStroke(layerID: pointProject.layers[0].id)
+        pointStroke.points.append(
+            StrokePoint(x: 129, y: 128, pressure: 1, tiltX: 0, tiltY: 0, time: 1)
+        )
+        pointModel.completeStroke(pointStroke)
+        let pointFailure = try #require(pointModel.notice)
+        #expect(pointFailure.message.contains("point capacity"))
+        #expect(pointFailure.code.rawValue == "WC-CAPACITY-001")
+        #expect(!pointFailure.recoverySuggestion.contains("Try the operation again"))
+    }
+
+    @Test @MainActor func capacityWarningAppearsAtNinetyPercentAndNamesTheAction() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let maximumCommandCount = 10
+        let limits = ProjectAdmissionLimits(
+            maximumCommandCount: maximumCommandCount,
+            maximumTotalStrokePointCount: 1_024,
+            maximumSerializedStorageBytes: 8_388_608
+        )
+        var project = PaintingProject.studioTestProject()
+        project.commands = (0..<8).map { _ in
+            .clearLayer(LayerCommand(layerID: project.layers[0].id))
+        }
+        func makeModel(_ project: PaintingProject) throws -> StudioModel {
+            StudioModel(
+                project: project,
+                renderer: try WatercolorRenderer(
+                    project: project,
+                    device: device,
+                    debugProjectAdmissionLimits: limits,
+                    debugCommandBufferError: { $0.error }
+                ),
+                maximumCommandCount: maximumCommandCount,
+                maximumTotalStrokePointCount: 1_024,
+                maximumSerializedStorageBytes: 8_388_608
+            )
+        }
+
+        // Below the threshold, no warning distracts from painting.
+        let model = try makeModel(project)
+        #expect(model.capacityWarning == nil)
+
+        // At nine of ten commands the indicator appears and names the action.
+        model.completeStroke(.studioTestStroke(layerID: project.layers[0].id))
+        let warning = try #require(model.capacityWarning)
+        #expect(warning.contains("90%"))
+        #expect(warning.contains("new document"))
+
+        // Painting the final command moves the indicator to one hundred percent.
+        model.completeStroke(.studioTestStroke(layerID: project.layers[0].id, x: 96))
+        #expect(model.project.commands.count == maximumCommandCount)
+        #expect(model.capacityWarning?.contains("100%") == true)
+
+        // Undoing history clears the warning again.
+        model.undo()
+        model.undo()
+        #expect(model.project.commands.count == 8)
+        #expect(model.capacityWarning == nil)
+    }
+
+    @Test @MainActor func strokeExhaustionNoticeUsesTheCapacityCategoryWithItsOwnRecovery() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device)
+        )
+
+        model.noteStrokeExhaustion(.pointCapacity(maximumPointCount: 12))
+
+        let failure = try #require(model.notice)
+        #expect(failure.message == "This stroke reached its 12-point limit, so Watercolor Studio ended and saved it there.")
+        #expect(failure.recoverySuggestion == "Start a new stroke to keep painting.")
+        #expect(failure.code.rawValue == "WC-CAPACITY-001")
+        #expect(failure.diagnostic.canvasWidth == project.canvas.width)
+    }
+
     @Test func unknownFailureDoesNotExposeRawPathsOrIdentifiers() {
         let raw = NSError(
             domain: "SensitiveSubsystem",
@@ -149,7 +380,7 @@ import WatercolorCore
         #expect(model.project.commands.count == maximumCommandCount)
         #expect(model.rendererProject.commands.count == maximumCommandCount)
         #expect(documentUpdates.isEmpty)
-        #expect(model.error?.message.contains("2") == true)
+        #expect(model.notice?.message.contains("2") == true)
         #expect(try renderer.studioChecksum() == checksumBefore)
 
         model.completeStroke(stroke)
@@ -157,7 +388,7 @@ import WatercolorCore
         #expect(model.project.commands.count == maximumCommandCount)
         #expect(model.rendererProject.commands.count == maximumCommandCount)
         #expect(documentUpdates.isEmpty)
-        #expect(model.error?.message.contains("2") == true)
+        #expect(model.notice?.message.contains("2") == true)
         #expect(try renderer.studioChecksum() == checksumBefore)
     }
 
@@ -193,7 +424,7 @@ import WatercolorCore
         #expect(model.project.commands.count == project.commands.count)
         #expect(model.rendererProject.commands.count == project.commands.count)
         #expect(documentUpdates.isEmpty)
-        #expect(model.error?.message.contains("point capacity") == true)
+        #expect(model.notice?.message.contains("point capacity") == true)
         #expect(try renderer.studioChecksum() == checksumBefore)
     }
 
@@ -212,7 +443,7 @@ import WatercolorCore
         let checksumBefore = try renderer.studioChecksum()
 
         #expect(model.beginStrokePreview(stroke) == .unavailable)
-        #expect(model.error?.message.contains("document storage capacity") == true)
+        #expect(model.notice?.message.contains("document storage capacity") == true)
         #expect(!model.isStrokePreviewActive)
 
         model.completeStroke(stroke)
@@ -220,7 +451,7 @@ import WatercolorCore
         #expect(model.project == project)
         #expect(model.rendererProject == project)
         #expect(documentUpdates.isEmpty)
-        #expect(model.error?.message.contains("document storage capacity") == true)
+        #expect(model.notice?.message.contains("document storage capacity") == true)
         #expect(try renderer.studioChecksum() == checksumBefore)
     }
 
@@ -343,7 +574,7 @@ import WatercolorCore
         #expect(model.project.commands.count == project.commands.count)
         #expect(model.rendererProject.commands.count == project.commands.count)
         #expect(documentUpdates.isEmpty)
-        #expect(model.error?.message.contains("point capacity") == true)
+        #expect(model.notice?.message.contains("point capacity") == true)
         #expect(try renderer.studioChecksum() == checksumBefore)
     }
 
@@ -404,7 +635,7 @@ import WatercolorCore
         #expect(updates == [model.project])
     }
 
-    @Test func queuedPreviewPointsSplitIntoBoundedRendererSubmissions() async throws {
+    @Test func queuedPreviewPointsDrainInAdaptiveBoundedSubmissions() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
         let renderer = try WatercolorRenderer(project: project, device: device)
@@ -427,22 +658,33 @@ import WatercolorCore
         )
         #expect(model.beginStrokePreview(stroke) == .accepted)
 
-        let queuedIndices: [Int] = Array(1...33)
-        let queuedPoints: [StrokePoint] = queuedIndices.map { index in
-            StrokePoint(
-                x: Double(48 + index * 3),
-                y: Double(96 + (index % 5) * 2),
-                pressure: 1,
-                tiltX: 0,
-                tiltY: 0,
-                time: Double(index) / 120
-            )
+        // A queued backlog drains in one submission, so paint catches up to
+        // the cursor instead of trickling out eight points per GPU round-trip.
+        let queuedPoints: [StrokePoint] = (1...33).map { (index: Int) -> StrokePoint in
+            let x = Double(48 + index * 3)
+            let y = Double(96 + (index % 5) * 2)
+            let time = Double(index) / 120
+            return StrokePoint(x: x, y: y, pressure: 1, tiltX: 0, tiltY: 0, time: time)
         }
         model.appendStrokePreview(id: stroke.id, points: queuedPoints)
         await model.waitForStrokePreviewIdle()
 
-        #expect(submittedPointCounts == [8, 8, 8, 8, 1])
-        #expect(submittedPointCounts.allSatisfy { $0 <= 8 })
+        #expect(submittedPointCounts == [33])
+        #expect(model.error == nil)
+
+        // An extreme backlog is still bounded per submission, so cancellation
+        // never waits behind one enormous in-flight append.
+        let hugeBacklog: [StrokePoint] = (34...400).map { (index: Int) -> StrokePoint in
+            let x = Double(48 + (index % 100) * 3)
+            let y = Double(96 + (index % 5) * 2)
+            let time = Double(index) / 120
+            return StrokePoint(x: x, y: y, pressure: 1, tiltX: 0, tiltY: 0, time: time)
+        }
+        submittedPointCounts = []
+        model.appendStrokePreview(id: stroke.id, points: hugeBacklog)
+        await model.waitForStrokePreviewIdle()
+
+        #expect(submittedPointCounts == [64, 64, 64, 64, 64, 47])
         #expect(model.error == nil)
     }
 
@@ -484,49 +726,6 @@ import WatercolorCore
         #expect(model.project.commands == [.stroke(stroke)])
         let replayed = try WatercolorRenderer(project: model.project, device: device)
         #expect(try renderer.studioChecksum() == replayed.studioChecksum())
-    }
-
-    @Test func largeQueuedPreviewDrainsWithoutGrowingThePendingQueue() async throws {
-        guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let project = PaintingProject.studioTestProject()
-        let renderer = try WatercolorRenderer(project: project, device: device)
-        var submittedPointCounts: [Int] = []
-        let operation = StrokePreviewRendererOperation(
-            update: { _, _, points, _ in
-                submittedPointCounts.append(points.count)
-            },
-            finish: { _, _, _ in }
-        )
-        let model = StudioModel(
-            project: project,
-            renderer: renderer,
-            strokePreviewOperation: operation
-        )
-        let stroke = StrokeCommand.studioTestStroke(
-            layerID: project.layers[0].id,
-            x: 48,
-            y: 96
-        )
-        #expect(model.beginStrokePreview(stroke) == .accepted)
-        let queuedIndices: [Int] = Array(1...4_096)
-        let queuedPoints: [StrokePoint] = queuedIndices.map { index in
-            StrokePoint(
-                x: Double(48 + (index % 64) * 2),
-                y: Double(96 + ((index * 13) % 64) * 2),
-                pressure: 1,
-                tiltX: 0,
-                tiltY: 0,
-                time: Double(index) / 120
-            )
-        }
-        model.appendStrokePreview(id: stroke.id, points: queuedPoints)
-        await model.waitForStrokePreviewIdle()
-
-        #expect(submittedPointCounts.count == 512)
-        #expect(submittedPointCounts.allSatisfy { $0 == 8 })
-        #expect(model.pendingStrokePreviewPointCountForTesting == 0)
-        #expect(model.pendingStrokePreviewCompactionCountForTesting == 1)
-        #expect(model.error == nil)
     }
 
     @Test func multiUpdatePreviewCommitExactlyMatchesFreshSemanticReplay() async throws {
@@ -1173,6 +1372,9 @@ import WatercolorCore
         #expect(documentUpdates.isEmpty)
         #expect(!model.capabilities.canPaint)
         #expect(model.rendererRecoveryError != nil)
+        // One report per failure: the recovery banner owns the message and
+        // the Try Again control, so no modal alert may appear on top of it.
+        #expect(model.error == nil)
         #expect(
             model.beginStrokePreview(.studioTestStroke(layerID: project.layers[0].id))
                 == .unavailable
@@ -1186,6 +1388,76 @@ import WatercolorCore
         #expect(model.rendererRecoveryError == nil)
         #expect(model.capabilities.canPaint)
         #expect(model.rendererCheckpointCountForTesting == 0)
+    }
+
+    @Test func retryRendererRecoveryRestoresPaintingWithoutAStructuralEdit() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let injectedError = NSError(
+            domain: "StudioModelTests",
+            code: 47,
+            userInfo: [NSLocalizedDescriptionKey: "preview restoration failed"]
+        )
+        var shouldFailReplay = false
+        let renderer = try WatercolorRenderer(
+            project: project,
+            device: device,
+            debugCommandBufferError: { commandBuffer in
+                if shouldFailReplay, commandBuffer.label == "Watercolor replay" {
+                    return injectedError
+                }
+                return commandBuffer.error
+            }
+        )
+        let finish = ControlledPreviewSuspension()
+        var documentUpdates: [PaintingProject] = []
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            onDocumentUpdate: { documentUpdates.append($0) },
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, id, points, token in
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
+                },
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
+                    _ = try await finish.suspendOnce()
+                }
+            )
+        )
+        let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
+
+        #expect(model.beginStrokePreview(stroke) == .accepted)
+        let commit = Task { @MainActor in
+            await model.commitStrokePreview(stroke)
+        }
+        await finish.waitUntilSuspended()
+        shouldFailReplay = true
+        model.cancelStrokePreview()
+        await model.waitForStrokePreviewCancellation()
+        await finish.resume()
+        await commit.value
+        #expect(model.rendererRecoveryError != nil)
+        #expect(!model.capabilities.canPaint)
+
+        // A retry that fails keeps the recovery state and reports why.
+        model.retryRendererRecovery()
+        #expect(model.rendererRecoveryError != nil)
+        #expect(!model.capabilities.canPaint)
+        #expect(model.error != nil)
+
+        // A retry that succeeds restores painting without a structural edit.
+        shouldFailReplay = false
+        model.retryRendererRecovery()
+        #expect(model.rendererRecoveryError == nil)
+        #expect(model.capabilities.canPaint)
+        #expect(model.error == nil)
+        #expect(model.project == project)
+        #expect(documentUpdates.isEmpty)
+
+        model.completeStroke(.studioTestStroke(layerID: project.layers[0].id))
+        #expect(model.project.commands.count == 1)
+        #expect(model.error == nil)
     }
 
     @Test func failedPreviewCancellationRestoreDisablesPainting() async throws {
@@ -1586,6 +1858,7 @@ import WatercolorCore
 
         #expect(model.project == project)
         #expect(model.rendererRecoveryError != nil)
+        #expect(model.error == nil)
         #expect(!model.capabilities.canPaint)
     }
 
@@ -1997,7 +2270,7 @@ import WatercolorCore
         #expect(documentUpdates == [model.project])
     }
 
-    @Test func selectingPaperPublishesAndReplaysTheProject() throws {
+    @Test func selectingPaperPublishesAndReplaysTheProject() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
         let renderer = try WatercolorRenderer(project: project, device: device)
@@ -2009,6 +2282,7 @@ import WatercolorCore
         )
 
         model.selectPaper(.rough)
+        await model.waitForStructuralChanges()
 
         #expect(model.project.paper == .rough)
         #expect(model.selectedLayerID == project.layers[0].id)
@@ -2016,7 +2290,7 @@ import WatercolorCore
         #expect(documentUpdates == [model.project])
     }
 
-    @Test func changingPaperReplaysPaintedRasterExactlyAsTheSavedProjectReopens() throws {
+    @Test func changingPaperReplaysPaintedRasterExactlyAsTheSavedProjectReopens() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         var project = PaintingProject.studioTestProject()
         let stroke = StrokeCommand.studioTestStroke(layerID: project.layers[0].id)
@@ -2030,6 +2304,7 @@ import WatercolorCore
         )
 
         model.selectPaper(.rough)
+        await model.waitForStructuralChanges()
 
         let reopenedProject = try PaintingDocumentCodec.decode(
             PaintingDocumentCodec.encode(model.project)
@@ -2071,7 +2346,7 @@ import WatercolorCore
         #expect(!model.capabilities.canUndo)
     }
 
-    @Test func failedPaperReplayPreservesTheLiveModelRendererAndDocument() throws {
+    @Test func failedPaperReplayPreservesTheLiveModelRendererAndDocument() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         var project = PaintingProject.studioTestProject()
         project.commands = [
@@ -2109,6 +2384,7 @@ import WatercolorCore
         shouldFail = true
 
         model.selectPaper(.rough)
+        await model.waitForStructuralChanges()
 
         #expect(model.project == project)
         #expect(model.rendererProject == project)
@@ -2122,6 +2398,9 @@ import WatercolorCore
         #expect(model.canvasWetness == canvasWetness)
         #expect(model.error?.code == .gpuExecution)
         #expect(failedReplayCount == 1)
+        // The failed change leaves the picker on the paper that is actually
+        // in use, never stuck showing a choice that did not apply.
+        #expect(model.displayedPaper == project.paper)
     }
 
     @Test func brushSizeAdjustmentsStayWithinThePaintableRange() throws {
@@ -2395,7 +2674,7 @@ import WatercolorCore
         #expect(model.rendererCheckpointCountForTesting <= 2)
     }
 
-    @Test func checkpointBudgetEvictsOldSnapshotsBeforeAllocatingCandidate() throws {
+    @Test func checkpointBudgetEvictsOldSnapshotsBeforeAllocatingCandidate() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
         var checkpointCountsDuringCandidateReplay: [Int] = []
@@ -2421,18 +2700,22 @@ import WatercolorCore
         observedModel = model
 
         model.selectPaper(.rough)
+        await model.waitForStructuralChanges()
         let roughRendererIdentity = model.rendererIdentity
         model.selectPaper(.hotPress)
+        await model.waitForStructuralChanges()
 
         #expect(model.rendererCheckpointCountForTesting == 1)
         #expect(model.rendererCheckpointBytesForTesting <= oneCheckpointBudget)
-        #expect(checkpointCountsDuringCandidateReplay == [0, 0])
+        // Each asynchronous paper change replays twice: once to initialize
+        // the blank candidate and once to replay the history through it.
+        #expect(checkpointCountsDuringCandidateReplay == [0, 0, 0, 0])
         model.undo()
         #expect(model.project.paper == .rough)
         #expect(model.rendererIdentity == roughRendererIdentity)
     }
 
-    @Test func devicePeakAdmissionEvictsRetainedCheckpointsBeforeCandidateAllocation() throws {
+    @Test func devicePeakAdmissionEvictsRetainedCheckpointsBeforeCandidateAllocation() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
         let renderer = try WatercolorRenderer(
@@ -2449,10 +2732,12 @@ import WatercolorCore
         )
 
         model.selectPaper(.rough)
+        await model.waitForStructuralChanges()
         #expect(model.project.paper == .rough)
         #expect(model.rendererCheckpointCountForTesting == 1)
 
         model.selectPaper(.hotPress)
+        await model.waitForStructuralChanges()
 
         #expect(model.project.paper == .hotPress)
         #expect(model.rendererCheckpointCountForTesting == 1)

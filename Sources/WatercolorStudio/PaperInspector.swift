@@ -15,7 +15,16 @@ struct PaperInspector: View {
             }
             .pickerStyle(.radioGroup)
             .disabled(!model.canModifyProject)
-            .help("Choose the paper fiber used by the watercolor simulation")
+            .help(
+                model.isApplyingSurfaceChange
+                    ? "The chosen paper surface is preparing — the picker unlocks when it finishes"
+                    : "Choose the paper fiber used by the watercolor simulation"
+            )
+            .accessibilityHint(
+                model.isApplyingSurfaceChange
+                    ? "Unavailable while the chosen paper surface prepares."
+                    : ""
+            )
         }
         .font(.system(size: 12))
         .tint(StudioPalette.cobalt)
@@ -23,7 +32,7 @@ struct PaperInspector: View {
 
     private var paperBinding: Binding<PaperTexture> {
         Binding(
-            get: { model.project.paper },
+            get: { model.displayedPaper },
             set: { model.selectPaper($0) }
         )
     }

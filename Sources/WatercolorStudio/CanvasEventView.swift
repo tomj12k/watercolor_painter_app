@@ -6,11 +6,29 @@ import WatercolorCore
 enum StrokeExhaustionReason: Equatable, Sendable {
     case pointCapacity(maximumPointCount: Int)
 
+    /// Notice for a stroke whose paint was committed up to the limit.
     var message: String {
         switch self {
         case let .pointCapacity(maximumPointCount):
-            "This stroke reached its \(maximumPointCount)-point limit. Try a shorter stroke or use a larger brush for wider spacing."
+            "This stroke reached its \(maximumPointCount)-point limit, so Watercolor Studio ended and saved it there."
         }
+    }
+
+    var recoverySuggestion: String {
+        "Start a new stroke to keep painting."
+    }
+
+    /// Notice for a stroke whose preview had to be discarded instead of
+    /// committed, so it must not claim the paint was saved.
+    var cancellationMessage: String {
+        switch self {
+        case let .pointCapacity(maximumPointCount):
+            "This stroke reached its \(maximumPointCount)-point limit and could not be kept."
+        }
+    }
+
+    var cancellationRecoverySuggestion: String {
+        "Use a shorter stroke or a larger brush for wider spacing."
     }
 }
 
@@ -135,17 +153,18 @@ struct CanvasStrokeBuilder {
             let appendResult = append(point)
             appendedPoints = appendResult.points
             if let exhaustionReason = appendResult.exhaustionReason {
+                // Keep the truncated stroke so its paint can still commit.
                 return StrokeFinishResult(
-                    stroke: nil,
-                    points: [],
+                    stroke: stroke,
+                    points: appendedPoints,
                     exhaustionReason: exhaustionReason
                 )
             }
         }
         if let exhaustionReason {
             return StrokeFinishResult(
-                stroke: nil,
-                points: [],
+                stroke: stroke,
+                points: appendedPoints,
                 exhaustionReason: exhaustionReason
             )
         }
@@ -160,8 +179,8 @@ struct CanvasStrokeBuilder {
         } else {
             guard stroke!.points.count < maximumPointCount else {
                 return StrokeFinishResult(
-                    stroke: nil,
-                    points: [],
+                    stroke: stroke,
+                    points: appendedPoints,
                     exhaustionReason: .pointCapacity(maximumPointCount: maximumPointCount)
                 )
             }
@@ -206,10 +225,17 @@ private extension Double {
 public final class CanvasEventView: MTKView {
     private static let minimumZoom: CGFloat = 0.1
     private static let maximumZoom: CGFloat = 16
+    private static let minimumVisiblePaper: CGFloat = 48
     private static let spaceKeyCode: CGKeyCode = 49
 
     private var model: StudioModel
     private var strokeBuilder: CanvasStrokeBuilder?
+    private var strokePreviewStarted = false
+    private var deferredStrokeQueue: [(stroke: StrokeCommand, reason: StrokeExhaustionReason?)] = []
+    private var deferredStrokeDrainTask: Task<Void, Never>?
+    /// How long a deferred stroke may wait for the renderer before it is
+    /// dropped and reported. Adjustable so tests need not wait five seconds.
+    var deferredStrokeCompletionTimeout: Duration = .seconds(5)
     private var panAnchor: CGPoint?
     private var spaceKeyDown = false
 
@@ -259,12 +285,24 @@ public final class CanvasEventView: MTKView {
     func synchronize(with model: StudioModel) {
         guard self.model !== model else {
             updateInputAvailability()
-            requestCanvasDraw()
+            // synchronize runs inside a SwiftUI view update, where publishing
+            // a model change is undefined behavior. Redraw now; run the pan
+            // clamp (which may write model.pan) after the update completes.
+            model.updateCanvasDisplay(self)
+            scheduleDeferredPanClamp()
             return
         }
 
-        self.model.cancelStrokePreview()
+        // Cancelling publishes the outgoing model's capabilities, and this
+        // path also runs inside a SwiftUI view update — defer it, like the
+        // pan clamp above.
+        let outgoingModel = self.model
+        Task { @MainActor in
+            outgoingModel.cancelStrokePreview()
+        }
         strokeBuilder = nil
+        strokePreviewStarted = false
+        deferredStrokeQueue.removeAll()
         panAnchor = nil
         spaceKeyDown = false
         self.model = model
@@ -393,52 +431,188 @@ public final class CanvasEventView: MTKView {
             brush: model.brush,
             point: strokePoint(from: event)
         )
-        guard let stroke = builder.currentStroke,
-              model.beginStrokePreview(stroke) == .accepted
-        else {
+        strokeBuilder = builder
+        strokePreviewStarted = false
+        startPendingStrokePreviewIfNeeded()
+    }
+
+    /// Attaches the accumulating stroke to a live renderer preview. When the
+    /// renderer is still finishing the previous stroke, the builder keeps
+    /// collecting points and the next input event retries, so quick
+    /// successive strokes never silently drop.
+    private func startPendingStrokePreviewIfNeeded() {
+        // Strokes waiting in the deferred queue were drawn earlier, so a new
+        // stroke must not obtain a live preview — and thereby commit — ahead
+        // of them. It stays in its builder and joins the queue on pointer up.
+        guard deferredStrokeQueue.isEmpty, deferredStrokeDrainTask == nil else { return }
+        guard !strokePreviewStarted,
+              let stroke = strokeBuilder?.currentStroke,
+              let firstPoint = stroke.points.first
+        else { return }
+        var initial = stroke
+        initial.points = [firstPoint]
+        switch model.beginStrokePreview(initial) {
+        case .accepted:
+            strokePreviewStarted = true
+            let queuedPoints = Array(stroke.points.dropFirst())
+            if !queuedPoints.isEmpty {
+                model.appendStrokePreview(id: stroke.id, points: queuedPoints)
+            }
+        case .busy:
+            updateInputAvailability()
+        case .unavailable:
             strokeBuilder = nil
             updateInputAvailability()
-            return
         }
-        strokeBuilder = builder
     }
 
     private func appendStrokePoint(from event: NSEvent) {
         guard strokeBuilder != nil else { return }
         let appendResult = strokeBuilder!.append(strokePoint(from: event))
-        guard let exhaustionReason = appendResult.exhaustionReason else {
-            guard !appendResult.points.isEmpty else { return }
-            if let strokeID = strokeBuilder?.strokeID {
-                model.appendStrokePreview(id: strokeID, points: appendResult.points)
+        if let exhaustionReason = appendResult.exhaustionReason {
+            let truncatedStroke = strokeBuilder?.currentStroke
+            let started = strokePreviewStarted
+            strokeBuilder = nil
+            strokePreviewStarted = false
+            if started {
+                commitExhaustedStroke(
+                    truncatedStroke,
+                    newPoints: appendResult.points,
+                    reason: exhaustionReason
+                )
+            } else {
+                completeDeferredStroke(truncatedStroke, reason: exhaustionReason)
             }
             return
         }
-        model.cancelStrokePreview(reason: exhaustionReason)
-        strokeBuilder = nil
-        updateInputAvailability()
+        guard strokePreviewStarted else {
+            startPendingStrokePreviewIfNeeded()
+            return
+        }
+        guard !appendResult.points.isEmpty else { return }
+        if let strokeID = strokeBuilder?.strokeID {
+            model.appendStrokePreview(id: strokeID, points: appendResult.points)
+        }
     }
 
     private func completeStroke(with event: NSEvent) {
         guard strokeBuilder != nil else { return }
+        let started = strokePreviewStarted
         let completion = strokeBuilder!.finish(at: strokePoint(from: event))
         strokeBuilder = nil
+        strokePreviewStarted = false
         if let exhaustionReason = completion.exhaustionReason {
-            model.cancelStrokePreview(reason: exhaustionReason)
-            updateInputAvailability()
+            if started {
+                commitExhaustedStroke(
+                    completion.stroke,
+                    newPoints: completion.points,
+                    reason: exhaustionReason
+                )
+            } else {
+                completeDeferredStroke(completion.stroke, reason: exhaustionReason)
+            }
             return
         }
         guard let stroke = completion.stroke else { return }
+        guard started else {
+            completeDeferredStroke(stroke, reason: nil)
+            return
+        }
         model.appendStrokePreview(id: stroke.id, points: completion.points)
         let model = model
         Task { @MainActor [weak self] in
             await model.commitStrokePreview(stroke)
-            self?.requestCanvasDraw()
+            // The commit belongs to its own model; the view refresh does not
+            // once the view has been handed a different model.
+            guard let self, self.model === model else { return }
+            self.requestCanvasDraw()
         }
+    }
+
+    /// Queues a stroke whose preview never obtained the renderer — the
+    /// previous stroke was still finishing for its whole, brief lifetime —
+    /// so it renders as soon as the renderer frees up. A first-in-first-out
+    /// queue keeps deferred strokes in draw order: a later stroke can never
+    /// commit ahead of an earlier one that is still waiting.
+    private func completeDeferredStroke(
+        _ stroke: StrokeCommand?,
+        reason: StrokeExhaustionReason?
+    ) {
+        guard let stroke else { return }
+        deferredStrokeQueue.append((stroke: stroke, reason: reason))
+        startDeferredStrokeDrainIfNeeded()
+    }
+
+    private func startDeferredStrokeDrainIfNeeded() {
+        guard deferredStrokeDrainTask == nil, !deferredStrokeQueue.isEmpty else { return }
+        let model = model
+        deferredStrokeDrainTask = Task { @MainActor [weak self] in
+            while let self, self.model === model, !self.deferredStrokeQueue.isEmpty {
+                var deadline = ContinuousClock.now.advanced(by: self.deferredStrokeCompletionTimeout)
+                while !model.canModifyProject, ContinuousClock.now < deadline {
+                    try? await Task.sleep(for: .milliseconds(8))
+                    // A surface change replays the whole painting on
+                    // purpose; its duration says nothing about a stuck
+                    // renderer, so the timeout clock restarts after it.
+                    if model.isApplyingSurfaceChange {
+                        deadline = ContinuousClock.now.advanced(
+                            by: self.deferredStrokeCompletionTimeout
+                        )
+                    }
+                }
+                guard model.canModifyProject else {
+                    // The renderer never freed up; dropping the queue keeps
+                    // new painting possible instead of blocking it forever —
+                    // and the customer is told the paint could not land.
+                    let droppedStrokeCount = self.deferredStrokeQueue.count
+                    self.deferredStrokeQueue.removeAll()
+                    model.noteDroppedDeferredStrokes(count: droppedStrokeCount)
+                    break
+                }
+                let entry = self.deferredStrokeQueue.removeFirst()
+                model.completeStroke(entry.stroke)
+                if let reason = entry.reason {
+                    model.noteStrokeExhaustion(reason)
+                }
+            }
+            guard let self else { return }
+            self.deferredStrokeDrainTask = nil
+            self.requestCanvasDraw()
+            self.updateInputAvailability()
+            self.startDeferredStrokeDrainIfNeeded()
+        }
+    }
+
+    /// Commits the paint a capacity-ended stroke already produced instead of
+    /// discarding it, then surfaces why the stroke ended.
+    private func commitExhaustedStroke(
+        _ stroke: StrokeCommand?,
+        newPoints: [StrokePoint],
+        reason: StrokeExhaustionReason
+    ) {
+        guard let stroke, model.isStrokePreviewActive else {
+            model.cancelStrokePreview(reason: reason)
+            updateInputAvailability()
+            return
+        }
+        if !newPoints.isEmpty {
+            model.appendStrokePreview(id: stroke.id, points: newPoints)
+        }
+        let model = model
+        Task { @MainActor [weak self] in
+            await model.commitStrokePreview(stroke)
+            model.noteStrokeExhaustion(reason)
+            guard let self, self.model === model else { return }
+            self.requestCanvasDraw()
+            self.updateInputAvailability()
+        }
+        updateInputAvailability()
     }
 
     private func beginPan(with event: NSEvent) {
         model.cancelStrokePreview()
         strokeBuilder = nil
+        strokePreviewStarted = false
         panAnchor = convert(event.locationInWindow, from: nil)
     }
 
@@ -462,6 +636,7 @@ public final class CanvasEventView: MTKView {
     private func resetTransientInputState() {
         model.cancelStrokePreview()
         strokeBuilder = nil
+        strokePreviewStarted = false
         panAnchor = nil
         spaceKeyDown = false
     }
@@ -506,8 +681,37 @@ public final class CanvasEventView: MTKView {
         )
     }
 
+    /// Redraws from event-handler paths, where model writes are safe.
     private func requestCanvasDraw() {
+        clampPanIfNeeded()
         model.updateCanvasDisplay(self)
+    }
+
+    /// Keeps a sliver of paper on screen no matter how far the customer
+    /// pans or zooms, so the painting can always be found again.
+    private func clampPanIfNeeded() {
+        let clampedPan = canvasTransform.clampedPan(
+            model.pan,
+            minimumVisiblePaper: Self.minimumVisiblePaper
+        )
+        if clampedPan != model.pan {
+            model.pan = clampedPan
+        }
+    }
+
+    private func scheduleDeferredPanClamp() {
+        let model = model
+        Task { @MainActor [weak self] in
+            guard let self, self.model === model else { return }
+            let clampedPan = canvasTransform.clampedPan(
+                model.pan,
+                minimumVisiblePaper: Self.minimumVisiblePaper
+            )
+            if clampedPan != model.pan {
+                model.pan = clampedPan
+                model.updateCanvasDisplay(self)
+            }
+        }
     }
 
     private static let pressureEventTypes: Set<NSEvent.EventType> = [

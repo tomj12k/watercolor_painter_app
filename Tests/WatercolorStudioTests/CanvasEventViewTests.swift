@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import CoreGraphics
 import Foundation
 import Metal
@@ -352,7 +353,8 @@ import WatercolorCore
             x: 20, y: 10, pressure: 1, tiltX: 0, tiltY: 0, time: 1
         ))
 
-        #expect(completion.stroke == nil)
+        // The truncated stroke survives exhaustion so its paint can commit.
+        #expect(completion.stroke?.points.count == 1)
         #expect(
             completion.exhaustionReason
                 == .pointCapacity(maximumPointCount: 1)
@@ -555,7 +557,9 @@ import WatercolorCore
         )))
         await model.waitForStrokePreviewIdle()
         #expect(!submittedBatches.isEmpty)
-        #expect(submittedBatches.allSatisfy { $0.count <= 8 })
+        // Drained appends are bounded only by the adaptive drain limit; the
+        // renderer splits each append into safe GPU submissions itself.
+        #expect(submittedBatches.allSatisfy { $0.count <= 64 })
         view.mouseUp(with: try #require(canvasMouseEvent(
             .leftMouseUp,
             timestamp: 2,
@@ -763,6 +767,171 @@ import WatercolorCore
         #expect(try newRenderer.debugPixel(x: 128, y: 128, layerID: newLayer.id).alpha > 0.05)
     }
 
+    @Test func modelReplacementDefersTheOldModelsCancellationOutOfTheViewUpdate() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let oldProject = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [PaintLayer(name: "Old")]
+        )
+        let newProject = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .rough,
+            layers: [PaintLayer(name: "New")]
+        )
+        let oldModel = StudioModel(
+            project: oldProject,
+            renderer: try WatercolorRenderer(project: oldProject, device: device)
+        )
+        let newModel = StudioModel(
+            project: newProject,
+            renderer: try WatercolorRenderer(project: newProject, device: device)
+        )
+        let view = CanvasEventView(model: oldModel)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        oldModel.configureCanvas(view)
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown, timestamp: 0, eventNumber: 0
+        )))
+        #expect(oldModel.isStrokePreviewActive)
+
+        // synchronize runs inside a SwiftUI view update; cancelling the old
+        // model there publishes its capabilities during the update. The
+        // cancellation must be deferred, then still happen.
+        var oldModelPublishedDuringUpdate = false
+        let subscription = oldModel.objectWillChange.sink { _ in
+            oldModelPublishedDuringUpdate = true
+        }
+        view.synchronize(with: newModel)
+        subscription.cancel()
+        #expect(!oldModelPublishedDuringUpdate)
+
+        for _ in 0..<2_000 where oldModel.isStrokePreviewActive {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        await oldModel.waitForStrokePreviewCancellation()
+        #expect(!oldModel.isStrokePreviewActive)
+        #expect(oldModel.project.commands.isEmpty)
+    }
+
+    @Test func deferredStrokesDroppedAtTheTimeoutAreReportedNotSilent() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [PaintLayer(name: "Layer")]
+        )
+        let finish = CanvasPreviewSuspension()
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device),
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, id, points, token in
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
+                },
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
+                    await finish.suspend()
+                }
+            )
+        )
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+        view.deferredStrokeCompletionTimeout = .milliseconds(40)
+        let first = StrokeCommand(
+            layerID: project.layers[0].id,
+            tool: .brush,
+            brush: .default,
+            points: [StrokePoint(x: 64, y: 64, pressure: 1, tiltX: 0, tiltY: 0, time: 0)]
+        )
+
+        #expect(model.beginStrokePreview(first) == .accepted)
+        let commit = Task { @MainActor in
+            await model.commitStrokePreview(first)
+        }
+        await finish.waitUntilSuspended()
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown, timestamp: 1, eventNumber: 1, location: .init(x: 40, y: 128)
+        )))
+        view.mouseUp(with: try #require(canvasMouseEvent(
+            .leftMouseUp, timestamp: 2, eventNumber: 2, location: .init(x: 40, y: 128)
+        )))
+
+        // The renderer never frees up within the timeout, so the deferred
+        // stroke is dropped — and the customer must be told, not left to
+        // wonder where the paint went.
+        for _ in 0..<2_000 where model.notice == nil {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        #expect(model.notice?.message.contains("could not be painted") == true)
+
+        await finish.resume()
+        await commit.value
+        #expect(model.project.commands.count == 1)
+    }
+
+    @Test func strokeDrawnDuringAPaperChangeLandsInsteadOfTimingOut() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let layer = PaintLayer(name: "Layer 1")
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 1_600, height: 1_200),
+            paper: .coldPress,
+            layers: [layer]
+        )
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device)
+        )
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 1_600, height: 1_200)
+        model.configureCanvas(view)
+        // Far shorter than the paper replay below, so a timeout clock that
+        // keeps running through the surface change would drop the stroke.
+        view.deferredStrokeCompletionTimeout = .milliseconds(20)
+
+        let points: [StrokePoint] = (0..<240).map { (index: Int) -> StrokePoint in
+            StrokePoint(
+                x: 40 + Double(index) * 5.5,
+                y: 600 + sin(Double(index) * 0.2) * 120,
+                pressure: 0.8,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 240
+            )
+        }
+        let stroke = StrokeCommand(layerID: layer.id, tool: .brush, brush: .default, points: points)
+        var initial = stroke
+        initial.points = [stroke.points[0]]
+        #expect(model.beginStrokePreview(initial) == .accepted)
+        model.appendStrokePreview(id: stroke.id, points: Array(stroke.points.dropFirst()))
+        await model.waitForStrokePreviewIdle()
+        await model.commitStrokePreview(stroke)
+        #expect(model.project.commands.count == 1)
+
+        // The customer keeps painting while the new surface prepares. The
+        // stroke cannot preview yet, so it defers — and it must land once
+        // the surface is ready, never silently expire.
+        model.selectPaper(.rough)
+        #expect(model.isApplyingSurfaceChange)
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown, timestamp: 1, eventNumber: 1, location: .init(x: 300, y: 500)
+        )))
+        view.mouseUp(with: try #require(canvasMouseEvent(
+            .leftMouseUp, timestamp: 2, eventNumber: 2, location: .init(x: 340, y: 540)
+        )))
+
+        await model.waitForStructuralChanges()
+        // The paper change edits the surface without appending a command, so
+        // the painting ends with the first stroke plus the deferred one.
+        for _ in 0..<4_000 where model.project.commands.count < 2 {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        #expect(model.error == nil)
+        #expect(model.project.paper == .rough)
+        #expect(model.project.commands.count == 2)
+    }
+
     @Test func losingFocusClearsSpacePanAndCancelsTransientStrokeState() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject(
@@ -797,7 +966,7 @@ import WatercolorCore
         #expect(!model.isStrokePreviewActive)
     }
 
-    @Test func rejectedPreviewAdmissionDoesNotBuildStroke() async throws {
+    @Test func strokeBegunWhileFinishingIsRetainedAndPaintsAfterTheRendererFrees() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject(
             canvas: CanvasSize(width: 256, height: 256),
@@ -842,12 +1011,205 @@ import WatercolorCore
             eventNumber: 1
         )))
 
-        #expect(!view.hasTransientInputStateForTesting)
+        // The quick second stroke is retained while the renderer finishes the
+        // first one instead of being dropped.
+        #expect(view.hasTransientInputStateForTesting)
         #expect(view.toolTip == "Finishing stroke.")
+        view.mouseUp(with: try #require(canvasMouseEvent(
+            .leftMouseUp,
+            timestamp: 2,
+            eventNumber: 2
+        )))
 
         await finish.resume()
         await commit.value
-        #expect(model.project.commands == [.stroke(first)])
+        for _ in 0..<2_000 where model.project.commands.count < 2 {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        #expect(model.project.commands.count == 2)
+        #expect(model.project.commands.first == .stroke(first))
+        #expect(model.error == nil)
+        #expect(try renderer.debugPixel(x: 128, y: 128).alpha > 0.05)
+    }
+
+    @Test func strokeBegunWhileFinishingStartsItsPreviewOnALaterDrag() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [PaintLayer(name: "Layer")]
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let finish = CanvasPreviewSuspension()
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, id, points, token in
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
+                },
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
+                    await finish.suspend()
+                }
+            )
+        )
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+        let first = StrokeCommand(
+            layerID: project.layers[0].id,
+            tool: .brush,
+            brush: .default,
+            points: [StrokePoint(x: 64, y: 64, pressure: 1, tiltX: 0, tiltY: 0, time: 0)]
+        )
+
+        #expect(model.beginStrokePreview(first) == .accepted)
+        let commit = Task { @MainActor in
+            await model.commitStrokePreview(first)
+        }
+        await finish.waitUntilSuspended()
+        view.synchronize(with: model)
+
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown, timestamp: 1, eventNumber: 1, location: .init(x: 40, y: 128)
+        )))
+        #expect(!model.isStrokePreviewActive || model.isStrokePreviewFinalizing)
+
+        await finish.resume()
+        await commit.value
+
+        // The retained stroke attaches to a live preview on the next drag.
+        view.mouseDragged(with: try #require(canvasMouseEvent(
+            .leftMouseDragged, timestamp: 2, eventNumber: 2, location: .init(x: 120, y: 128)
+        )))
+        #expect(model.isStrokePreviewActive)
+        view.mouseUp(with: try #require(canvasMouseEvent(
+            .leftMouseUp, timestamp: 3, eventNumber: 3, location: .init(x: 200, y: 128)
+        )))
+        for _ in 0..<2_000 where model.project.commands.count < 2 {
+            await finish.resume()
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+
+        #expect(model.project.commands.count == 2)
+        #expect(model.error == nil)
+        #expect(try renderer.debugPixel(x: 120, y: 128).alpha > 0.05)
+    }
+
+    @Test func deferredStrokeCommitsBeforeAStrokeDrawnAfterIt() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [PaintLayer(name: "Layer")]
+        )
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        let finish = CanvasPreviewSuspension()
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            strokePreviewOperation: StrokePreviewRendererOperation(
+                update: { renderer, id, points, token in
+                    try await renderer.appendStrokePreview(id: id, points: points, token: token)
+                },
+                finish: { renderer, stroke, token in
+                    try await renderer.finishStrokePreview(stroke, token: token)
+                    await finish.suspend()
+                }
+            )
+        )
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+        let first = StrokeCommand(
+            layerID: project.layers[0].id,
+            tool: .brush,
+            brush: .default,
+            points: [StrokePoint(x: 64, y: 64, pressure: 1, tiltX: 0, tiltY: 0, time: 0)]
+        )
+
+        #expect(model.beginStrokePreview(first) == .accepted)
+        let commit = Task { @MainActor in
+            await model.commitStrokePreview(first)
+        }
+        await finish.waitUntilSuspended()
+        view.synchronize(with: model)
+
+        // Stroke A begins and ends while the renderer is still finishing the
+        // first stroke, so it is deferred.
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown, timestamp: 1, eventNumber: 1, location: .init(x: 40, y: 128)
+        )))
+        view.mouseUp(with: try #require(canvasMouseEvent(
+            .leftMouseUp, timestamp: 2, eventNumber: 2, location: .init(x: 40, y: 128)
+        )))
+
+        await finish.resume()
+        await commit.value
+
+        // Stroke C is drawn after A, with the renderer now free. It must not
+        // overtake the deferred stroke in the painting's command order.
+        view.mouseDown(with: try #require(canvasMouseEvent(
+            .leftMouseDown, timestamp: 3, eventNumber: 3, location: .init(x: 180, y: 128)
+        )))
+        view.mouseDragged(with: try #require(canvasMouseEvent(
+            .leftMouseDragged, timestamp: 4, eventNumber: 4, location: .init(x: 200, y: 128)
+        )))
+        view.mouseUp(with: try #require(canvasMouseEvent(
+            .leftMouseUp, timestamp: 5, eventNumber: 5, location: .init(x: 220, y: 128)
+        )))
+
+        for _ in 0..<2_000 where model.project.commands.count < 3 {
+            await finish.resume()
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+
+        #expect(model.project.commands.count == 3)
+        guard case let .stroke(second) = model.project.commands[1],
+              case let .stroke(third) = model.project.commands[2]
+        else {
+            Issue.record("expected three stroke commands")
+            return
+        }
+        #expect(second.points.first?.x == 40)
+        #expect(third.points.first?.x == 180)
+        #expect(model.error == nil)
+    }
+
+    @Test func offscreenPanIsClampedSoThePaperStaysVisible() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject(
+            canvas: CanvasSize(width: 256, height: 256),
+            paper: .coldPress,
+            layers: [PaintLayer(name: "Layer")]
+        )
+        let model = StudioModel(
+            project: project,
+            renderer: try WatercolorRenderer(project: project, device: device)
+        )
+        let view = CanvasEventView(model: model)
+        view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
+        model.configureCanvas(view)
+
+        model.pan = CGSize(width: 100_000, height: -100_000)
+        view.synchronize(with: model)
+
+        // synchronize runs inside a SwiftUI view update, where publishing a
+        // model change is undefined behavior — the clamp must not fire here.
+        #expect(model.pan == CGSize(width: 100_000, height: -100_000))
+
+        // The 256-point paper fills the 256-point view, so panning settles
+        // once only the 48-point minimum sliver of paper remains visible.
+        for _ in 0..<2_000 where model.pan.width > 208 {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(model.pan == CGSize(width: 208, height: -208))
+
+        model.pan = CGSize(width: 30, height: -12)
+        view.synchronize(with: model)
+        try? await Task.sleep(for: .milliseconds(30))
+        #expect(model.pan == CGSize(width: 30, height: -12))
     }
 
     @Test func zeroMotionEventsDoNotScheduleAdditionalPreviewUpdates() async throws {
@@ -886,7 +1248,7 @@ import WatercolorCore
         #expect(await updates.count == 0)
     }
 
-    @Test func aggregatePointExhaustionCancelsThePreviewAndAllowsRecovery() async throws {
+    @Test func aggregatePointExhaustionCommitsTheTruncatedPaintAndReportsTheLimit() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let layer = PaintLayer(name: "Layer")
         let existingStroke = StrokeCommand(
@@ -910,8 +1272,6 @@ import WatercolorCore
         let view = CanvasEventView(model: model)
         view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
         model.configureCanvas(view)
-        let committedAlpha = try renderer.debugPixel(x: 16, y: 16, layerID: layer.id).alpha
-        let checksumBefore = try canvasChecksum(renderer)
         #expect(model.maximumPointCountForNewStroke == 1)
 
         view.mouseDown(with: try #require(canvasMouseEvent(
@@ -921,34 +1281,32 @@ import WatercolorCore
         view.mouseDragged(with: try #require(canvasMouseEvent(
             .leftMouseDragged, timestamp: 2, eventNumber: 2, location: .init(x: 200, y: 64)
         )))
-        await model.waitForStrokePreviewCancellation()
+        await waitForStrokePreviewToFinish(in: model)
 
         #expect(!model.isStrokePreviewActive)
         #expect(!view.hasTransientInputStateForTesting)
-        #expect(model.project == project)
+        #expect(model.project.commands.count == 2)
         #expect(
-            model.error?.message
-                == "This stroke reached its 1-point limit. Try a shorter stroke or use a larger brush for wider spacing."
+            model.notice?.message
+                == "This stroke reached its 1-point limit, so Watercolor Studio ended and saved it there."
         )
-        #expect(try canvasChecksum(renderer) == checksumBefore)
-        #expect(try renderer.debugPixel(x: 16, y: 16, layerID: layer.id).alpha == committedAlpha)
+        #expect(try renderer.debugPixel(x: 64, y: 192, layerID: layer.id).alpha > 0.05)
 
-        let recovery = try #require(canvasMouseEvent(
+        // The document is now at its point capacity, so the next stroke is
+        // rejected with the capacity explanation instead of silently failing.
+        view.mouseDown(with: try #require(canvasMouseEvent(
             .leftMouseDown, timestamp: 3, eventNumber: 3, location: .init(x: 96, y: 96)
-        ))
-        let recoveryUp = try #require(canvasMouseEvent(
+        )))
+        view.mouseUp(with: try #require(canvasMouseEvent(
             .leftMouseUp, timestamp: 4, eventNumber: 4, location: .init(x: 96, y: 96)
-        ))
-        view.mouseDown(with: recovery)
-        view.mouseUp(with: recoveryUp)
+        )))
         await waitForStrokePreviewToFinish(in: model)
 
         #expect(model.project.commands.count == 2)
-        #expect(model.error == nil)
-        #expect(try renderer.debugPixel(x: 96, y: 160, layerID: layer.id).alpha > 0.05)
+        #expect(model.notice?.message == "The project has reached its point capacity of 2.")
     }
 
-    @Test func inFlightAppendCannotDuplicateCapacityCancellationOrReplaceItsReason() async throws {
+    @Test func exhaustionWithAnInFlightAppendCommitsTheTruncatedStrokeExactlyOnce() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject(
             canvas: CanvasSize(width: 256, height: 256),
@@ -956,8 +1314,6 @@ import WatercolorCore
             layers: [PaintLayer(name: "Layer")]
         )
         let append = CanvasPreviewSuspension()
-        let failureProcessed = CanvasPreviewSuspension()
-        let cancellation = CanvasPreviewSuspension()
         let renderer = try WatercolorRenderer(
             project: project,
             device: device,
@@ -965,7 +1321,7 @@ import WatercolorCore
                 await append.suspend()
             }
         )
-        var cancellationCount = 0
+        var finishCount = 0
         let model = StudioModel(
             project: project,
             renderer: renderer,
@@ -978,18 +1334,8 @@ import WatercolorCore
                     )
                 },
                 finish: { renderer, stroke, token in
+                    finishCount += 1
                     try await renderer.finishStrokePreview(stroke, token: token)
-                },
-                cancel: { renderer, token in
-                    cancellationCount += 1
-                    let ordinal = cancellationCount
-                    try await renderer.restoreStrokePreviewCancellation(token)
-                    if ordinal == 1 {
-                        await cancellation.suspend()
-                    }
-                },
-                didProcessUpdateFailure: { _ in
-                    await failureProcessed.suspend()
                 }
             ),
             maximumTotalStrokePointCount: 10
@@ -1013,35 +1359,30 @@ import WatercolorCore
         )))
         await append.waitUntilSuspended()
 
+        // Exhaustion arrives while the first append is still on the GPU. The
+        // truncated stroke must wait for that append and then commit once.
         view.mouseDragged(with: try #require(canvasMouseEvent(
             .leftMouseDragged,
             timestamp: 2,
             eventNumber: 2,
             location: CGPoint(x: 220, y: 64)
         )))
-        await cancellation.waitUntilSuspended()
         #expect(model.isStrokePreviewActive)
-        #expect(!model.capabilities.canPaint)
 
         await append.resume()
-        await failureProcessed.waitUntilSuspended()
-        #expect(model.isStrokePreviewActive)
-        #expect(!model.capabilities.canPaint)
-        #expect(cancellationCount == 1)
-        await failureProcessed.resume()
-        await cancellation.resume()
-        await model.waitForStrokePreviewCancellation()
+        await waitForStrokePreviewToFinish(in: model)
 
-        #expect(cancellationCount == 1)
+        #expect(finishCount == 1)
+        #expect(model.project.commands.count == 1)
         #expect(
-            model.error?.message
-                == "This stroke reached its 10-point limit. Try a shorter stroke or use a larger brush for wider spacing."
+            model.notice?.message
+                == "This stroke reached its 10-point limit, so Watercolor Studio ended and saved it there."
         )
         #expect(!model.isStrokePreviewActive)
         #expect(model.capabilities.canPaint)
     }
 
-    @Test func pointerUpPointExhaustionRestoresAndReportsBeforeContinuedPainting() async throws {
+    @Test func pointerUpPointExhaustionCommitsTheTruncatedPaintAndReportsTheLimit() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let layer = PaintLayer(name: "Layer")
         let existingStroke = StrokeCommand(
@@ -1065,7 +1406,6 @@ import WatercolorCore
         let view = CanvasEventView(model: model)
         view.frame = CGRect(x: 0, y: 0, width: 256, height: 256)
         model.configureCanvas(view)
-        let checksumBefore = try canvasChecksum(renderer)
 
         view.mouseDown(with: try #require(canvasMouseEvent(
             .leftMouseDown, timestamp: 1, eventNumber: 1, location: .init(x: 64, y: 64)
@@ -1073,14 +1413,14 @@ import WatercolorCore
         view.mouseUp(with: try #require(canvasMouseEvent(
             .leftMouseUp, timestamp: 2, eventNumber: 2, location: .init(x: 128, y: 64)
         )))
-        await model.waitForStrokePreviewCancellation()
+        await waitForStrokePreviewToFinish(in: model)
 
-        #expect(model.project == project)
-        #expect(try canvasChecksum(renderer) == checksumBefore)
+        #expect(model.project.commands.count == 2)
         #expect(
-            model.error?.message
-                == "This stroke reached its 1-point limit. Try a shorter stroke or use a larger brush for wider spacing."
+            model.notice?.message
+                == "This stroke reached its 1-point limit, so Watercolor Studio ended and saved it there."
         )
+        #expect(try renderer.debugPixel(x: 64, y: 192, layerID: layer.id).alpha > 0.05)
 
         view.mouseDown(with: try #require(canvasMouseEvent(
             .leftMouseDown, timestamp: 3, eventNumber: 3, location: .init(x: 96, y: 96)
@@ -1091,7 +1431,7 @@ import WatercolorCore
         await waitForStrokePreviewToFinish(in: model)
 
         #expect(model.project.commands.count == 2)
-        #expect(model.error == nil)
+        #expect(model.notice?.message == "The project has reached its point capacity of 2.")
     }
 }
 

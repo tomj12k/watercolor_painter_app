@@ -92,6 +92,34 @@ public struct StudioView: View {
         .frame(minWidth: 1_050, minHeight: 680)
         .focusedSceneValue(\.studioModel, model)
         .toolbar { studioToolbar }
+        // Status changes must reach assistive technology as announcements —
+        // a VoiceOver user otherwise discovers a pause or a limit only by
+        // finding controls unexpectedly disabled.
+        .onChange(of: model.isApplyingSurfaceChange) { _, isApplying in
+            if isApplying {
+                announce("Painting paused while the paper surface prepares.")
+            } else {
+                announce("Painting resumed.")
+            }
+        }
+        .onChange(of: model.rendererRecoveryError != nil) { _, isRecovering in
+            if isRecovering {
+                announce(
+                    "Painting is paused after a renderer problem. "
+                        + "Your work is safe. Use Try Again to resume."
+                )
+            }
+        }
+        .onChange(of: model.capacityWarning) { _, warning in
+            if let warning { announce(warning) }
+        }
+        .onChange(of: model.notice?.id) { _, _ in
+            if let notice = model.notice { announce(notice.message) }
+        }
+    }
+
+    private func announce(_ message: String) {
+        AccessibilityNotification.Announcement(message).post()
     }
 
     private var paperStage: some View {
@@ -113,6 +141,11 @@ public struct StudioView: View {
 
                 MetalCanvasView(model: model)
 
+                if model.rendererRecoveryError != nil {
+                    recoveryBanner
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                }
+
                 Rectangle()
                     .stroke(
                         StudioPalette.cobalt.opacity(0.28 + model.canvasWetness * 0.62),
@@ -127,24 +160,100 @@ public struct StudioView: View {
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
 
-                HStack(spacing: 6) {
-                    Image(systemName: "drop.fill")
-                    Text(activityLabel)
-                        .monospacedDigit()
-                }
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .foregroundStyle(StudioPalette.fiber)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(StudioPalette.carbon.opacity(0.88))
-                .overlay(alignment: .leading) {
-                    Rectangle()
-                        .fill(StudioPalette.cobalt)
-                        .frame(width: 2)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "drop.fill")
+                        Text(activityLabel)
+                            .monospacedDigit()
+                    }
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(StudioPalette.fiber)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(StudioPalette.carbon.opacity(0.88))
+                    .overlay(alignment: .leading) {
+                        Rectangle()
+                            .fill(StudioPalette.cobalt)
+                            .frame(width: 2)
+                    }
+                    .accessibilityLabel("Canvas activity")
+                    .accessibilityValue(activityLabel)
+
+                    if model.isApplyingSurfaceChange {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Preparing the paper surface…")
+                        }
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(StudioPalette.fiber)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(StudioPalette.carbon.opacity(0.88))
+                        .overlay(alignment: .leading) {
+                            Rectangle()
+                                .fill(StudioPalette.cobalt)
+                                .frame(width: 2)
+                        }
+                        .accessibilityLabel("Paper surface")
+                        .accessibilityValue("Preparing the paper surface")
+                    }
+
+                    if let notice = model.notice {
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Image(systemName: "info.circle")
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(notice.message)
+                                if !notice.recoverySuggestion.isEmpty {
+                                    Text(notice.recoverySuggestion)
+                                        .foregroundStyle(StudioPalette.fiber.opacity(0.75))
+                                }
+                            }
+                            Button {
+                                model.dismissNotice()
+                            } label: {
+                                Image(systemName: "xmark")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Dismiss notice")
+                        }
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(StudioPalette.fiber)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(StudioPalette.carbon.opacity(0.88))
+                        .overlay(alignment: .leading) {
+                            Rectangle()
+                                .fill(StudioPalette.pigment)
+                                .frame(width: 2)
+                        }
+                        .frame(maxWidth: 380, alignment: .leading)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("Painting notice")
+                        .accessibilityValue(notice.message)
+                    }
+
+                    if let capacityWarning = model.capacityWarning {
+                        HStack(spacing: 6) {
+                            Image(systemName: "gauge.with.needle")
+                            Text(capacityWarning)
+                                .monospacedDigit()
+                        }
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundStyle(StudioPalette.fiber)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(StudioPalette.carbon.opacity(0.88))
+                        .overlay(alignment: .leading) {
+                            Rectangle()
+                                .fill(StudioPalette.pigment)
+                                .frame(width: 2)
+                        }
+                        .accessibilityLabel("Painting capacity")
+                        .accessibilityValue(capacityWarning)
+                    }
                 }
                 .padding(12)
-                .accessibilityLabel("Canvas activity")
-                .accessibilityValue(activityLabel)
             }
             .clipped()
         }
@@ -152,6 +261,31 @@ public struct StudioView: View {
 
     private var activityLabel: String {
         "Canvas wetness \(Int((model.canvasWetness * 100).rounded()))%"
+    }
+
+    private var recoveryBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+            Text("Painting is paused after a renderer problem. Your work so far is safe.")
+            Button("Try Again", action: model.retryRendererRecovery)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(StudioPalette.cobalt)
+        }
+        .font(.system(size: 12, weight: .medium))
+        .foregroundStyle(StudioPalette.fiber)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(StudioPalette.carbon.opacity(0.94))
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill(StudioPalette.pigment)
+                .frame(width: 2)
+        }
+        .padding(12)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Renderer recovery")
+        .accessibilityHint("Painting is paused. Try Again rebuilds the renderer from your saved work.")
     }
 
     private var inspector: some View {

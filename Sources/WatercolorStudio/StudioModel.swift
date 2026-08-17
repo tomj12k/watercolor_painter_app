@@ -23,6 +23,7 @@ public struct StudioFailure: Identifiable, Equatable, Sendable {
     public enum Code: String, Equatable, Sendable {
         case resourceBudget = "WC-RESOURCE-001"
         case workBudget = "WC-WORK-001"
+        case capacity = "WC-CAPACITY-001"
         case metalUnavailable = "WC-METAL-001"
         case gpuExecution = "WC-GPU-001"
         case malformedDocument = "WC-DOCUMENT-001"
@@ -63,6 +64,22 @@ public struct StudioFailure: Identifiable, Equatable, Sendable {
         let code = Self.code(for: error)
         let diagnostic = StudioDiagnostic.live(errorCode: code.rawValue, project: project)
         self = Self.failure(for: error, code: code, diagnostic: diagnostic)
+    }
+
+    /// A deliberate document limit was reached. Unlike unknown failures, the
+    /// operation will keep failing on retry, so the recovery guidance must
+    /// name the action that actually frees capacity.
+    public static func capacity(
+        message: String,
+        recoverySuggestion: String,
+        project: PaintingProject?
+    ) -> Self {
+        Self(
+            code: .capacity,
+            message: message,
+            recoverySuggestion: recoverySuggestion,
+            diagnostic: .live(errorCode: Code.capacity.rawValue, project: project)
+        )
     }
 
     public static func resourceBudget(
@@ -146,6 +163,13 @@ public struct StudioFailure: Identifiable, Equatable, Sendable {
         switch code {
         case .resourceBudget:
             return resourceBudget(required: 0, available: 0, diagnostic: diagnostic)
+        case .capacity:
+            return Self(
+                code: code,
+                message: "The project has reached one of its capacity limits. Your painting is unchanged.",
+                recoverySuggestion: "Undo strokes, or continue in a new document.",
+                diagnostic: diagnostic
+            )
         case .workBudget:
             return Self(
                 code: code,
@@ -375,9 +399,18 @@ actor StudioPNGExportCoordinator {
 public final class StudioModel: ObservableObject {
     public static let brushSizeRange = 1.0...300.0
     private static let dryStepCount = 24
-    // Keep each queued preview update within one renderer stamp batch. This
-    // bounds GPU work per submission when input arrives faster than Metal.
-    private static let previewPointBatchSize = 8
+    // Drain the queued input backlog in large adaptive appends so paint
+    // catches up to a fast cursor: the renderer splits each append into
+    // bounded GPU submissions itself, so per-submission safety no longer
+    // limits the drain size. The cap keeps cancellation responsive and the
+    // canvas refreshing every append while a backlog drains, instead of
+    // one long append that repaints only at its end.
+    //
+    // Must stay a whole multiple of WatercolorRenderer.stampBatchSize: wet
+    // simulation runs between stamp batches, so a drain size off the batch
+    // stride would shift batch boundaries and make live-preview pixels
+    // diverge from replay and reopen. A test pins this relationship.
+    static let previewPointDrainLimit = 64
     private static let maximumRendererCheckpointCount = 2
     private static let defaultRendererCheckpointByteBudget = 256 * 1024 * 1024
 
@@ -385,13 +418,59 @@ public final class StudioModel: ObservableObject {
     @Published public var selectedLayerID: UUID {
         didSet { refreshCapabilities() }
     }
-    @Published public var selectedTool: PaintTool
+    @Published public var selectedTool: PaintTool {
+        didSet {
+            guard oldValue != selectedTool else { return }
+            storedToolSettings[oldValue] = brush
+            brush = storedToolSettings[selectedTool] ?? Self.defaultBrush(for: selectedTool)
+        }
+    }
     @Published public var brush: BrushSettings
+
+    /// Each tool keeps its own settings, so adjusting the eraser never
+    /// disturbs the brush. Settings for tools not yet visited come from
+    /// `defaultBrush(for:)`.
+    private var storedToolSettings: [PaintTool: BrushSettings] = [:]
+
+    /// Strength tools start at full strength — the exact behavior they had
+    /// while their strength was fixed — so nothing feels different until
+    /// the customer moves the slider.
+    static func defaultBrush(for tool: PaintTool) -> BrushSettings {
+        var settings = BrushSettings.default
+        switch tool {
+        case .brush, .water:
+            break
+        case .eraser, .smudge, .smear, .dry:
+            settings.opacity = 1
+        }
+        return settings
+    }
     @Published public var zoom: CGFloat
     @Published public var pan: CGSize
     @Published public private(set) var error: StudioFailure?
+    /// A routine limit the customer ran into — a stroke ended at capacity, a
+    /// refused stroke, or queued strokes that expired. These are expected
+    /// events, so they inform from the canvas activity area instead of
+    /// interrupting with a modal alert; `error` stays reserved for failures.
+    @Published public private(set) var notice: StudioFailure?
     @Published public private(set) var rendererRecoveryError: StudioRendererRecoveryError?
     @Published public private(set) var capabilities: StudioCapabilities
+    /// Non-modal notice shown from 90% of any document limit, so the customer
+    /// learns about the ceiling before a stroke is refused at the wall.
+    @Published public private(set) var capacityWarning: String?
+    /// True while a structural change (such as a new paper surface) replays
+    /// the painting in the background with editing paused; the studio shows
+    /// why the pause is happening while this is set.
+    @Published public private(set) var isApplyingSurfaceChange = false
+
+    /// The paper the customer chose, applied or still preparing. The picker
+    /// shows this value so a click is reflected immediately; it falls back
+    /// to the project's paper when a change fails or none is pending.
+    @Published private var pendingPaper: PaperTexture?
+
+    public var displayedPaper: PaperTexture {
+        pendingPaper ?? project.paper
+    }
     @Published public private(set) var canvasWetness: Double
     @Published public private(set) var layerOpacityPreviews: [UUID: Double]
     @Published public private(set) var recentColors: [PaintColor]
@@ -459,23 +538,20 @@ public final class StudioModel: ObservableObject {
     private weak var attachedCanvas: MTKView?
     private var strokePreviewState: StudioStrokePreviewState
     private var pendingStrokePreviewPoints: [StrokePoint]
-    private var pendingStrokePreviewOffset: Int
-#if DEBUG
-    private(set) var pendingStrokePreviewCompactionCountForTesting = 0
-#endif
     private var strokePreviewDrainTask: Task<Void, Never>?
     private var strokePreviewDrainToken: StudioStrokePreviewToken?
     private var strokePreviewCancellationTask: Task<Void, Never>?
     private var rendererCheckpoints: [RendererCheckpoint]
     private let rendererCheckpointByteBudget: Int
     private let projectAdmissionLimits: ProjectAdmissionLimits
+    private var structuralReplacementTask: Task<Void, Never>?
 
     public var isStrokePreviewActive: Bool {
         strokePreviewState.token != nil
     }
 
     public var canModifyProject: Bool {
-        strokePreviewState.token == nil
+        strokePreviewState.token == nil && !isApplyingSurfaceChange
     }
 
     var isStrokePreviewFinalizing: Bool {
@@ -484,7 +560,7 @@ public final class StudioModel: ObservableObject {
     }
 
     var pendingStrokePreviewPointCountForTesting: Int {
-        pendingStrokePreviewPoints.count - pendingStrokePreviewOffset
+        pendingStrokePreviewPoints.count
     }
 
     private var canAppendCommand: Bool {
@@ -523,8 +599,10 @@ public final class StudioModel: ObservableObject {
         zoom = 1
         pan = .zero
         error = nil
+        notice = nil
         rendererRecoveryError = nil
         capabilities = StudioCapabilities(canPaint: true, canUndo: false, canRedo: false)
+        capacityWarning = nil
         canvasWetness = renderer.canvasWetness
         layerOpacityPreviews = [:]
         recentColors = []
@@ -536,7 +614,6 @@ public final class StudioModel: ObservableObject {
         currentPNGExportFailureID = nil
         strokePreviewState = .idle
         pendingStrokePreviewPoints = []
-        pendingStrokePreviewOffset = 0
         strokePreviewDrainTask = nil
         strokePreviewDrainToken = nil
         strokePreviewCancellationTask = nil
@@ -554,6 +631,7 @@ public final class StudioModel: ObservableObject {
 
     @discardableResult
     func beginStrokePreview(_ stroke: StrokeCommand) -> StrokePreviewAdmission {
+        guard !isApplyingSurfaceChange else { return .busy }
         guard strokePreviewState.token == nil else { return .busy }
         guard rendererRecoveryError == nil,
               canAppendStroke(stroke),
@@ -570,6 +648,7 @@ public final class StudioModel: ObservableObject {
             strokePreviewState = .active(token)
             refreshCapabilities()
             error = nil
+            notice = nil
             return .accepted
         } catch {
             self.error = StudioFailure.rendering(error: error, project: project)
@@ -583,14 +662,6 @@ public final class StudioModel: ObservableObject {
               renderer === token.renderer,
               !points.isEmpty
         else { return }
-        if pendingStrokePreviewOffset == pendingStrokePreviewPoints.count {
-            let hadConsumedStorage = pendingStrokePreviewOffset > 0
-            pendingStrokePreviewPoints.removeAll(keepingCapacity: true)
-            pendingStrokePreviewOffset = 0
-#if DEBUG
-            if hadConsumedStorage { pendingStrokePreviewCompactionCountForTesting += 1 }
-#endif
-        }
         pendingStrokePreviewPoints.append(contentsOf: points)
         startStrokePreviewDrainIfNeeded()
     }
@@ -617,7 +688,7 @@ public final class StudioModel: ObservableObject {
             canvasWetness = token.renderer.canvasWetness
             editor.append(.stroke(stroke))
             strokePreviewState = .idle
-            clearPendingStrokePreviewPoints()
+            pendingStrokePreviewPoints = []
             publishEditorProject()
             error = nil
         } catch {
@@ -653,6 +724,27 @@ public final class StudioModel: ObservableObject {
         if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
     }
 
+    /// Reports strokes that waited for the renderer but never obtained it.
+    /// A routine loss report, so it lands on the notice channel.
+    func noteDroppedDeferredStrokes(count: Int) {
+        guard count > 0 else { return }
+        let subject = count == 1 ? "A queued stroke" : "\(count) queued strokes"
+        notice = StudioFailure(
+            message: "\(subject) could not be painted because the renderer stayed busy."
+        )
+    }
+
+    /// Explains why a capacity-ended stroke stopped, without disturbing a
+    /// failure that the commit itself already reported.
+    func noteStrokeExhaustion(_ reason: StrokeExhaustionReason) {
+        guard error == nil else { return }
+        notice = StudioFailure.capacity(
+            message: reason.message,
+            recoverySuggestion: reason.recoverySuggestion,
+            project: project
+        )
+    }
+
     func cancelStrokePreview(reason: StrokeExhaustionReason? = nil) {
         guard let token = strokePreviewState.token else { return }
         guard !isCancellingStrokePreview(token) else { return }
@@ -660,7 +752,13 @@ public final class StudioModel: ObservableObject {
         beginStrokePreviewCancellation(
             token: token,
             wasFinalizing: wasFinalizing,
-            failure: reason.map { StudioFailure(message: $0.message) }
+            failure: reason.map {
+                StudioFailure.capacity(
+                    message: $0.cancellationMessage,
+                    recoverySuggestion: $0.cancellationRecoverySuggestion,
+                    project: project
+                )
+            }
         )
         refreshCapabilities()
         if let attachedCanvas { updateCanvasDisplay(attachedCanvas) }
@@ -681,7 +779,7 @@ public final class StudioModel: ObservableObject {
     private func startStrokePreviewDrainIfNeeded() {
         guard strokePreviewDrainTask == nil,
               let token = strokePreviewState.token,
-              pendingStrokePreviewOffset < pendingStrokePreviewPoints.count
+              !pendingStrokePreviewPoints.isEmpty
         else { return }
 
         strokePreviewDrainToken = token
@@ -694,19 +792,10 @@ public final class StudioModel: ObservableObject {
         while !Task.isCancelled,
               isCurrentStrokePreview(token),
               renderer === token.renderer,
-              pendingStrokePreviewOffset < pendingStrokePreviewPoints.count {
-            let availablePointCount = pendingStrokePreviewPoints.count - pendingStrokePreviewOffset
-            let pointCount = min(Self.previewPointBatchSize, availablePointCount)
-            let end = pendingStrokePreviewOffset + pointCount
-            let points = Array(pendingStrokePreviewPoints[pendingStrokePreviewOffset..<end])
-            pendingStrokePreviewOffset = end
-            if pendingStrokePreviewOffset == pendingStrokePreviewPoints.count {
-                pendingStrokePreviewPoints.removeAll(keepingCapacity: true)
-                pendingStrokePreviewOffset = 0
-#if DEBUG
-                pendingStrokePreviewCompactionCountForTesting += 1
-#endif
-            }
+              !pendingStrokePreviewPoints.isEmpty {
+            let pointCount = min(Self.previewPointDrainLimit, pendingStrokePreviewPoints.count)
+            let points = Array(pendingStrokePreviewPoints.prefix(pointCount))
+            pendingStrokePreviewPoints = Array(pendingStrokePreviewPoints.dropFirst(pointCount))
             do {
                 try await strokePreviewOperation.update(
                     token.renderer,
@@ -776,7 +865,7 @@ public final class StudioModel: ObservableObject {
             return
         }
         strokePreviewState = .cancelling(token)
-        clearPendingStrokePreviewPoints()
+        pendingStrokePreviewPoints = []
         strokePreviewDrainTask?.cancel()
         strokePreviewDrainTask = nil
         strokePreviewDrainToken = nil
@@ -835,8 +924,10 @@ public final class StudioModel: ObservableObject {
     }
 
     private func reportCommandCapacityFailure() {
-        error = StudioFailure(
-            message: "The project has reached its command capacity of \(projectAdmissionLimits.maximumCommandCount)."
+        notice = StudioFailure.capacity(
+            message: "The project has reached its command capacity of \(projectAdmissionLimits.maximumCommandCount).",
+            recoverySuggestion: "Undo strokes, or continue in a new document.",
+            project: project
         )
     }
 
@@ -856,12 +947,16 @@ public final class StudioModel: ObservableObject {
             case .commandLimitExceeded:
                 reportCommandCapacityFailure()
             case .totalStrokePointLimitExceeded:
-                error = StudioFailure(
-                    message: "The project has reached its point capacity of \(projectAdmissionLimits.maximumTotalStrokePointCount)."
+                notice = StudioFailure.capacity(
+                    message: "The project has reached its point capacity of \(projectAdmissionLimits.maximumTotalStrokePointCount).",
+                    recoverySuggestion: "Undo strokes, or continue in a new document.",
+                    project: project
                 )
             case .documentByteLimitExceeded:
-                error = StudioFailure(
-                    message: "The project has reached its document storage capacity. Use a shorter stroke or remove painting history before continuing."
+                notice = StudioFailure.capacity(
+                    message: "The project has reached its document storage capacity.",
+                    recoverySuggestion: "Use a shorter stroke, or undo strokes before continuing.",
+                    project: project
                 )
             default:
                 error = StudioFailure.rendering(
@@ -917,18 +1012,10 @@ public final class StudioModel: ObservableObject {
     private func invalidateStrokePreview(_ token: StudioStrokePreviewToken) {
         guard isCurrentStrokePreview(token) else { return }
         strokePreviewState = .idle
-        clearPendingStrokePreviewPoints()
+        pendingStrokePreviewPoints = []
         strokePreviewDrainTask?.cancel()
         strokePreviewDrainTask = nil
         strokePreviewDrainToken = nil
-    }
-
-    private func clearPendingStrokePreviewPoints() {
-        pendingStrokePreviewPoints.removeAll(keepingCapacity: true)
-        pendingStrokePreviewOffset = 0
-#if DEBUG
-        pendingStrokePreviewCompactionCountForTesting += 1
-#endif
     }
 
     private func isCurrentStrokePreview(_ token: StudioStrokePreviewToken) -> Bool {
@@ -951,7 +1038,9 @@ public final class StudioModel: ObservableObject {
         )
         rendererRecoveryError = recoveryError
         rendererCheckpoints.removeAll()
-        error = StudioFailure.rendering(error: recoveryCause, project: project)
+        // The recovery banner carries the message and the Try Again control.
+        // Raising a modal alert here as well would cover that control, so
+        // recovery reports through the banner alone.
     }
 
     public func addLayer() {
@@ -1117,14 +1206,89 @@ public final class StudioModel: ObservableObject {
         )
     }
 
+    /// Applies a paper change without blocking the main thread. The change
+    /// requires a full deterministic replay under the new surface, so editing
+    /// pauses while the replay runs asynchronously and the project publishes
+    /// only when the replacement renderer is ready — a failure leaves the
+    /// painting untouched, exactly like the synchronous edit paths.
     public func selectPaper(_ paper: PaperTexture) {
+        guard canModifyProject else { return }
         let selectedLayerID = selectedLayerID
-        performProjectEdit(
-            { editor in editor.setPaper(paper) },
-            selecting: { project in
-                project.layers.first(where: { $0.id == selectedLayerID })?.id
+        var updatedEditor = editor
+        updatedEditor.setPaper(paper)
+        let updatedProject = updatedEditor.project
+        guard updatedProject != project else { return }
+
+        isApplyingSurfaceChange = true
+        pendingPaper = paper
+        refreshCapabilities()
+        let preparedCheckpoint = rendererRecoveryError == nil
+            ? prepareCurrentRendererCheckpointForCandidateAllocation()
+            : nil
+        structuralReplacementTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let candidateRenderer = try await self.makeRendererCandidateAsynchronously(
+                    project: updatedProject
+                )
+                if let preparedCheckpoint {
+                    self.appendRendererCheckpoint(preparedCheckpoint)
+                }
+                self.isApplyingSurfaceChange = false
+                self.pendingPaper = nil
+                self.replaceRenderer(with: candidateRenderer)
+                self.publishSuccessfulEdit(
+                    editor: updatedEditor,
+                    project: updatedProject,
+                    selectedLayerID: updatedProject.layers.first(
+                        where: { $0.id == selectedLayerID }
+                    )?.id
+                )
+            } catch {
+                self.isApplyingSurfaceChange = false
+                self.pendingPaper = nil
+                self.error = StudioFailure.rendering(error: error, project: self.project)
+                self.refreshCapabilities()
             }
-        )
+            self.structuralReplacementTask = nil
+        }
+    }
+
+    func waitForStructuralChanges() async {
+        while let task = structuralReplacementTask {
+            await task.value
+            if structuralReplacementTask == nil { return }
+        }
+    }
+
+    /// Builds a replacement renderer for `project` while keeping the main
+    /// thread schedulable: the candidate starts from an empty command list
+    /// (cheap), then replays the full history through the renderer's
+    /// asynchronous replay, which waits on GPU completion without blocking.
+    private func makeRendererCandidateAsynchronously(
+        project candidateProject: PaintingProject
+    ) async throws -> WatercolorRenderer {
+        var blankProject = candidateProject
+        blankProject.commands = []
+        let retainedBytes = rendererCheckpoints.reduce(into: 0) { total, checkpoint in
+            let (updatedTotal, didOverflow) = total.addingReportingOverflow(
+                checkpoint.estimatedBytes
+            )
+            total = didOverflow ? .max : updatedTotal
+        }
+        do {
+            let candidateRenderer = try renderer.makeCandidate(
+                project: blankProject,
+                retainedCheckpointBytes: retainedBytes
+            )
+            try await candidateRenderer.replayAsynchronously(project: candidateProject)
+            return candidateRenderer
+        } catch RendererError.resourceBudgetExceeded where retainedBytes > 0 {
+            rendererCheckpoints.removeAll()
+            let candidateRenderer = try renderer.makeCandidate(project: blankProject)
+            try await candidateRenderer.replayAsynchronously(project: candidateProject)
+            return candidateRenderer
+        }
     }
 
     public func setBrushSize(_ size: Double) {
@@ -1221,6 +1385,21 @@ public final class StudioModel: ObservableObject {
         }
     }
 
+    /// Rebuilds the renderer from the committed project after a renderer
+    /// failure, restoring painting without requiring a structural edit. A
+    /// failed rebuild keeps the recovery state and reports why.
+    public func retryRendererRecovery() {
+        guard rendererRecoveryError != nil else { return }
+        do {
+            let candidateRenderer = try makeRendererCandidate(project: project)
+            replaceRenderer(with: candidateRenderer)
+            refreshCapabilities()
+            error = nil
+        } catch {
+            self.error = StudioFailure.rendering(error: error, project: project)
+        }
+    }
+
     public func drySelectedLayer() {
         guard selectedLayerIndex != nil else { return }
         let layerID = selectedLayerID
@@ -1238,6 +1417,11 @@ public final class StudioModel: ObservableObject {
     public func exportPNG(to destinationURL: URL) async {
         let exportID = UUID()
         latestPNGExportID = exportID
+        // A paper change the customer already chose must be in the file:
+        // wait for the in-flight replacement renderer before snapshotting,
+        // so the export can never write the old surface to disk.
+        await waitForStructuralChanges()
+        guard latestPNGExportID == exportID else { return }
         let capturedFailureID = error?.id
         let capturedExportFailureID = currentPNGExportFailureID
         let exportTicket = await pngExportCoordinator.beginExport(to: destinationURL)
@@ -1274,6 +1458,10 @@ public final class StudioModel: ObservableObject {
 
     public func dismissError() {
         error = nil
+    }
+
+    public func dismissNotice() {
+        notice = nil
     }
 
     @discardableResult
@@ -1433,6 +1621,7 @@ public final class StudioModel: ObservableObject {
         refreshCapabilities()
         onDocumentUpdate?(project)
         error = nil
+        notice = nil
     }
 
     private func replaceRenderer(
@@ -1545,12 +1734,44 @@ public final class StudioModel: ObservableObject {
     private func refreshCapabilities() {
         capabilities = StudioCapabilities(
             canPaint: rendererRecoveryError == nil
+                && !isApplyingSurfaceChange
                 && !isStrokePreviewFinalizing
                 && !strokePreviewState.isCancelling
                 && project.layers.contains(where: { $0.id == selectedLayerID }),
             canUndo: canModifyProject && editor.canUndo,
             canRedo: canModifyProject && editor.canRedo
         )
+        capacityWarning = Self.capacityWarning(for: project, limits: projectAdmissionLimits)
+    }
+
+    private static func capacityWarning(
+        for project: PaintingProject,
+        limits: ProjectAdmissionLimits
+    ) -> String? {
+        func fraction(_ used: Int, of maximum: Int) -> Double {
+            guard maximum > 0 else { return 1 }
+            return Double(used) / Double(maximum)
+        }
+        var totalPointCount = 0
+        for command in project.commands {
+            guard case let .stroke(stroke) = command else { continue }
+            let (updatedTotal, didOverflow) = totalPointCount
+                .addingReportingOverflow(stroke.points.count)
+            guard !didOverflow else {
+                totalPointCount = .max
+                break
+            }
+            totalPointCount = updatedTotal
+        }
+        let storageCharge = (try? project.serializedStorageCharge()) ?? .max
+        let usage = max(
+            fraction(project.commands.count, of: limits.maximumCommandCount),
+            fraction(totalPointCount, of: limits.maximumTotalStrokePointCount),
+            fraction(storageCharge, of: limits.maximumSerializedStorageBytes)
+        )
+        guard usage >= 0.9 else { return nil }
+        let percent = min(Int((usage * 100).rounded(.down)), 100)
+        return "Painting history is \(percent)% full. Undo strokes, or continue in a new document."
     }
 
 }

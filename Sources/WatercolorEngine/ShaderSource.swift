@@ -75,6 +75,39 @@ enum ShaderSource {
         return mix(base, fiber, secondary);
     }
 
+    float smoothValueNoise(float2 position, float cellSize, uint seed) {
+        float2 scaled = position / max(cellSize, 1.0f);
+        float2 base = floor(scaled);
+        float2 fraction = scaled - base;
+        float2 weight = fraction * fraction * (3.0f - 2.0f * fraction);
+        uint2 cell = uint2(base);
+        float v00 = randomValue(cell, seed);
+        float v10 = randomValue(cell + uint2(1u, 0u), seed);
+        float v01 = randomValue(cell + uint2(0u, 1u), seed);
+        float v11 = randomValue(cell + uint2(1u, 1u), seed);
+        return mix(mix(v00, v10, weight.x), mix(v01, v11, weight.x), weight.y);
+    }
+
+    // Version-one texture fields interpolate between noise cells and blend a
+    // second octave, so texture modulates deposits as a continuous field with
+    // per-paper character instead of hard-edged blocks. The legacy paperNoise
+    // above is unchanged for behavior-version-zero documents and the paper
+    // tint of the composite.
+    float smoothPaperNoise(float2 position, uint paper, uint seed) {
+        float frequency;
+        float secondary;
+        switch (paper) {
+            case 0: frequency = 15.0f; secondary = 0.18f; break;
+            case 1: frequency = 9.0f; secondary = 0.34f; break;
+            case 2: frequency = 5.0f; secondary = 0.55f; break;
+            case 3: frequency = 7.0f; secondary = 0.72f; break;
+            default: frequency = 3.0f; secondary = 0.42f; break;
+        }
+        float base = smoothValueNoise(position, frequency, seed ^ (paper * 0x51ed270bu));
+        float detail = smoothValueNoise(position, frequency * 0.41f, seed ^ 0xa511e9b3u);
+        return mix(base, detail, secondary);
+    }
+
     float legacyShapeCoverage(float2 normalized, uint shape) {
         float distance;
         switch (shape) {
@@ -329,15 +362,15 @@ enum ShaderSource {
             case 0:
                 break;
             case 1: {
-                float valley = paperNoise(position, paper, strokeSeed ^ 0x243f6a88u);
+                float valley = smoothPaperNoise(float2(position), paper, strokeSeed ^ 0x243f6a88u);
                 texturedCoverage = coverage * mix(0.30f, 1.24f, valley);
                 pigment = mix(0.72f, 1.32f, valley);
                 water = 0.92f;
                 break;
             }
             case 2: {
-                uint2 connectedCoordinate = position / 4u;
-                float skip = paperNoise(connectedCoordinate, paper, strokeSeed ^ 0x85a308d3u);
+                float2 connectedCoordinate = float2(position) / 4.0f;
+                float skip = smoothPaperNoise(connectedCoordinate, paper, strokeSeed ^ 0x85a308d3u);
                 float interior = smoothstep(0.18f, 0.52f, coverage);
                 float skipCoverage = smoothstep(0.48f, 0.70f, skip);
                 texturedCoverage = coverage * mix(1.0f, skipCoverage, interior);
@@ -391,7 +424,7 @@ enum ShaderSource {
                 water = 1.92f;
                 break;
             case 2: {
-                float skip = paperNoise(position / 4u, paper, strokeSeed ^ 0x13198a2eu);
+                float skip = smoothPaperNoise(float2(position) / 4.0f, paper, strokeSeed ^ 0x13198a2eu);
                 float interior = smoothstep(0.18f, 0.52f, coverage);
                 styledCoverage = coverage * mix(
                     1.0f,
@@ -471,7 +504,7 @@ enum ShaderSource {
             }
         } else {
             uint strokeSeed = parameters.behavior.y;
-            grain = paperNoise(position, parameters.extra.y, strokeSeed);
+            grain = smoothPaperNoise(float2(position), parameters.extra.y, strokeSeed);
             VersionOneProfile hair = versionOneHairProfile(
                 coverage,
                 normalized,
@@ -533,7 +566,13 @@ enum ShaderSource {
                 wetness.write(half4(min(float(existingWetness) + max(waterAmount, coverage * pressure * 0.5f), 1.0f)), position, slice);
                 break;
             case 2: {
-                float remaining = 1.0f - clamp(coverage * pressure * 0.92f, 0.0f, 0.96f);
+                // Version 2 strokes scale the lift by the tool's strength
+                // (carried in the opacity slot); earlier strokes keep the
+                // fixed strength they were painted with.
+                float strength = parameters.behavior.x >= 2u
+                    ? clamp(parameters.brush.y, 0.0f, 1.0f)
+                    : 1.0f;
+                float remaining = 1.0f - clamp(coverage * pressure * 0.92f * strength, 0.0f, 0.96f);
                 pigment.write(existingPigment * half(remaining), position, slice);
                 wetness.write(existingWetness * half(remaining), position, slice);
                 break;
@@ -559,7 +598,10 @@ enum ShaderSource {
                 break;
             }
             default: {
-                float remaining = 1.0f - clamp(coverage * pressure * 0.84f, 0.0f, 0.95f);
+                float strength = parameters.behavior.x >= 2u
+                    ? clamp(parameters.brush.y, 0.0f, 1.0f)
+                    : 1.0f;
+                float remaining = 1.0f - clamp(coverage * pressure * 0.84f * strength, 0.0f, 0.95f);
                 wetness.write(existingWetness * half(remaining), position, slice);
                 break;
             }
@@ -811,7 +853,11 @@ enum ShaderSource {
         if (position.x >= output.get_width() || position.y >= output.get_height()) return;
 
         uint paper = parameters.dimensions.z;
-        float grain = paperNoise(position, paper, 0x74a7c15du);
+        // Smooth, half-frequency grain: an uncorrelated per-pixel grain reads
+        // as white speckle wherever dense paint saturates the deposit, and
+        // even a fine smooth octave leaves visible stepping there. The wider
+        // cells keep the per-paper tooth as soft mottling.
+        float grain = smoothPaperNoise(float2(position) * 0.5f, paper, 0x74a7c15du);
         float grainStrength;
         switch (paper) {
             case 0: grainStrength = 0.012f; break;
@@ -831,8 +877,13 @@ enum ShaderSource {
             float concentration = max(sample.a, 0.0f);
             if (concentration <= 0.0001f) continue;
             float3 pigmentColor = clamp(sample.rgb / max(concentration, 0.0001f), 0.0f, 1.0f);
+            // Paper tooth scales how quickly pigment covers, inside the
+            // exponential: valleys fill later, but enough pigment saturates
+            // every pixel. A ceiling here would leave fixed bright spots
+            // that no amount of paint could ever cover. Light washes match
+            // the previous look, since 1 - exp(-c*d) ~= c*d for small c.
             float paperDeposit = mix(0.90f, 1.08f, grain);
-            float alpha = clamp((1.0f - exp(-concentration)) * metadata.y * paperDeposit, 0.0f, 1.0f);
+            float alpha = clamp((1.0f - exp(-concentration * paperDeposit)) * metadata.y, 0.0f, 1.0f);
             color = mix(color, pigmentColor, alpha);
         }
 
