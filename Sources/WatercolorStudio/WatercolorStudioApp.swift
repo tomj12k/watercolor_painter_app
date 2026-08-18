@@ -90,6 +90,17 @@ final class WatercolorStudioApplicationDelegate: NSObject, NSApplicationDelegate
         true
     }
 
+    // This studio intentionally owns its document launch flow. Restoring a
+    // stale SwiftUI document window after a force-quit can leave AppKit at a
+    // recovery alert before DocumentGroup creates the in-app canvas setup.
+    func applicationShouldRestoreState(_ app: NSApplication) -> Bool {
+        false
+    }
+
+    func applicationShouldRestoreSecureState(_ app: NSApplication) -> Bool {
+        false
+    }
+
     func applicationOpenUntitledFile(_ sender: NSApplication) -> Bool {
         requestUntitledDocument()
     }

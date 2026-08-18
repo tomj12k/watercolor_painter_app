@@ -10,6 +10,12 @@ import Testing
         #expect(delegate.applicationShouldOpenUntitledFile(.shared))
     }
 
+    @Test func launchDoesNotRestoreStaleWindowsAfterAForceQuit() {
+        let delegate = WatercolorStudioApplicationDelegate()
+        #expect(!delegate.applicationShouldRestoreState(.shared))
+        #expect(!delegate.applicationShouldRestoreSecureState(.shared))
+    }
+
     @Test func coldLaunchOpensTheUntitledDocumentThroughTheStandardNewDocumentAction() {
         var receivedSelector: Selector?
         var receivedTarget: Any?
