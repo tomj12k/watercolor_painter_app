@@ -374,9 +374,9 @@ public struct StudioView: View {
                 )
             }
             .toggleStyle(.button)
-            .help("Allow a local AI agent to control watercolor tools")
+            .help(mcpController.connectionError ?? "Allow a local AI agent to control watercolor tools")
             .accessibilityLabel("AI Control")
-            .accessibilityValue(mcpController.isEnabled ? "On" : "Off")
+            .accessibilityValue(mcpController.connectionError ?? (mcpController.isEnabled ? "On" : "Off"))
             .accessibilityHint("Allows a local AI agent to draw through the watercolor tools")
 
             if mcpController.isConnected {

@@ -7,6 +7,7 @@ final class MCPDrawingController: ObservableObject {
     @Published private(set) var isEnabled = false
     @Published private(set) var isConnected = false
     @Published private(set) var sessionLabel: String?
+    @Published private(set) var connectionError: String?
 
     private weak var model: StudioModel?
     private let bridge: MCPBridge
@@ -38,14 +39,17 @@ final class MCPDrawingController: ObservableObject {
             do {
                 try bridge.start()
                 isEnabled = true
+                connectionError = nil
             } catch {
                 isEnabled = false
                 sessionLabel = nil
+                connectionError = "AI Control could not start. Try again or check the local MCP host."
             }
         } else {
             stopSession()
             bridge.stop()
             isEnabled = false
+            connectionError = nil
         }
     }
 
