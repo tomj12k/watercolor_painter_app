@@ -33,7 +33,7 @@ public struct MCPServer: Sendable {
                     id: request.id,
                     error: MCPRPCError(
                         code: .bridgeUnavailable,
-                        message: "Watercolor Studio is not available for MCP control."
+                        message: "Open a Watercolor Studio canvas, then try again."
                     )
                 )
             }
@@ -45,4 +45,3 @@ public struct MCPServer: Sendable {
         }
     }
 }
-

@@ -37,6 +37,19 @@ import Testing
         #expect(response.error?.code == .methodNotFound)
     }
 
+    @Test func unavailableBridgeExplainsHowToMakeACanvasAvailable() async throws {
+        let server = MCPServer { _ in
+            throw MCPRPCError(code: .bridgeUnavailable, message: "Endpoint missing")
+        }
+
+        let response = await server.handle(
+            MCPJSONRPCRequest(id: .number(1), method: "tools/list")
+        )
+
+        #expect(response.error?.code == .bridgeUnavailable)
+        #expect(response.error?.message == "Open a Watercolor Studio canvas, then try again.")
+    }
+
     @Test func requestRoundTripsWithObjectArguments() throws {
         let request = MCPJSONRPCRequest(
             id: .number(7),

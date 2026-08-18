@@ -31,6 +31,10 @@ final class MCPDrawingController: ObservableObject {
 
     func attach(model: StudioModel) {
         self.model = model
+        // An open canvas is the explicit local surface that Claude controls.
+        // Start its authenticated, loopback-only bridge here so the helper can
+        // discover the app without requiring a separate toolbar click.
+        setEnabled(true)
     }
 
     func setEnabled(_ enabled: Bool) {

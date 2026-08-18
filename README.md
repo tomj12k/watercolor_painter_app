@@ -40,11 +40,15 @@ Choose **Canvas → Export PNG…**, select a destination in the save panel, and
 
 ## Local AI control (MCP)
 
-Watercolor Studio includes an opt-in local MCP bridge for AI-assisted painting. In an open document, turn on **AI Control** in the toolbar. The bridge publishes a short-lived, owner-only endpoint under `~/Library/Application Support/WatercolorStudio/mcp-endpoint.json`; it is removed when AI Control is turned off or the document closes. No network listener is opened.
+Watercolor Studio includes a local MCP bridge for AI-assisted painting. As soon
+as a canvas is open, the app publishes a short-lived, owner-only endpoint under
+`~/Library/Application Support/WatercolorStudio/mcp-endpoint.json`; it is
+removed when **AI Control** is turned off or the canvas closes. No network
+listener is opened.
 
 The standalone stdio MCP executable is built as `WatercolorStudioMCP` and is also included in packaged builds at `Contents/Helpers/WatercolorStudioMCP`. Point an MCP host at that executable (or run `swift run WatercolorStudioMCP` from a checkout). It discovers the active app endpoint and forwards MCP `tools/list` and `tools/call` requests through the private Unix socket.
 
-Available local tools include canvas and brush catalogs, layer inspection and management, semantic watercolor strokes (`stroke_begin`, `stroke_append`, `stroke_end`, `stroke_cancel`), drying, undo/redo, and PNG export. AI Control is disabled by default; existing mouse, keyboard, document, save, and export workflows remain unchanged when it is off. Requests are bounded by the same renderer, project, history, and validation limits as normal drawing.
+Available local tools include canvas and brush catalogs, layer inspection and management, semantic watercolor strokes (`stroke_begin`, `stroke_append`, `stroke_end`, `stroke_cancel`), drying, undo/redo, and PNG export. The toolbar keeps an **AI Control** switch and **Stop AI** action so the customer can end a local session at any time. Requests are bounded by the same renderer, project, history, and validation limits as normal drawing.
 
 ## Architecture
 
@@ -73,9 +77,10 @@ open '.build/release/Watercolor Studio.app'
 
 On launch, Watercolor Studio opens the in-app **New Watercolor** screen. It
 does not open an Open panel or create/save an untitled painting. Choose a
-preset or canvas size, then select **Create Watercolor Canvas**; only that
-action creates the document and begins the normal Save As flow. Use **File →
-Open** when you explicitly want to load an existing `.watercolor` painting.
+preset or canvas size, then select **Create Watercolor Canvas** to begin an
+in-memory draft. Saving is deferred until you explicitly select **Save
+Painting** in the editor. Use **File → Open** when you explicitly want to load an existing
+`.watercolor` painting.
 
 macOS may present its normal unsigned-app warning; use Finder’s Control-click **Open** flow or System Settings → Privacy & Security to allow this local build. Never distribute the `make app` output to customers: it does not include signing or notarization.
 

@@ -5,6 +5,21 @@ import WatercolorCore
 @testable import WatercolorStudio
 
 @Suite @MainActor struct InitialDocumentFlowTests {
+    @Test func draftCanvasPersistsOnlyWhenExplicitlySaved() throws {
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("watercolor-draft-\(UUID().uuidString).watercolor")
+        defer { try? FileManager.default.removeItem(at: destination) }
+
+        let store = DraftPaintingStore()
+        let project = PaintingProject.newDefault()
+        #expect(store.destinationURL == nil)
+        try store.save(project, to: destination)
+
+        #expect(store.destinationURL == destination)
+        let reopened = try PaintingDocumentCodec.decode(Data(contentsOf: destination))
+        #expect(reopened == project)
+    }
+
     @Test func coldLaunchShowsTheNewCanvasScreenWithoutCreatingADocument() {
         let delegate = WatercolorStudioApplicationDelegate()
 
@@ -52,6 +67,21 @@ import WatercolorCore
         #expect(receivedSelectors.isEmpty)
     }
 
+    @Test func finishedLaunchPresentsTheNewCanvasScreenOnce() {
+        var presentationCount = 0
+        let delegate = WatercolorStudioApplicationDelegate(
+            sendAction: { _, _, _ in false },
+            schedule: { action in action() },
+            presentNewCanvas: { presentationCount += 1 }
+        )
+
+        delegate.applicationDidFinishLaunching(
+            Notification(name: NSApplication.didFinishLaunchingNotification, object: NSApplication.shared)
+        )
+
+        #expect(presentationCount == 1)
+    }
+
     @Test func launchForAnExistingFileDoesNotCreateAnUntitledDocument() {
         var requestCount = 0
         let delegate = WatercolorStudioApplicationDelegate(
@@ -95,24 +125,23 @@ import WatercolorCore
         #expect(receivedSelectors.isEmpty)
     }
 
-    @Test func newDocumentIsRequestedOnlyAfterAValidCanvasConfigurationIsCreated() {
+    @Test func canvasLoadsInMemoryOnlyAfterAValidConfigurationIsCreated() {
         var requestCount = 0
         var receivedProject: PaintingProject?
-        let coordinator = NewDocumentLaunchCoordinator { project in
+        let coordinator = NewDocumentLaunchCoordinator(canvasLoadAction: { project in
             requestCount += 1
             receivedProject = project
             return true
-        }
+        })
 
-        #expect(coordinator.pendingProject == nil)
         #expect(requestCount == 0)
         #expect(coordinator.create(NewCanvasConfiguration(width: 128, height: 128, paper: .coldPress)) == false)
         #expect(requestCount == 0)
         #expect(coordinator.create(NewCanvasConfiguration(width: 800, height: 600, paper: .rough)))
         #expect(requestCount == 1)
         #expect(receivedProject?.canvas == CanvasSize(width: 800, height: 600))
-        #expect(coordinator.consumePendingProject()?.paper == .rough)
-        #expect(coordinator.pendingProject == nil)
+        // Creating a canvas is not a document operation. The draft is loaded
+        // in memory and can be saved later, once the customer asks to save.
     }
 
     @Test func successfulCreateRequestsSaveAsOnceAfterTheConfigurationSheetDismisses() {

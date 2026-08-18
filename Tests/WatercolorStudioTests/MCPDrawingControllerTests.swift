@@ -6,6 +6,21 @@ import WatercolorMCP
 @testable import WatercolorStudio
 
 @Suite(.serialized) @MainActor struct MCPDrawingControllerTests {
+    @Test func attachingAnOpenCanvasPublishesTheLocalMCPService() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("watercolor-mcp-autostart-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let bridge = MCPBridge(endpointStore: MCPEndpointStore(directoryURL: directory))
+        let controller = MCPDrawingController(bridge: bridge)
+        let model = try StudioModel(project: .mcpTestProject())
+
+        controller.attach(model: model)
+
+        #expect(controller.isEnabled)
+        #expect(try MCPEndpointStore(directoryURL: directory).read() != nil)
+        controller.setEnabled(false)
+    }
+
     @Test func controlIsOffByDefaultAndDoesNotAdvertiseAnEndpoint() async throws {
         let model = try StudioModel(project: .mcpTestProject())
         let controller = MCPDrawingController(model: model)

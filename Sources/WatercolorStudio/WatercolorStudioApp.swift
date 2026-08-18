@@ -7,25 +7,19 @@ import WatercolorEngine
 struct WatercolorStudioApp: App {
     @NSApplicationDelegateAdaptor(WatercolorStudioApplicationDelegate.self)
     private var applicationDelegate
-    @StateObject private var launchCoordinator = NewDocumentLaunchCoordinator.shared
 
     init() {
-        _launchCoordinator = StateObject(wrappedValue: NewDocumentLaunchCoordinator.shared)
-        NewDocumentLaunchCoordinator.shared.didCreateDocument = {
-            NewCanvasWindowPresenter.shared.close()
-        }
-        DispatchQueue.main.async {
-            NewCanvasWindowPresenter.shared.show()
-        }
+        // Install the launch observer before AppKit enters its event loop.
+        // This avoids relying on SwiftUI's document-scene delegate timing.
+        _ = NewCanvasWindowPresenter.shared
     }
 
     var body: some Scene {
         // A viewing document scene does not ask AppKit to manufacture an
         // untitled document during launch. The explicit New Canvas window is
-        // the only startup surface; the coordinator opens a document after
-        // the customer presses Create.
+        // the only startup surface; drafts live in memory until saved.
         DocumentGroup(viewing: PaintingDocument.self) { configuration in
-            StudioDocumentView(document: configuration.$document, launchCoordinator: launchCoordinator)
+            StudioDocumentView(document: configuration.$document)
         }
         .defaultSize(width: 1_220, height: 790)
         .commands {
@@ -49,6 +43,18 @@ private final class NewCanvasWindowPresenter {
     static let shared = NewCanvasWindowPresenter()
     private var window: NSWindow?
 
+    private init() {
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didFinishLaunchingNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.show()
+            }
+        }
+    }
+
     func show() {
         guard window == nil else {
             window?.makeKeyAndOrderFront(nil)
@@ -71,49 +77,119 @@ private final class NewCanvasWindowPresenter {
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
+
     func close() {
         window?.close()
         window = nil
+    }
+
+    func showCanvas(_ project: PaintingProject) {
+        show()
+        window?.title = "Untitled"
+        window?.contentViewController = NSHostingController(
+            rootView: DraftCanvasView(project: project)
+        )
+        window?.setContentSize(NSSize(width: 1_220, height: 790))
+        window?.center()
+    }
+}
+
+@MainActor
+private struct DraftCanvasView: View {
+    @State private var document: PaintingDocument
+    @StateObject private var saveStore = DraftPaintingStore()
+    @State private var saveFailure: StudioFailure?
+
+    init(project: PaintingProject) {
+        _document = State(initialValue: PaintingDocument(project: project))
+    }
+
+    var body: some View {
+        StudioDocumentView(document: $document)
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button(action: saveDraft) {
+                        Label("Save Painting", systemImage: "square.and.arrow.down")
+                    }
+                    .help(
+                        saveStore.destinationURL == nil
+                            ? "Choose where to save this draft"
+                            : "Save this draft"
+                    )
+                    .accessibilityLabel("Save painting")
+                }
+            }
+            .alert(item: $saveFailure) { failure in
+                Alert(
+                    title: Text("Could not save painting"),
+                    message: Text("\(failure.message)\n\n\(failure.recoverySuggestion)"),
+                    dismissButton: .default(Text("OK"))
+                )
+            }
+    }
+
+    private func saveDraft() {
+        if let destination = saveStore.destinationURL {
+            save(project: document.project, to: destination)
+            return
+        }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.watercolorPainting]
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = "Untitled.watercolor"
+        panel.begin { response in
+            guard response == .OK, let destination = panel.url else { return }
+            Task { @MainActor in
+                save(project: document.project, to: destination)
+            }
+        }
+    }
+
+    private func save(project: PaintingProject, to destination: URL) {
+        do {
+            try saveStore.save(project, to: destination)
+        } catch {
+            saveFailure = StudioFailure(message: "Watercolor Studio could not save this painting. Try another location.")
+        }
+    }
+}
+
+@MainActor
+final class DraftPaintingStore: ObservableObject {
+    @Published private(set) var destinationURL: URL?
+
+    func save(_ project: PaintingProject, to destination: URL) throws {
+        let data = try PaintingDocumentCodec.encode(project)
+        try data.write(to: destination, options: .atomic)
+        destinationURL = destination
     }
 }
 
 @MainActor
 final class NewDocumentLaunchCoordinator: ObservableObject {
-    typealias NewDocumentAction = @MainActor (PaintingProject) -> Bool
+    typealias CanvasLoadAction = @MainActor (PaintingProject) -> Bool
 
-    private let newDocumentAction: NewDocumentAction
-    private(set) var pendingProject: PaintingProject?
+    private let canvasLoadAction: CanvasLoadAction
     @Published private(set) var failure: StudioFailure?
-    var didCreateDocument: (() -> Void)?
 
     static let shared = NewDocumentLaunchCoordinator()
 
-    init(newDocumentAction: @escaping NewDocumentAction = { _ in
-        // Call the document controller directly because the viewing scene does
-        // not install the standard New Document responder. This remains a
-        // user-triggered action: no document exists until this closure runs.
-        do {
-            _ = try NSDocumentController.shared.openUntitledDocumentAndDisplay(true)
-            return true
-        } catch {
-            return false
-        }
+    init(canvasLoadAction: @escaping CanvasLoadAction = { project in
+        NewCanvasWindowPresenter.shared.showCanvas(project)
+        return true
     }) {
-        self.newDocumentAction = newDocumentAction
+        self.canvasLoadAction = canvasLoadAction
     }
 
     @discardableResult
     func create(_ configuration: NewCanvasConfiguration) -> Bool {
         do {
             let project = try configuration.makeProject()
-            pendingProject = project
-            guard newDocumentAction(project) else {
-                pendingProject = nil
-                failure = StudioFailure(message: "Watercolor Studio could not create a new document. Try again.")
+            guard canvasLoadAction(project) else {
+                failure = StudioFailure(message: "Watercolor Studio could not load this canvas. Try again.")
                 return false
             }
             failure = nil
-            didCreateDocument?()
             return true
         } catch {
             failure = StudioFailure(error: error, project: nil)
@@ -126,16 +202,11 @@ final class NewDocumentLaunchCoordinator: ObservableObject {
         create(NewCanvasConfiguration(preset: .landscape))
     }
 
-    func consumePendingProject() -> PaintingProject? {
-        defer { pendingProject = nil }
-        return pendingProject
-    }
 }
 
 @MainActor
 private struct NewCanvasLaunchView: View {
     @ObservedObject var coordinator: NewDocumentLaunchCoordinator
-    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NewCanvasConfigurationView(
@@ -143,10 +214,10 @@ private struct NewCanvasLaunchView: View {
             copyDetails: { _ in },
             dismissFailure: {},
             create: {
-                if coordinator.create($0) { dismiss() }
+                _ = coordinator.create($0)
             },
             useDefault: {
-                if coordinator.useDefault() { dismiss() }
+                _ = coordinator.useDefault()
             }
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -182,6 +253,7 @@ final class WatercolorStudioApplicationDelegate: NSObject, NSApplicationDelegate
     typealias SendAction = (_ selector: Selector, _ target: Any?, _ sender: Any?) -> Bool
     typealias Schedule = (_ action: @escaping @MainActor () -> Void) -> Void
     typealias HasOpenDocumentOrWindow = @MainActor () -> Bool
+    typealias PresentNewCanvas = @MainActor () -> Void
 
     private enum UntitledRequestState {
         case notRequested
@@ -192,8 +264,8 @@ final class WatercolorStudioApplicationDelegate: NSObject, NSApplicationDelegate
     private let sendAction: SendAction
     private let schedule: Schedule
     private let hasOpenDocumentOrWindow: HasOpenDocumentOrWindow
+    private let presentNewCanvas: PresentNewCanvas
     private var untitledRequestState = UntitledRequestState.notRequested
-    private var launchWindow: NSWindow?
 
     override convenience init() {
         self.init(
@@ -201,7 +273,8 @@ final class WatercolorStudioApplicationDelegate: NSObject, NSApplicationDelegate
                 NSApplication.shared.sendAction(selector, to: target, from: sender)
             },
             schedule: { action in DispatchQueue.main.async { action() } },
-            hasOpenDocumentOrWindow: Self.liveHasOpenDocumentOrWindow
+            hasOpenDocumentOrWindow: Self.liveHasOpenDocumentOrWindow,
+            presentNewCanvas: { NewCanvasWindowPresenter.shared.show() }
         )
     }
 
@@ -213,11 +286,13 @@ final class WatercolorStudioApplicationDelegate: NSObject, NSApplicationDelegate
             }
         },
         hasOpenDocumentOrWindow: @escaping HasOpenDocumentOrWindow =
-            WatercolorStudioApplicationDelegate.liveHasOpenDocumentOrWindow
+            WatercolorStudioApplicationDelegate.liveHasOpenDocumentOrWindow,
+        presentNewCanvas: @escaping PresentNewCanvas = { NewCanvasWindowPresenter.shared.show() }
     ) {
         self.sendAction = sendAction
         self.schedule = schedule
         self.hasOpenDocumentOrWindow = hasOpenDocumentOrWindow
+        self.presentNewCanvas = presentNewCanvas
         super.init()
     }
 
@@ -251,6 +326,7 @@ final class WatercolorStudioApplicationDelegate: NSObject, NSApplicationDelegate
     func applicationDidFinishLaunching(_ notification: Notification) {
         schedule { [weak self] in
             self?.closeStartupOpenPanels()
+            self?.presentNewCanvas()
         }
     }
 
@@ -258,31 +334,6 @@ final class WatercolorStudioApplicationDelegate: NSObject, NSApplicationDelegate
         for window in NSApplication.shared.windows where window is NSOpenPanel || window.title == "Open" {
             window.close()
         }
-    }
-
-    private func showLaunchWindowIfNeeded() {
-        guard !NSApplication.shared.windows.contains(where: { $0.isVisible && !($0 is NSPanel) }),
-              launchWindow == nil
-        else { return }
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 500),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "New Watercolor"
-        window.contentViewController = NSHostingController(
-            rootView: NewCanvasLaunchView(coordinator: NewDocumentLaunchCoordinator.shared)
-        )
-        window.center()
-        window.isReleasedWhenClosed = false
-        launchWindow = window
-        NewDocumentLaunchCoordinator.shared.didCreateDocument = { [weak self] in
-            self?.launchWindow?.close()
-            self?.launchWindow = nil
-        }
-        window.makeKeyAndOrderFront(nil)
-        NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
     private static func liveHasOpenDocumentOrWindow() -> Bool {
@@ -490,12 +541,8 @@ struct StudioDocumentView: View {
     @StateObject private var initialDocumentFlow: InitialDocumentFlowCoordinator
     @StateObject private var documentWindowLocator: StudioDocumentWindowLocator
     @StateObject private var mcpController: MCPDrawingController
-    private let launchCoordinator: NewDocumentLaunchCoordinator
-    private let wasCreatedFromLaunchScreen: Bool
-
     init(
         document: Binding<PaintingDocument>,
-        launchCoordinator: NewDocumentLaunchCoordinator = NewDocumentLaunchCoordinator(),
         scheduleInitialSaveAs: @escaping InitialDocumentFlowCoordinator.Schedule = { action in
             DispatchQueue.main.async { action() }
         },
@@ -505,16 +552,6 @@ struct StudioDocumentView: View {
     ) {
         let windowLocator = StudioDocumentWindowLocator()
         _document = document
-        self.launchCoordinator = launchCoordinator
-        if let pendingProject = launchCoordinator.consumePendingProject() {
-            var launchedDocument = document.wrappedValue
-            launchedDocument.project = pendingProject
-            launchedDocument.needsInitialConfiguration = false
-            document.wrappedValue = launchedDocument
-            wasCreatedFromLaunchScreen = true
-        } else {
-            wasCreatedFromLaunchScreen = false
-        }
         _host = StateObject(wrappedValue: StudioDocumentHost(document: document))
         _documentWindowLocator = StateObject(wrappedValue: windowLocator)
         _initialDocumentFlow = StateObject(
@@ -533,9 +570,6 @@ struct StudioDocumentView: View {
                 StudioView(model: model, mcpController: mcpController)
                     .onAppear {
                         mcpController.attach(model: model)
-                        if wasCreatedFromLaunchScreen {
-                            initialDocumentFlow.requestInitialSaveAsAfterAppearance()
-                        }
                     }
                     .onDisappear { mcpController.setEnabled(false) }
             } else {

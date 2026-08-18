@@ -7,7 +7,10 @@ struct WatercolorStudioMCPMain {
         let store = MCPEndpointStore()
         let server = MCPServer { request in
             guard let descriptor = try store.read() else {
-                throw MCPRPCError(code: .bridgeUnavailable, message: "Watercolor Studio is not running.")
+                throw MCPRPCError(
+                    code: .bridgeUnavailable,
+                    message: "Open a Watercolor Studio canvas, then try again."
+                )
             }
             let bridgeResponse = try MCPUnixSocketClient().send(
                 descriptor: descriptor,
