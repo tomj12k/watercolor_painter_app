@@ -9,7 +9,8 @@ let package = Package(
         .library(name: "WatercolorCore", targets: ["WatercolorCore"]),
         .library(name: "WatercolorEngine", targets: ["WatercolorEngine"]),
         .library(name: "WatercolorMCP", targets: ["WatercolorMCP"]),
-        .executable(name: "WatercolorStudio", targets: ["WatercolorStudio"])
+        .executable(name: "WatercolorStudio", targets: ["WatercolorStudio"]),
+        .executable(name: "WatercolorStudioMCP", targets: ["WatercolorStudioMCP"])
     ],
     targets: [
         .target(name: "WatercolorCore"),
@@ -23,6 +24,10 @@ let package = Package(
             ]
         ),
         .target(name: "WatercolorMCP"),
+        .executableTarget(
+            name: "WatercolorStudioMCP",
+            dependencies: ["WatercolorMCP"]
+        ),
         .executableTarget(
             name: "WatercolorStudio",
             dependencies: ["WatercolorCore", "WatercolorEngine"]

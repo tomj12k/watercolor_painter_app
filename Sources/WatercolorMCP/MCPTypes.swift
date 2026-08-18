@@ -53,6 +53,13 @@ public indirect enum JSONValue: Codable, Equatable, Sendable {
     }
 }
 
+public extension JSONValue {
+    subscript(key: String) -> JSONValue? {
+        guard case let .object(values) = self else { return nil }
+        return values[key]
+    }
+}
+
 public struct MCPJSONRPCRequest: Codable, Equatable, Sendable {
     public let jsonrpc: String
     public let id: MCPRequestID?
@@ -80,7 +87,7 @@ public struct MCPJSONRPCRequest: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey { case jsonrpc, id, method, params }
 }
 
-public struct MCPRPCError: Codable, Equatable, Sendable {
+public struct MCPRPCError: Error, Codable, Equatable, Sendable {
     public enum Code: Int, Codable, Sendable {
         case parseError = -32700
         case invalidRequest = -32600
@@ -161,4 +168,3 @@ public enum MCPProtocolError: Error, Equatable, Sendable {
     case invalidJSONRPCVersion
     case invalidRequest
 }
-

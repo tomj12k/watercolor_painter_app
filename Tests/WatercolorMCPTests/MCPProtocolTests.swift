@@ -3,6 +3,40 @@ import Testing
 @testable import WatercolorMCP
 
 @Suite struct MCPProtocolTests {
+    @Test func serverNegotiatesAndForwardsToolCalls() async throws {
+        let server = MCPServer { request in
+            MCPJSONRPCResponse(
+                id: request.id,
+                result: .object(["forwarded": .string(request.method)])
+            )
+        }
+        let initialize = await server.handle(
+            MCPJSONRPCRequest(id: .number(1), method: "initialize")
+        )
+        #expect(initialize.error == nil)
+        #expect(initialize.result?["serverInfo"]?["name"] == .string("WatercolorStudioMCP"))
+
+        let call = await server.handle(
+            MCPJSONRPCRequest(
+                id: .number(2),
+                method: "tools/call",
+                params: .object(["name": .string("canvas_state")])
+            )
+        )
+        #expect(call.error == nil)
+        #expect(call.result == .object(["forwarded": .string("tools/call")]))
+    }
+
+    @Test func serverRejectsUnknownMethods() async throws {
+        let server = MCPServer { _ in
+            MCPJSONRPCResponse(id: nil, result: .null)
+        }
+        let response = await server.handle(
+            MCPJSONRPCRequest(id: .number(1), method: "not/a/method")
+        )
+        #expect(response.error?.code == .methodNotFound)
+    }
+
     @Test func requestRoundTripsWithObjectArguments() throws {
         let request = MCPJSONRPCRequest(
             id: .number(7),
@@ -53,4 +87,3 @@ import Testing
         #expect(decoded.inputSchema == tool.inputSchema)
     }
 }
-
