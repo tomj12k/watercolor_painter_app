@@ -38,6 +38,14 @@ Painting documents use the `.watercolor` extension and the `com.watercolorstudio
 
 Choose **Canvas → Export PNG…**, select a destination in the save panel, and the current rendered canvas is written as a PNG image. Export creates a snapshot of the canvas; it does not change the `.watercolor` project.
 
+## Local AI control (MCP)
+
+Watercolor Studio includes an opt-in local MCP bridge for AI-assisted painting. In an open document, turn on **AI Control** in the toolbar. The bridge publishes a short-lived, owner-only endpoint under `~/Library/Application Support/WatercolorStudio/mcp-endpoint.json`; it is removed when AI Control is turned off or the document closes. No network listener is opened.
+
+The standalone stdio MCP executable is built as `WatercolorStudioMCP` and is also included in packaged builds at `Contents/Helpers/WatercolorStudioMCP`. Point an MCP host at that executable (or run `swift run WatercolorStudioMCP` from a checkout). It discovers the active app endpoint and forwards MCP `tools/list` and `tools/call` requests through the private Unix socket.
+
+Available local tools include canvas and brush catalogs, layer inspection and management, semantic watercolor strokes (`stroke_begin`, `stroke_append`, `stroke_end`, `stroke_cancel`), drying, undo/redo, and PNG export. AI Control is disabled by default; existing mouse, keyboard, document, save, and export workflows remain unchanged when it is off. Requests are bounded by the same renderer, project, history, and validation limits as normal drawing.
+
 ## Architecture
 
 | Module | Responsibility |
@@ -45,6 +53,7 @@ Choose **Canvas → Export PNG…**, select a destination in the save panel, and
 | `WatercolorCore` | Project model, editing commands, presets, stroke sampling, and JSON document codecs. |
 | `WatercolorEngine` | Metal-backed replay and rendering. |
 | `WatercolorStudio` | SwiftUI document app, AppKit save panel, Metal canvas, and studio controls. |
+| `WatercolorMCP` / `WatercolorStudioMCP` | Local MCP protocol, stdio host, and authenticated Unix-socket transport. |
 
 Source targets live in `Sources/WatercolorCore`, `Sources/WatercolorEngine`, and `Sources/WatercolorStudio`; matching tests live under `Tests/`.
 
