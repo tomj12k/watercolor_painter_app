@@ -728,6 +728,50 @@ import WatercolorCore
         #expect(try renderer.studioChecksum() == replayed.studioChecksum())
     }
 
+    @Test func largeQueuedPreviewUsesIndexedStorageCompaction() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let project = PaintingProject.studioTestProject()
+        let renderer = try WatercolorRenderer(project: project, device: device)
+        var submittedPointCounts: [Int] = []
+        let operation = StrokePreviewRendererOperation(
+            update: { _, _, points, _ in
+                submittedPointCounts.append(points.count)
+            },
+            finish: { _, _, _ in }
+        )
+        let model = StudioModel(
+            project: project,
+            renderer: renderer,
+            strokePreviewOperation: operation
+        )
+        let stroke = StrokeCommand.studioTestStroke(
+            layerID: project.layers[0].id,
+            x: 48,
+            y: 96
+        )
+        #expect(model.beginStrokePreview(stroke) == .accepted)
+
+        let indices: [Int] = Array(1...4_096)
+        let queuedPoints: [StrokePoint] = indices.map { index in
+            StrokePoint(
+                x: Double(48 + (index % 64) * 2),
+                y: Double(96 + ((index * 13) % 64) * 2),
+                pressure: 1,
+                tiltX: 0,
+                tiltY: 0,
+                time: Double(index) / 120
+            )
+        }
+        model.appendStrokePreview(id: stroke.id, points: queuedPoints)
+        await model.waitForStrokePreviewIdle()
+
+        #expect(submittedPointCounts.count == 64)
+        #expect(submittedPointCounts.allSatisfy { $0 == StudioModel.previewPointDrainLimit })
+        #expect(model.pendingStrokePreviewPointCountForTesting == 0)
+        #expect(model.pendingStrokePreviewCompactionCountForTesting == 1)
+        #expect(model.error == nil)
+    }
+
     @Test func multiUpdatePreviewCommitExactlyMatchesFreshSemanticReplay() async throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let project = PaintingProject.studioTestProject()
