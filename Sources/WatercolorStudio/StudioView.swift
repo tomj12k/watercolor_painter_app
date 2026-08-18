@@ -64,9 +64,16 @@ struct StudioSectionTitle: View {
 
 public struct StudioView: View {
     @ObservedObject private var model: StudioModel
+    @ObservedObject private var mcpController: MCPDrawingController
 
     public init(model: StudioModel) {
         self.model = model
+        _mcpController = ObservedObject(wrappedValue: MCPDrawingController(model: model))
+    }
+
+    init(model: StudioModel, mcpController: MCPDrawingController) {
+        self.model = model
+        self.mcpController = mcpController
     }
 
     public var body: some View {
@@ -357,6 +364,29 @@ public struct StudioView: View {
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
+            Toggle(isOn: Binding(
+                get: { mcpController.isEnabled },
+                set: { mcpController.setEnabled($0) }
+            )) {
+                Label(
+                    mcpController.isConnected ? "AI Connected" : "AI Control",
+                    systemImage: mcpController.isConnected ? "sparkles" : "sparkles.rectangle.stack"
+                )
+            }
+            .toggleStyle(.button)
+            .help("Allow a local AI agent to control watercolor tools")
+            .accessibilityLabel("AI Control")
+            .accessibilityValue(mcpController.isEnabled ? "On" : "Off")
+            .accessibilityHint("Allows a local AI agent to draw through the watercolor tools")
+
+            if mcpController.isConnected {
+                Button("Stop AI") {
+                    mcpController.setEnabled(false)
+                }
+                .help("Stop the connected local AI painting session")
+                .accessibilityLabel("Stop AI painting session")
+            }
+
             Button(action: model.drySelectedLayer) {
                 Label("Dry layer", systemImage: "wind")
             }

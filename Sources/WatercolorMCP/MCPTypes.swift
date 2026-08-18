@@ -58,6 +58,11 @@ public extension JSONValue {
         guard case let .object(values) = self else { return nil }
         return values[key]
     }
+
+    subscript(index: Int) -> JSONValue? {
+        guard case let .array(values) = self, values.indices.contains(index) else { return nil }
+        return values[index]
+    }
 }
 
 public struct MCPJSONRPCRequest: Codable, Equatable, Sendable {

@@ -301,6 +301,7 @@ struct StudioDocumentView: View {
     @StateObject private var host: StudioDocumentHost
     @StateObject private var initialDocumentFlow: InitialDocumentFlowCoordinator
     @StateObject private var documentWindowLocator: StudioDocumentWindowLocator
+    @StateObject private var mcpController: MCPDrawingController
 
     init(
         document: Binding<PaintingDocument>,
@@ -322,12 +323,15 @@ struct StudioDocumentView: View {
                 requestSaveAs: { requestInitialSaveAs(windowLocator.window) }
             )
         )
+        _mcpController = StateObject(wrappedValue: MCPDrawingController())
     }
 
     var body: some View {
         Group {
             if let model = host.model {
-                StudioView(model: model)
+                StudioView(model: model, mcpController: mcpController)
+                    .onAppear { mcpController.attach(model: model) }
+                    .onDisappear { mcpController.setEnabled(false) }
             } else {
                 VStack(spacing: 10) {
                     Image(systemName: "exclamationmark.triangle")

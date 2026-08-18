@@ -30,7 +30,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "WatercolorStudio",
-            dependencies: ["WatercolorCore", "WatercolorEngine"]
+            dependencies: ["WatercolorCore", "WatercolorEngine", "WatercolorMCP"]
         ),
         .testTarget(name: "WatercolorCoreTests", dependencies: ["WatercolorCore"]),
         .testTarget(
