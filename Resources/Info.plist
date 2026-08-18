@@ -41,6 +41,10 @@
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+	<key>NSQuitAlwaysKeepsWindows</key>
+	<false/>
+	<key>ApplePersistenceIgnoreState</key>
+	<true/>
     <key>UTExportedTypeDeclarations</key>
     <array>
         <dict>

@@ -71,6 +71,12 @@ For local development use, launch it with:
 open '.build/release/Watercolor Studio.app'
 ```
 
+On launch, Watercolor Studio opens the in-app **New Watercolor** screen. It
+does not open an Open panel or create/save an untitled painting. Choose a
+preset or canvas size, then select **Create Watercolor Canvas**; only that
+action creates the document and begins the normal Save As flow. Use **File →
+Open** when you explicitly want to load an existing `.watercolor` painting.
+
 macOS may present its normal unsigned-app warning; use Finder’s Control-click **Open** flow or System Settings → Privacy & Security to allow this local build. Never distribute the `make app` output to customers: it does not include signing or notarization.
 
 ### Signed customer distribution

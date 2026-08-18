@@ -1,13 +1,14 @@
 import AppKit
 import Foundation
 import Testing
+import WatercolorCore
 @testable import WatercolorStudio
 
 @Suite @MainActor struct InitialDocumentFlowTests {
-    @Test func coldLaunchRequestsAnUntitledDocumentInsteadOfAnOpenPanel() {
+    @Test func coldLaunchShowsTheNewCanvasScreenWithoutCreatingADocument() {
         let delegate = WatercolorStudioApplicationDelegate()
 
-        #expect(delegate.applicationShouldOpenUntitledFile(.shared))
+        #expect(!delegate.applicationShouldOpenUntitledFile(.shared))
     }
 
     @Test func launchDoesNotRestoreStaleWindowsAfterAForceQuit() {
@@ -16,7 +17,7 @@ import Testing
         #expect(!delegate.applicationShouldRestoreSecureState(.shared))
     }
 
-    @Test func coldLaunchOpensTheUntitledDocumentThroughTheStandardNewDocumentAction() {
+    @Test func appKitUntitledCallbacksDoNotCreateADocumentBeforeCreateIsClicked() {
         var receivedSelector: Selector?
         var receivedTarget: Any?
         let delegate = WatercolorStudioApplicationDelegate { selector, target, _ in
@@ -25,12 +26,12 @@ import Testing
             return true
         }
 
-        #expect(delegate.applicationOpenUntitledFile(.shared))
-        #expect(receivedSelector.map(NSStringFromSelector) == "newDocument:")
-        #expect(receivedTarget is NSDocumentController)
+        #expect(!delegate.applicationOpenUntitledFile(.shared))
+        #expect(receivedSelector == nil)
+        #expect(receivedTarget == nil)
     }
 
-    @Test func defaultLaunchFallsBackToOpeningOneUntitledDocumentAfterStartup() {
+    @Test func defaultLaunchLeavesDocumentCreationToTheNewCanvasScreen() {
         var receivedSelectors: [String] = []
         let delegate = WatercolorStudioApplicationDelegate(
             sendAction: { selector, _, _ in
@@ -48,7 +49,7 @@ import Testing
         delegate.applicationDidFinishLaunching(notification)
         _ = delegate.applicationOpenUntitledFile(.shared)
 
-        #expect(receivedSelectors == ["newDocument:"])
+        #expect(receivedSelectors.isEmpty)
     }
 
     @Test func launchForAnExistingFileDoesNotCreateAnUntitledDocument() {
@@ -72,7 +73,7 @@ import Testing
         #expect(requestCount == 0)
     }
 
-    @Test func nondefaultLaunchWithoutAFileStillOpensOneUntitledDocument() {
+    @Test func nondefaultLaunchWithoutAFileLeavesDocumentCreationToTheNewCanvasScreen() {
         var receivedSelectors: [String] = []
         let delegate = WatercolorStudioApplicationDelegate(
             sendAction: { selector, _, _ in
@@ -91,7 +92,27 @@ import Testing
         delegate.applicationDidFinishLaunching(notification)
         _ = delegate.applicationOpenUntitledFile(.shared)
 
-        #expect(receivedSelectors == ["newDocument:"])
+        #expect(receivedSelectors.isEmpty)
+    }
+
+    @Test func newDocumentIsRequestedOnlyAfterAValidCanvasConfigurationIsCreated() {
+        var requestCount = 0
+        var receivedProject: PaintingProject?
+        let coordinator = NewDocumentLaunchCoordinator { project in
+            requestCount += 1
+            receivedProject = project
+            return true
+        }
+
+        #expect(coordinator.pendingProject == nil)
+        #expect(requestCount == 0)
+        #expect(coordinator.create(NewCanvasConfiguration(width: 128, height: 128, paper: .coldPress)) == false)
+        #expect(requestCount == 0)
+        #expect(coordinator.create(NewCanvasConfiguration(width: 800, height: 600, paper: .rough)))
+        #expect(requestCount == 1)
+        #expect(receivedProject?.canvas == CanvasSize(width: 800, height: 600))
+        #expect(coordinator.consumePendingProject()?.paper == .rough)
+        #expect(coordinator.pendingProject == nil)
     }
 
     @Test func successfulCreateRequestsSaveAsOnceAfterTheConfigurationSheetDismisses() {
