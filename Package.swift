@@ -8,6 +8,7 @@ let package = Package(
     products: [
         .library(name: "WatercolorCore", targets: ["WatercolorCore"]),
         .library(name: "WatercolorEngine", targets: ["WatercolorEngine"]),
+        .library(name: "WatercolorMCP", targets: ["WatercolorMCP"]),
         .executable(name: "WatercolorStudio", targets: ["WatercolorStudio"])
     ],
     targets: [
@@ -21,6 +22,7 @@ let package = Package(
                 .linkedFramework("MetalKit")
             ]
         ),
+        .target(name: "WatercolorMCP"),
         .executableTarget(
             name: "WatercolorStudio",
             dependencies: ["WatercolorCore", "WatercolorEngine"]
@@ -33,6 +35,10 @@ let package = Package(
         .testTarget(
             name: "WatercolorStudioTests",
             dependencies: ["WatercolorCore", "WatercolorEngine", "WatercolorStudio"]
+        ),
+        .testTarget(
+            name: "WatercolorMCPTests",
+            dependencies: ["WatercolorMCP"]
         )
     ]
 )
