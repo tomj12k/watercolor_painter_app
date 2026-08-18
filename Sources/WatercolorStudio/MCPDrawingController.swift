@@ -94,6 +94,38 @@ final class MCPDrawingController: ObservableObject {
             return success(request, brushCatalog())
         case "layers":
             return success(request, layersState(for: model))
+        case "layer_add":
+            model.addLayer()
+            return success(request, layersState(for: model))
+        case "layer_duplicate":
+            model.duplicateSelectedLayer()
+            return success(request, layersState(for: model))
+        case "layer_delete":
+            model.deleteSelectedLayer()
+            return success(request, layersState(for: model))
+        case "layer_rename":
+            let values = Self.object(from: arguments)
+            guard let layerID = UUID(uuidString: Self.string(values["layerID"]) ?? ""),
+                  let layerName = Self.string(values["name"]), !layerName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return failure(request, code: .invalidParams, message: "layer_rename requires a layerID and name.") }
+            model.renameLayer(id: layerID, to: layerName)
+            return success(request, layersState(for: model))
+        case "layer_visibility":
+            let values = Self.object(from: arguments)
+            guard let layerID = UUID(uuidString: Self.string(values["layerID"]) ?? ""),
+                  case let .bool(isVisible)? = values["visible"]
+            else { return failure(request, code: .invalidParams, message: "layer_visibility requires a layerID and visible flag.") }
+            model.setLayerVisibility(id: layerID, isVisible: isVisible)
+            return success(request, layersState(for: model))
+        case "layer_select":
+            guard let layerID = UUID(uuidString: Self.string(Self.object(from: arguments)["layerID"]) ?? ""),
+                  model.project.layers.contains(where: { $0.id == layerID })
+            else { return failure(request, code: .invalidParams, message: "layer_select requires an existing layerID.") }
+            model.selectedLayerID = layerID
+            return success(request, .object(["selectedLayerID": .string(layerID.uuidString)]))
+        case "dry_layer":
+            model.drySelectedLayer()
+            return success(request, .object(["commandCount": .number(Double(model.project.commands.count))]))
         case "stroke_begin":
             return beginStroke(request, arguments: arguments, model: model)
         case "stroke_append":
@@ -110,6 +142,14 @@ final class MCPDrawingController: ObservableObject {
         case "redo":
             model.redo()
             return success(request, .object(["canUndo": .bool(model.capabilities.canUndo), "canRedo": .bool(model.capabilities.canRedo)]))
+        case "export_png":
+            let values = Self.object(from: arguments)
+            guard let path = Self.string(values["path"]), path.hasSuffix(".png") else {
+                return failure(request, code: .invalidParams, message: "export_png requires a .png path.")
+            }
+            await model.exportPNG(to: URL(fileURLWithPath: path).standardizedFileURL)
+            if let error = model.error { return failure(request, code: .internalError, message: error.message) }
+            return success(request, .object(["path": .string(URL(fileURLWithPath: path).standardizedFileURL.path), "exported": .bool(true)]))
         default:
             return failure(request, code: .methodNotFound, message: "Unknown painting tool \(name).")
         }
@@ -238,12 +278,20 @@ final class MCPDrawingController: ObservableObject {
         MCPTool(name: "canvas_state", description: "Read the current watercolor canvas state.", inputSchema: .object(["type": .string("object")])),
         MCPTool(name: "brush_catalog", description: "List watercolor tools and brush options.", inputSchema: .object(["type": .string("object")])),
         MCPTool(name: "layers", description: "List painting layers and their visibility.", inputSchema: .object(["type": .string("object")])),
+        MCPTool(name: "layer_add", description: "Add a watercolor layer.", inputSchema: .object(["type": .string("object")])),
+        MCPTool(name: "layer_duplicate", description: "Duplicate the selected watercolor layer.", inputSchema: .object(["type": .string("object")])),
+        MCPTool(name: "layer_delete", description: "Delete the selected watercolor layer.", inputSchema: .object(["type": .string("object")])),
+        MCPTool(name: "layer_rename", description: "Rename a watercolor layer.", inputSchema: .object(["type": .string("object")])),
+        MCPTool(name: "layer_visibility", description: "Show or hide a watercolor layer.", inputSchema: .object(["type": .string("object")])),
+        MCPTool(name: "layer_select", description: "Select a watercolor layer.", inputSchema: .object(["type": .string("object")])),
+        MCPTool(name: "dry_layer", description: "Dry the selected watercolor layer.", inputSchema: .object(["type": .string("object")])),
         MCPTool(name: "stroke_begin", description: "Begin an AI watercolor stroke.", inputSchema: .object(["type": .string("object")])),
         MCPTool(name: "stroke_append", description: "Append points to an AI watercolor stroke.", inputSchema: .object(["type": .string("object")])),
         MCPTool(name: "stroke_end", description: "Commit an AI watercolor stroke.", inputSchema: .object(["type": .string("object")])),
         MCPTool(name: "stroke_cancel", description: "Cancel the active AI watercolor stroke.", inputSchema: .object(["type": .string("object")])),
         MCPTool(name: "undo", description: "Undo the latest painting command.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "redo", description: "Redo the latest painting command.", inputSchema: .object(["type": .string("object")]))
+        MCPTool(name: "redo", description: "Redo the latest painting command.", inputSchema: .object(["type": .string("object")])),
+        MCPTool(name: "export_png", description: "Export the current painting as PNG.", inputSchema: .object(["type": .string("object")]))
     ]
 
     private static func toolJSON(_ tool: MCPTool) -> JSONValue {
