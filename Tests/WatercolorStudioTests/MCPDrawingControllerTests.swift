@@ -51,6 +51,21 @@ import WatercolorMCP
         #expect(!FileManager.default.fileExists(atPath: descriptor.socketPath))
         try? FileManager.default.removeItem(at: directory)
     }
+
+    @Test func semanticStrokeUsesTheExistingStudioRendererAndHistory() async throws {
+        let model = try StudioModel(project: .mcpTestProject())
+        let controller = MCPDrawingController(model: model)
+        controller.setEnabled(true)
+        let point: JSONValue = .object(["x": .number(64), "y": .number(64), "pressure": .number(1), "time": .number(0)])
+        let params: JSONValue = .object(["name": .string("stroke_begin"), "arguments": .object(["points": .array([point])])])
+        let begin = await controller.handle(MCPJSONRPCRequest(id: .number(2), method: "tools/call", params: params))
+        #expect(begin.error == nil)
+        let end = await controller.handle(MCPJSONRPCRequest(id: .number(3), method: "tools/call", params: .object(["name": .string("stroke_end"), "arguments": .object([:])])))
+        #expect(end.error == nil)
+        #expect(model.project.commands.count == 1)
+        #expect(model.capabilities.canUndo)
+        controller.setEnabled(false)
+    }
 }
 
 private extension PaintingProject {
