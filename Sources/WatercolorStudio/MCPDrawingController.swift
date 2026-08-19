@@ -136,6 +136,8 @@ final class MCPDrawingController: ObservableObject {
             return success(request, .object(["commandCount": .number(Double(model.project.commands.count))]))
         case "stroke_begin":
             return beginStroke(request, arguments: arguments, model: model)
+        case "draw_stroke":
+            return await drawStroke(request, arguments: arguments, model: model)
         case "stroke_append":
             return appendStroke(request, arguments: arguments, model: model)
         case "stroke_end":
@@ -187,6 +189,12 @@ final class MCPDrawingController: ObservableObject {
         activeStroke = stroke
         model.appendStrokePreview(id: stroke.id, points: points)
         return success(request, .object(["strokeID": .string(stroke.id.uuidString), "pointCount": .number(Double(stroke.points.count))]))
+    }
+
+    private func drawStroke(_ request: MCPJSONRPCRequest, arguments: JSONValue, model: StudioModel) async -> MCPJSONRPCResponse {
+        let begin = beginStroke(request, arguments: arguments, model: model)
+        guard begin.error == nil else { return begin }
+        return await endStroke(request, model: model)
     }
 
     private func endStroke(_ request: MCPJSONRPCRequest, model: StudioModel) async -> MCPJSONRPCResponse {
@@ -275,7 +283,17 @@ final class MCPDrawingController: ObservableObject {
     }
 
     private func success(_ request: MCPJSONRPCRequest, _ result: JSONValue) -> MCPJSONRPCResponse {
-        MCPJSONRPCResponse(id: request.id, result: result)
+        // MCP tool calls require human-readable content. Keep the same values
+        // in structuredContent so an agent can reliably use IDs and limits in
+        // its next call instead of scraping prose.
+        let text = (try? String(data: JSONEncoder().encode(result), encoding: .utf8)) ?? "{}"
+        return MCPJSONRPCResponse(
+            id: request.id,
+            result: .object([
+                "content": .array([.object(["type": .string("text"), "text": .string(text)])]),
+                "structuredContent": result
+            ])
+        )
     }
 
     private func failure(_ request: MCPJSONRPCRequest, code: MCPRPCError.Code, message: String) -> MCPJSONRPCResponse {
@@ -283,24 +301,88 @@ final class MCPDrawingController: ObservableObject {
     }
 
     private static let toolCatalog: [MCPTool] = [
-        MCPTool(name: "canvas_state", description: "Read the current watercolor canvas state.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "brush_catalog", description: "List watercolor tools and brush options.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "layers", description: "List painting layers and their visibility.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "layer_add", description: "Add a watercolor layer.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "layer_duplicate", description: "Duplicate the selected watercolor layer.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "layer_delete", description: "Delete the selected watercolor layer.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "layer_rename", description: "Rename a watercolor layer.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "layer_visibility", description: "Show or hide a watercolor layer.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "layer_select", description: "Select a watercolor layer.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "dry_layer", description: "Dry the selected watercolor layer.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "stroke_begin", description: "Begin an AI watercolor stroke.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "stroke_append", description: "Append points to an AI watercolor stroke.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "stroke_end", description: "Commit an AI watercolor stroke.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "stroke_cancel", description: "Cancel the active AI watercolor stroke.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "undo", description: "Undo the latest painting command.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "redo", description: "Redo the latest painting command.", inputSchema: .object(["type": .string("object")])),
-        MCPTool(name: "export_png", description: "Export the current painting as PNG.", inputSchema: .object(["type": .string("object")]))
+        MCPTool(name: "canvas_state", description: "Read the canvas size, paper, selected layer, command count, and undo state.", inputSchema: noArgumentsSchema),
+        MCPTool(name: "brush_catalog", description: "List every supported tool, shape, hair, texture, and watercolor style before painting.", inputSchema: noArgumentsSchema),
+        MCPTool(name: "layers", description: "List painting layers with their IDs, names, visibility, and opacity.", inputSchema: noArgumentsSchema),
+        MCPTool(name: "layer_add", description: "Add a new watercolor layer and select it.", inputSchema: noArgumentsSchema),
+        MCPTool(name: "layer_duplicate", description: "Duplicate the selected watercolor layer.", inputSchema: noArgumentsSchema),
+        MCPTool(name: "layer_delete", description: "Delete the selected watercolor layer when more than one layer exists.", inputSchema: noArgumentsSchema),
+        MCPTool(name: "layer_rename", description: "Rename a layer by its ID.", inputSchema: objectSchema(["layerID": uuidSchema, "name": stringSchema], required: ["layerID", "name"])),
+        MCPTool(name: "layer_visibility", description: "Show or hide a layer by its ID.", inputSchema: objectSchema(["layerID": uuidSchema, "visible": boolSchema], required: ["layerID", "visible"])),
+        MCPTool(name: "layer_select", description: "Select an existing layer by ID before painting.", inputSchema: objectSchema(["layerID": uuidSchema], required: ["layerID"])),
+        MCPTool(name: "dry_layer", description: "Dry the selected layer using the existing watercolor simulation.", inputSchema: noArgumentsSchema),
+        MCPTool(name: "draw_stroke", description: "Paint one complete watercolor stroke in a single call. Use this for a simple line, contour, or filled-in picture stroke; it accepts the same points, tool, layerID, and brush options as stroke_begin.", inputSchema: strokeBeginSchema),
+        MCPTool(name: "stroke_begin", description: "Start a watercolor stroke. Supply its first canvas-coordinate point and optional brush settings; then use stroke_append and stroke_end.", inputSchema: strokeBeginSchema),
+        MCPTool(name: "stroke_append", description: "Append one or more canvas-coordinate points to the active watercolor stroke.", inputSchema: objectSchema(["points": pointsSchema], required: ["points"])),
+        MCPTool(name: "stroke_end", description: "Commit the active watercolor stroke to the selected layer.", inputSchema: noArgumentsSchema),
+        MCPTool(name: "stroke_cancel", description: "Cancel the active watercolor stroke without committing it.", inputSchema: noArgumentsSchema),
+        MCPTool(name: "undo", description: "Undo the latest committed painting command.", inputSchema: noArgumentsSchema),
+        MCPTool(name: "redo", description: "Redo the latest undone painting command.", inputSchema: noArgumentsSchema),
+        MCPTool(name: "export_png", description: "Export the current canvas to an absolute .png file path.", inputSchema: objectSchema(["path": stringSchema], required: ["path"]))
     ]
+
+    private static let noArgumentsSchema = objectSchema([:])
+    private static let stringSchema: JSONValue = .object(["type": .string("string")])
+    private static let uuidSchema: JSONValue = .object(["type": .string("string"), "format": .string("uuid")])
+    private static let boolSchema: JSONValue = .object(["type": .string("boolean")])
+    private static let numberSchema: JSONValue = .object(["type": .string("number")])
+    private static let pointSchema = objectSchema([
+        "x": numberSchema,
+        "y": numberSchema,
+        "pressure": .object(["type": .string("number"), "minimum": .number(0), "maximum": .number(1)]),
+        "tiltX": numberSchema,
+        "tiltY": numberSchema,
+        "time": numberSchema
+    ], required: ["x", "y"])
+    private static let pointsSchema: JSONValue = .object([
+        "type": .string("array"),
+        "minItems": .number(1),
+        "items": pointSchema
+    ])
+    private static let colorSchema = objectSchema([
+        "red": .object(["type": .string("number"), "minimum": .number(0), "maximum": .number(1)]),
+        "green": .object(["type": .string("number"), "minimum": .number(0), "maximum": .number(1)]),
+        "blue": .object(["type": .string("number"), "minimum": .number(0), "maximum": .number(1)]),
+        "alpha": .object(["type": .string("number"), "minimum": .number(0), "maximum": .number(1)])
+    ], required: ["red", "green", "blue"])
+    private static let brushSchema = objectSchema([
+        "shape": enumSchema(BrushShape.allCases.map(\.rawValue)),
+        "hair": enumSchema(BrushHair.allCases.map(\.rawValue)),
+        "texture": enumSchema(BrushTexture.allCases.map(\.rawValue)),
+        "style": enumSchema(WatercolorStyle.allCases.map(\.rawValue)),
+        "color": colorSchema,
+        "size": .object(["type": .string("number"), "minimum": .number(1), "maximum": .number(512)]),
+        "opacity": unitIntervalSchema,
+        "flow": unitIntervalSchema,
+        "water": unitIntervalSchema,
+        "granulation": unitIntervalSchema,
+        "edgeBloom": unitIntervalSchema,
+        "spacing": .object(["type": .string("number"), "minimum": .number(0.08), "maximum": .number(0.6)]),
+        "rotation": .object(["type": .string("number"), "minimum": .number(-180), "maximum": .number(180)]),
+        "bristleStrength": unitIntervalSchema,
+        "textureStrength": unitIntervalSchema
+    ])
+    private static let unitIntervalSchema: JSONValue = .object(["type": .string("number"), "minimum": .number(0), "maximum": .number(1)])
+    private static let strokeBeginSchema = objectSchema([
+        "points": pointsSchema,
+        "tool": enumSchema(PaintTool.allCases.map(\.rawValue)),
+        "layerID": uuidSchema,
+        "brush": brushSchema
+    ], required: ["points"])
+
+    private static func objectSchema(_ properties: [String: JSONValue], required: [String] = []) -> JSONValue {
+        var schema: [String: JSONValue] = [
+            "type": .string("object"),
+            "properties": .object(properties),
+            "additionalProperties": .bool(false)
+        ]
+        if !required.isEmpty { schema["required"] = .array(required.map(JSONValue.string)) }
+        return .object(schema)
+    }
+
+    private static func enumSchema(_ values: [String]) -> JSONValue {
+        .object(["type": .string("string"), "enum": .array(values.map(JSONValue.string))])
+    }
 
     private static func toolJSON(_ tool: MCPTool) -> JSONValue {
         .object([

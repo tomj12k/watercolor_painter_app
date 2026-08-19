@@ -46,9 +46,11 @@ as a canvas is open, the app publishes a short-lived, owner-only endpoint under
 removed when **AI Control** is turned off or the canvas closes. No network
 listener is opened.
 
-The standalone stdio MCP executable is built as `WatercolorStudioMCP` and is also included in packaged builds at `Contents/Helpers/WatercolorStudioMCP`. Point an MCP host at that executable (or run `swift run WatercolorStudioMCP` from a checkout). It discovers the active app endpoint and forwards MCP `tools/list` and `tools/call` requests through the private Unix socket.
+The standalone stdio MCP executable is built as `WatercolorStudioMCP` and is also included in packaged builds at `Contents/Helpers/WatercolorStudioMCP`. Point an MCP host at that executable (or run `swift run WatercolorStudioMCP` from a checkout). It discovers the active app endpoint and forwards MCP `tools/list` and `tools/call` requests through the private Unix socket. Tool calls return both standard MCP text content and structured JSON, so an agent can read layer IDs and canvas limits directly.
 
-Available local tools include canvas and brush catalogs, layer inspection and management, semantic watercolor strokes (`stroke_begin`, `stroke_append`, `stroke_end`, `stroke_cancel`), drying, undo/redo, and PNG export. The toolbar keeps an **AI Control** switch and **Stop AI** action so the customer can end a local session at any time. Requests are bounded by the same renderer, project, history, and validation limits as normal drawing.
+Available local tools include canvas and brush catalogs, layer inspection and management, `draw_stroke` for one-call painting, semantic multi-call strokes (`stroke_begin`, `stroke_append`, `stroke_end`, `stroke_cancel`), drying, undo/redo, and PNG export. Stroke schemas enumerate coordinate, tool, shape, hair, texture, style, color, and dynamics attributes. The toolbar keeps an **AI Control** switch and **Stop AI** action so the customer can end a local session at any time. Requests are bounded by the same renderer, project, history, and validation limits as normal drawing.
+
+For Claude Code, configure the MCP command to the packaged helper, open a canvas in Watercolor Studio, then ask Claude to inspect `canvas_state` and call `draw_stroke`. The tool catalog is available automatically once that canvas is open.
 
 ## Architecture
 

@@ -44,6 +44,72 @@ import WatercolorMCP
         controller.setEnabled(false)
     }
 
+    @Test func toolCallsUseMCPContentAndExposeStructuredResults() async throws {
+        let model = try StudioModel(project: .mcpTestProject())
+        let controller = MCPDrawingController(model: model)
+        controller.setEnabled(true)
+        defer { controller.setEnabled(false) }
+
+        let response = await controller.handle(
+            MCPJSONRPCRequest(
+                id: .number(1),
+                method: "tools/call",
+                params: .object(["name": .string("canvas_state")])
+            )
+        )
+
+        #expect(response.error == nil)
+        #expect(response.result?["content"]?[0]?["type"] == .string("text"))
+        #expect(response.result?["structuredContent"]?["canvas"]?["width"] == .number(256))
+    }
+
+    @Test func strokeToolSchemaDescribesPointsAndBrushAttributes() async throws {
+        let model = try StudioModel(project: .mcpTestProject())
+        let controller = MCPDrawingController(model: model)
+        controller.setEnabled(true)
+        defer { controller.setEnabled(false) }
+
+        let response = await controller.handle(
+            MCPJSONRPCRequest(id: .number(1), method: "tools/list")
+        )
+        let tools = try #require(response.result?["tools"])
+        guard case let .array(toolValues) = tools else {
+            Issue.record("tools/list must return an array")
+            return
+        }
+        let strokeBegin = try #require(toolValues.first(where: { $0["name"] == .string("stroke_begin") }))
+
+        #expect(strokeBegin["inputSchema"]?["properties"]?["points"] != nil)
+        #expect(strokeBegin["inputSchema"]?["properties"]?["brush"]?["properties"]?["shape"] != nil)
+        #expect(strokeBegin["inputSchema"]?["properties"]?["brush"]?["properties"]?["textureStrength"] != nil)
+    }
+
+    @Test func oneShotDrawStrokePaintsAnOpenCanvas() async throws {
+        let model = try StudioModel(project: .mcpTestProject())
+        let controller = MCPDrawingController(model: model)
+        controller.setEnabled(true)
+        defer { controller.setEnabled(false) }
+        let points: JSONValue = .array([
+            .object(["x": .number(32), "y": .number(32)]),
+            .object(["x": .number(96), "y": .number(96)])
+        ])
+
+        let response = await controller.handle(
+            MCPJSONRPCRequest(
+                id: .number(1),
+                method: "tools/call",
+                params: .object([
+                    "name": .string("draw_stroke"),
+                    "arguments": .object(["points": points])
+                ])
+            )
+        )
+
+        #expect(response.error == nil)
+        #expect(response.result?["structuredContent"]?["committed"] == .bool(true))
+        #expect(model.project.commands.count == 1)
+    }
+
     @Test func stopSessionCancelsPreviewAndClearsConnectionState() async throws {
         let model = try StudioModel(project: .mcpTestProject())
         let controller = MCPDrawingController(model: model)
